@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+data/ip_pool.db
+data/ip_pool.db*
+data/ip_pool.pid
+logs/
+*.pid
+.DS_Store
