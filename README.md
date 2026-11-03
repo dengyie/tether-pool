@@ -5,7 +5,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-30%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-36%20passed-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 [中文文档 (README.zh-CN.md)](README.zh-CN.md)
@@ -88,7 +88,7 @@ pip install -r requirements.txt
 ```
 Verifies pool topology, multi-region probing, circuit breaker self-healing, forward proxy gateway tunneling, and adapter exports in ~10 seconds.
 
-### 3. Run Unit Tests (30 Tests Passing)
+### 3. Run Unit Tests (36 Tests Passing)
 ```bash
 .venv/bin/pytest -v
 ```
@@ -148,9 +148,10 @@ curl -x http://bob:secret@127.0.0.1:9101 \
 ```
 ip-pool/
 ├── config/
-│   └── nodes.yaml              # Static inventory of 108 proxy endpoints
+│   └── nodes.yaml              # Static inventory of pool proxy endpoints
 ├── core/
 │   ├── circuit.py              # 4-State Circuit Breaker & cooldown algorithms
+│   ├── clash_importer.py       # Clash / 3X-UI proxy importer & Mihomo SOCKS5 bridge
 │   ├── metrics.py              # Low-cardinality Prometheus exporter
 │   ├── models.py               # Pydantic data schemas
 │   ├── prober.py               # Asynchronous dual-stack health prober
@@ -168,7 +169,7 @@ ip-pool/
 │   ├── gemini_adapter.py       # Gemini Web reverse routing adapter
 │   ├── playwright_pool.py      # Python crawler & Playwright pool SDK
 │   └── grok2api_adapter.py     # Database synchronizer & account sharder
-├── tests/                      # Pytest isolated unit test suite (30 passing tests)
+├── tests/                      # Pytest isolated unit test suite (36 passing tests)
 ├── demo.py                     # Interactive end-to-end verification showcase
 ├── requirements.txt            # Python dependencies
 └── start.sh                    # Dual-process background daemon manager

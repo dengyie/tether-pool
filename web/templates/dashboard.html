@@ -156,12 +156,27 @@
             <div class="flex flex-wrap items-center gap-2">
                 <div class="flex items-center bg-dark-700/80 p-1 rounded-lg border border-slate-700 text-xs">
                     <button class="filter-region-btn px-2.5 py-1 rounded-md bg-cyan-600 text-white font-medium" data-region="" onclick="setRegionFilter('')">全地域</button>
+                    <button class="filter-region-btn px-2.5 py-1 rounded-md text-slate-400 hover:text-white" data-region="hongkong" onclick="setRegionFilter('hongkong')">香港</button>
                     <button class="filter-region-btn px-2.5 py-1 rounded-md text-slate-400 hover:text-white" data-region="tokyo" onclick="setRegionFilter('tokyo')">东京</button>
                     <button class="filter-region-btn px-2.5 py-1 rounded-md text-slate-400 hover:text-white" data-region="singapore" onclick="setRegionFilter('singapore')">新加坡</button>
-                    <button class="filter-region-btn px-2.5 py-1 rounded-md text-slate-400 hover:text-white" data-region="netherlands" onclick="setRegionFilter('netherlands')">荷兰</button>
-                    <button class="filter-region-btn px-2.5 py-1 rounded-md text-slate-400 hover:text-white" data-region="india" onclick="setRegionFilter('india')">印度</button>
-                    <button class="filter-region-btn px-2.5 py-1 rounded-md text-slate-400 hover:text-white" data-region="hongkong" onclick="setRegionFilter('hongkong')">香港</button>
                     <button class="filter-region-btn px-2.5 py-1 rounded-md text-slate-400 hover:text-white" data-region="us-west" onclick="setRegionFilter('us-west')">美西</button>
+                    <button class="filter-region-btn px-2.5 py-1 rounded-md text-slate-400 hover:text-white" data-region="france" onclick="setRegionFilter('france')">法国</button>
+                    <button class="filter-region-btn px-2.5 py-1 rounded-md text-slate-400 hover:text-white" data-region="germany" onclick="setRegionFilter('germany')">德国</button>
+                    <button class="filter-region-btn px-2.5 py-1 rounded-md text-slate-400 hover:text-white" data-region="china" onclick="setRegionFilter('china')">大陆</button>
+                    <select id="filter-region-more" onchange="setRegionFilter(this.value)" class="bg-transparent text-slate-400 hover:text-white px-1.5 py-1 text-xs focus:outline-none">
+                        <option value="" class="bg-dark-800 text-slate-300">更多地域...</option>
+                        <option value="italy" class="bg-dark-800 text-slate-300">🇮🇹 意大利</option>
+                        <option value="netherlands" class="bg-dark-800 text-slate-300">🇳🇱 荷兰</option>
+                        <option value="india" class="bg-dark-800 text-slate-300">🇮🇳 印度</option>
+                        <option value="taiwan" class="bg-dark-800 text-slate-300">🇹🇼 台湾</option>
+                        <option value="russia" class="bg-dark-800 text-slate-300">🇷🇺 俄罗斯</option>
+                        <option value="australia" class="bg-dark-800 text-slate-300">🇦🇺 澳大利亚</option>
+                        <option value="united-kingdom" class="bg-dark-800 text-slate-300">🇬🇧 英国</option>
+                        <option value="korea" class="bg-dark-800 text-slate-300">🇰🇷 韩国</option>
+                        <option value="vietnam" class="bg-dark-800 text-slate-300">🇻🇳 越南</option>
+                        <option value="switzerland" class="bg-dark-800 text-slate-300">🇨🇭 瑞士</option>
+                        <option value="global" class="bg-dark-800 text-slate-300">🌐 全球其它</option>
+                    </select>
                 </div>
 
                 <div class="flex items-center bg-dark-700/80 p-1 rounded-lg border border-slate-700 text-xs">
@@ -188,10 +203,23 @@
                         class="px-3 py-1.5 bg-dark-700 border border-slate-700 rounded-lg text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-cyan-500 w-full sm:w-64">
                     <select id="sim-region" class="px-2.5 py-1.5 bg-dark-700 border border-slate-700 rounded-lg text-xs text-slate-200 focus:outline-none">
                         <option value="">全球随机优选</option>
-                        <option value="tokyo">偏好：东京 (Tokyo)</option>
-                        <option value="singapore">偏好：新加坡 (Singapore)</option>
-                        <option value="netherlands">偏好：荷兰 (Netherlands)</option>
-                        <option value="india">偏好：印度 (India)</option>
+                        <option value="hongkong">🇭🇰 偏好：中国香港 (Hong Kong)</option>
+                        <option value="tokyo">🇯🇵 偏好：日本东京 (Tokyo)</option>
+                        <option value="singapore">🇸🇬 偏好：新加坡 (Singapore)</option>
+                        <option value="us-west">🇺🇸 偏好：美西/美国 (US)</option>
+                        <option value="france">🇫🇷 偏好：法国 (France)</option>
+                        <option value="italy">🇮🇹 偏好：意大利 (Italy)</option>
+                        <option value="germany">🇩🇪 偏好：德国 (Germany)</option>
+                        <option value="netherlands">🇳🇱 偏好：荷兰 (Netherlands)</option>
+                        <option value="india">🇮🇳 偏好：印度 (India)</option>
+                        <option value="taiwan">🇹🇼 偏好：中国台湾 (Taiwan)</option>
+                        <option value="china">🇨🇳 偏好：中国大陆 (China)</option>
+                        <option value="russia">🇷🇺 偏好：俄罗斯 (Russia)</option>
+                        <option value="australia">🇦🇺 偏好：澳大利亚 (Australia)</option>
+                        <option value="united-kingdom">🇬🇧 偏好：英国 (UK)</option>
+                        <option value="korea">🇰🇷 偏好：韩国 (Korea)</option>
+                        <option value="vietnam">🇻🇳 偏好：越南 (Vietnam)</option>
+                        <option value="switzerland">🇨🇭 偏好：瑞士 (Switzerland)</option>
                     </select>
                     <button onclick="simulateAcquire()" class="px-3.5 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-medium rounded-lg transition shadow">
                         计算租约
@@ -292,12 +320,24 @@
         let currentLease = null;
 
         const REGION_NAMES = {
-            'tokyo': '日本东京 (Tokyo AWS)',
-            'singapore': '新加坡 (Singapore Google云)',
-            'netherlands': '荷兰莱利斯塔德 (LeaseWeb NL)',
-            'india': '印度中部 (Central India Azure)',
-            'hongkong': '中国香港 (Hong Kong Azure)',
-            'us-west': '美西圣何塞 (US-West GCP)'
+            'hongkong': '🇭🇰 中国香港 (Hong Kong Azure/DGN)',
+            'tokyo': '🇯🇵 日本东京 (Tokyo AWS)',
+            'singapore': '🇸🇬 新加坡 (Singapore Google云)',
+            'us-west': '🇺🇸 美西/美国 (US GCP/Muse-VM)',
+            'france': '🇫🇷 法国 (France OVH/Katabump)',
+            'italy': '🇮🇹 意大利 (Italy Botkeep/Milan)',
+            'germany': '🇩🇪 德国法兰克福 (Germany Frankfurt)',
+            'netherlands': '🇳🇱 荷兰莱利斯塔德 (LeaseWeb NL)',
+            'india': '🇮🇳 印度中部 (Central India Azure)',
+            'taiwan': '🇹🇼 中国台湾 (Taiwan Hinet)',
+            'china': '🇨🇳 中国大陆 (China 华为/腾讯/阿里)',
+            'russia': '🇷🇺 俄罗斯新西伯利亚 (Russia JustHost)',
+            'australia': '🇦🇺 澳大利亚悉尼 (Australia Sydney)',
+            'united-kingdom': '🇬🇧 英国伦敦 (UK London)',
+            'korea': '🇰🇷 韩国首尔 (Korea Seoul)',
+            'vietnam': '🇻🇳 越南河内 (Vietnam TotHost)',
+            'switzerland': '🇨🇭 瑞士 (Switzerland BuyVM)',
+            'global': '🌐 全球节点 (Global)'
         };
 
         async function loadData() {
@@ -340,6 +380,11 @@
                     btn.classList.add('text-slate-400');
                 }
             });
+            const moreSelect = document.getElementById('filter-region-more');
+            if (moreSelect) {
+                const hasOption = Array.from(moreSelect.options).some(o => o.value === region);
+                moreSelect.value = hasOption ? region : '';
+            }
             applyFilters();
         }
 
@@ -431,6 +476,8 @@
                 typeBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] bg-purple-500/10 text-purple-300">原生 v4</span>';
             } else if (node.egress_type === 'native_ipv6') {
                 typeBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] bg-indigo-500/10 text-indigo-300">原生 v6</span>';
+            } else if (node.egress_type === 'clash_proxy') {
+                typeBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] bg-amber-500/10 text-amber-300">Clash 出口</span>';
             }
 
             const latency = node.latency_ms ? `${node.latency_ms}ms` : '--';

@@ -408,6 +408,7 @@ class Storage:
             warp_v6 = conn.execute("SELECT COUNT(*) FROM nodes WHERE egress_type = 'warp_ipv6'").fetchone()[0]
             nat_v4 = conn.execute("SELECT COUNT(*) FROM nodes WHERE egress_type = 'native_ipv4'").fetchone()[0]
             nat_v6 = conn.execute("SELECT COUNT(*) FROM nodes WHERE egress_type = 'native_ipv6'").fetchone()[0]
+            clash_proxy = conn.execute("SELECT COUNT(*) FROM nodes WHERE egress_type = 'clash_proxy'").fetchone()[0]
 
             regions = {}
             for row in conn.execute("SELECT region, COUNT(*) as c FROM nodes GROUP BY region").fetchall():
@@ -422,6 +423,7 @@ class Storage:
                 warp_ipv6_count=warp_v6,
                 native_ipv4_count=nat_v4,
                 native_ipv6_count=nat_v6,
+                clash_proxy_count=clash_proxy,
                 region_distribution=regions
             )
 

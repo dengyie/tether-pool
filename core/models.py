@@ -11,6 +11,7 @@ class EgressType(str, Enum):
     WARP_IPV6 = "warp_ipv6"
     NATIVE_IPV4 = "native_ipv4"
     NATIVE_IPV6 = "native_ipv6"
+    CLASH_PROXY = "clash_proxy"
 
 
 class HealthStatus(str, Enum):
@@ -81,4 +82,5 @@ class PoolStats(BaseModel):
     warp_ipv6_count: int
     native_ipv4_count: int
     native_ipv6_count: int
+    clash_proxy_count: int = 0
     region_distribution: dict

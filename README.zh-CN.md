@@ -5,7 +5,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-30%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-36%20passed-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 [English Documentation (README.md)](README.md)
@@ -90,7 +90,7 @@ pip install -r requirements.txt
 ```
 10 秒内完整跑通全池拓扑校验、双栈实时探活、断路器熔断自愈演练与 `:9101` 正向网关转发验证。
 
-### 3. 执行自动化测试 (30 项全绿)
+### 3. 执行自动化测试 (36 项全绿)
 ```bash
 .venv/bin/pytest -v
 ```
@@ -150,9 +150,10 @@ curl -x http://bob:secret@127.0.0.1:9101 \
 ```
 ip-pool/
 ├── config/
-│   └── nodes.yaml              # 108 个出站节点静态拓扑配置
+│   └── nodes.yaml              # 出站节点拓扑配置
 ├── core/
 │   ├── circuit.py              # 四态断路器状态机与退避冷却算法
+│   ├── clash_importer.py       # Clash / 3X-UI 节点导入与 Mihomo SOCKS5 桥接
 │   ├── metrics.py              # 低基数 Prometheus 监控导出器
 │   ├── models.py               # Pydantic 领域模型与数据契约
 │   ├── prober.py               # 异步双栈探活器
@@ -170,7 +171,7 @@ ip-pool/
 │   ├── gemini_adapter.py       # Gemini Web 逆向出站适配器
 │   ├── playwright_pool.py      # Python 爬虫与 Playwright 代理池 SDK
 │   └── grok2api_adapter.py     # Grok 2,103 账号增量同步与洗牌
-├── tests/                      # 隔离沙箱自动化单元测试 (30 项全绿)
+├── tests/                      # 隔离沙箱自动化单元测试 (36 项全绿)
 ├── demo.py                     # 端到端交互式全功能演练脚本
 ├── requirements.txt            # Python 依赖清单
 └── start.sh                    # 双进程后台守护启停脚本
