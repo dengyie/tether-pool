@@ -13,20 +13,11 @@ class EgressType(str, Enum):
     NATIVE_IPV6 = "native_ipv6"
 
 
-class Region(str, Enum):
-    TOKYO = "tokyo"
-    NETHERLANDS = "netherlands"
-    SINGAPORE = "singapore"
-    INDIA = "india"
-    HONGKONG = "hongkong"
-    US = "us"
-    GLOBAL = "global"
-
-
 class HealthStatus(str, Enum):
-    HEALTHY = "healthy"
-    DEGRADED = "degraded"
-    DEAD = "dead"
+    HEALTHY = "healthy"      # Closed circuit: fully operational
+    DEGRADED = "degraded"    # Unstable: high latency or single failure
+    DEAD = "dead"            # Open circuit: isolated / failing
+    HALF_OPEN = "half_open"  # Trial probe circuit: cooldown elapsed
     UNPROBED = "unprobed"
 
 
@@ -44,10 +35,23 @@ class ProxyNode(BaseModel):
     status: str = HealthStatus.UNPROBED.value
     fail_count: int = 0
     last_probed_at: Optional[str] = None
+    circuit_state: str = HealthStatus.UNPROBED.value
+    consecutive_failures: int = 0
+    consecutive_successes: int = 0
+    next_probe_allowed_at: Optional[str] = None
 
     @property
     def proxy_url(self) -> str:
         return f"{self.protocol}://{self.host}:{self.port}"
+
+
+class CircuitEvent(BaseModel):
+    id: Optional[int] = None
+    node_name: str
+    from_state: str
+    to_state: str
+    reason: str
+    created_at: str
 
 
 class ProbeResult(BaseModel):

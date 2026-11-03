@@ -6,4 +6,5 @@ data/ip_pool.db*
 data/ip_pool.pid
 logs/
 *.pid
+.pytest_cache/
 .DS_Store

@@ -9,17 +9,23 @@ from contextlib import asynccontextmanager
 from typing import Optional, List
 from fastapi import FastAPI, Query, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse, HTMLResponse, RedirectResponse
 
-from core.models import ProxyNode, PoolStats, LeaseInfo, ProbeResult
+from core.models import ProxyNode, PoolStats, LeaseInfo, ProbeResult, CircuitEvent
 from core.storage import Storage
 from core.prober import Prober
 from core.router import Router
+from core.metrics import MetricsCollector
+from adapters.cpa_adapter import CpaAdapter
 
 CONFIG_FILE = os.environ.get("IP_POOL_CONFIG", os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "nodes.yaml"))
+DASHBOARD_HTML = os.path.join(os.path.dirname(os.path.dirname(__file__)), "web", "templates", "dashboard.html")
 
 storage = Storage()
-prober = Prober(storage)
 router = Router(storage)
+prober = Prober(storage, router=router)
+metrics_collector = MetricsCollector(storage)
+cpa_adapter = CpaAdapter(storage)
 
 
 def load_initial_nodes():
@@ -79,7 +85,20 @@ app.add_middleware(
 )
 
 
-@app.get("/health")
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
+def index():
+    return RedirectResponse(url="/dashboard")
+
+
+@app.api_route("/dashboard", methods=["GET", "HEAD"], response_class=HTMLResponse)
+def get_dashboard():
+    if os.path.exists(DASHBOARD_HTML):
+        with open(DASHBOARD_HTML, "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    return HTMLResponse(content="<h1>Dashboard file not found</h1>", status_code=404)
+
+
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {"status": "ok", "service": "ip-pool"}
 
@@ -124,6 +143,16 @@ async def trigger_probe(background_tasks: BackgroundTasks):
     return {"message": "Full pool probe triggered in background"}
 
 
+@app.post("/v1/probe/test_node", response_model=ProbeResult)
+async def test_single_node(node_name: str = Query(..., description="Node name to test")):
+    """Immediately test a single node over EasyTier and return live egress result"""
+    node = storage.get_node(node_name)
+    if not node:
+        raise HTTPException(status_code=404, detail=f"Node {node_name} not found")
+    res = await prober.probe_node(node, force=True)
+    return res
+
+
 @app.get("/v1/export/grok2api")
 def export_grok2api():
     """Export healthy nodes formatted for grok2api egress node injection"""
@@ -144,18 +173,41 @@ def export_grok2api():
 
 
 @app.get("/v1/export/cpa")
-def export_cpa():
-    """Export native and WARP nodes for CPA configuration"""
-    nodes = storage.list_nodes(status="healthy")
-    return {
-        "proxies": [
-            {
-                "id": n.name,
-                "proxy_url": f"socks5://{n.host}:{n.port}",
-                "region": n.region,
-                "type": n.egress_type,
-                "exit_ip": n.exit_ip or ""
-            }
-            for n in nodes
-        ]
-    }
+def export_cpa(
+    region: Optional[str] = Query(None, description="Optional region filter"),
+    egress_type: Optional[str] = Query(None, description="Optional egress type filter")
+):
+    """Export native and WARP nodes for CPA configuration via CpaAdapter"""
+    return cpa_adapter.generate_cpa_config(region=region, egress_type=egress_type)
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+def get_metrics():
+    """Prometheus OpenMetrics exporter with low-cardinality labels"""
+    return PlainTextResponse(
+        content=metrics_collector.generate_metrics(),
+        media_type="text/plain; version=0.0.4; charset=utf-8"
+    )
+
+
+@app.get("/v1/circuit/events", response_model=List[CircuitEvent])
+def list_circuit_events(limit: int = Query(50, ge=1, le=200)):
+    """Retrieve recent circuit breaker transition and self-healing events"""
+    return storage.list_circuit_events(limit=limit)
+
+
+@app.post("/v1/circuit/reset")
+def reset_node_circuit(node_name: str = Query(..., description="Node name to reset")):
+    """Operator manual reset of a node back to healthy state"""
+    success = storage.reset_node_circuit(node_name)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Node {node_name} not found")
+    return {"message": f"Node {node_name} circuit reset to healthy"}
+
+
+@app.post("/v1/circuit/rehome")
+def trigger_node_rehome(node_name: str = Query(..., description="Node name whose leases should be migrated")):
+    """Trigger manual lease re-homing for a node"""
+    result = router.rehome_leases_for_node(node_name)
+    return result
+

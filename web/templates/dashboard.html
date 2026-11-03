@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IP Pool 控制台 - 全局双栈出口调度中枢</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        dark: {
+                            900: '#070a12',
+                            800: '#0d1322',
+                            700: '#141c30',
+                            600: '#1e2945'
+                        },
+                        cyber: {
+                            cyan: '#06b6d4',
+                            emerald: '#10b981',
+                            amber: '#f59e0b',
+                            rose: '#f43f5e'
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #070a12; }
+        ::-webkit-scrollbar-thumb { background: #1e2945; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #06b6d4; }
+        .glass { background: rgba(13, 19, 34, 0.75); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.08); }
+        .glass-card { background: rgba(20, 28, 48, 0.65); backdrop-filter: blur(8px); border: 1px solid rgba(255, 255, 255, 0.06); }
+        .glass-card:hover { border-color: rgba(6, 182, 212, 0.4); transform: translateY(-2px); transition: all 0.2s ease; }
+    </style>
+</head>
+<body class="bg-dark-900 text-slate-100 min-h-screen font-sans selection:bg-cyan-500/30 selection:text-cyan-200">
+
+    <!-- Top Navigation Header -->
+    <header class="glass sticky top-0 z-50 px-6 py-4 border-b border-slate-800/80">
+        <div class="max-w-7xl mx-auto flex flex-col md:flex-row md:items-center justify-between gap-4">
+            <div class="flex items-center space-x-3">
+                <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-cyan-600 to-emerald-500 flex items-center justify-center shadow-lg shadow-cyan-500/20">
+                    <span class="text-xl">🌐</span>
+                </div>
+                <div>
+                    <div class="flex items-center space-x-2">
+                        <h1 class="text-xl font-bold tracking-tight text-white">IP Pool 全局双栈调度中枢</h1>
+                        <span class="px-2 py-0.5 text-xs font-semibold rounded-full bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">v2.0-DualMode</span>
+                    </div>
+                    <p class="text-xs text-slate-400">108 独立出口 (100 WARP IPv6 + 8 机房原生) · EasyTier 网格零公网暴露</p>
+                </div>
+            </div>
+
+            <!-- Top Action Controls -->
+            <div class="flex items-center flex-wrap gap-2.5">
+                <button id="btn-probe-all" onclick="triggerProbeAll()" class="px-4 py-2 text-xs font-medium rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white transition flex items-center space-x-1.5 shadow-md shadow-cyan-600/20">
+                    <span id="probe-spinner" class="hidden animate-spin">🔄</span>
+                    <span id="probe-icon">⚡</span>
+                    <span id="probe-text">全池并发探活</span>
+                </button>
+                <button onclick="loadData()" class="px-3 py-2 text-xs font-medium rounded-lg bg-dark-700 hover:bg-dark-600 text-slate-200 border border-slate-700 transition flex items-center space-x-1.5">
+                    <span>🔄</span>
+                    <span>刷新</span>
+                </button>
+                <a href="/docs" target="_blank" class="px-3 py-2 text-xs font-medium rounded-lg bg-dark-700 hover:bg-dark-600 text-slate-300 border border-slate-700 transition flex items-center space-x-1">
+                    <span>📡</span>
+                    <span>REST API</span>
+                </a>
+                <a href="/metrics" target="_blank" class="px-3 py-2 text-xs font-medium rounded-lg bg-dark-700 hover:bg-dark-600 text-emerald-400 border border-slate-700 transition flex items-center space-x-1">
+                    <span>📊</span>
+                    <span>Prometheus</span>
+                </a>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto px-6 py-6 space-y-6">
+
+        <!-- KPI Metrics Ribbon -->
+        <div class="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div class="glass-card p-4 rounded-xl">
+                <div class="flex justify-between items-start">
+                    <span class="text-xs font-medium text-slate-400">纳管出口总量</span>
+                    <span class="p-1.5 rounded-lg bg-cyan-500/10 text-cyan-400 text-sm">🌍</span>
+                </div>
+                <div class="mt-2 flex items-baseline space-x-2">
+                    <span id="stat-total-nodes" class="text-2xl font-bold text-white">--</span>
+                    <span class="text-xs text-slate-400">个节点</span>
+                </div>
+                <div class="mt-2 text-xs text-slate-400 flex justify-between">
+                    <span>100 WARP IPv6</span>
+                    <span>8 原生出口</span>
+                </div>
+            </div>
+
+            <div class="glass-card p-4 rounded-xl">
+                <div class="flex justify-between items-start">
+                    <span class="text-xs font-medium text-slate-400">健康率 (Healthy)</span>
+                    <span class="p-1.5 rounded-lg bg-emerald-500/10 text-emerald-400 text-sm">🟢</span>
+                </div>
+                <div class="mt-2 flex items-baseline space-x-2">
+                    <span id="stat-healthy-ratio" class="text-2xl font-bold text-emerald-400">--%</span>
+                    <span id="stat-healthy-count" class="text-xs text-slate-400">(-- / --)</span>
+                </div>
+                <div class="mt-2 w-full bg-dark-700 rounded-full h-1.5 overflow-hidden">
+                    <div id="stat-healthy-bar" class="bg-emerald-500 h-1.5 rounded-full transition-all duration-500" style="width: 0%"></div>
+                </div>
+            </div>
+
+            <div class="glass-card p-4 rounded-xl">
+                <div class="flex justify-between items-start">
+                    <span class="text-xs font-medium text-slate-400">平均往返延迟 (RTT)</span>
+                    <span class="p-1.5 rounded-lg bg-amber-500/10 text-amber-400 text-sm">⚡</span>
+                </div>
+                <div class="mt-2 flex items-baseline space-x-2">
+                    <span id="stat-avg-rtt" class="text-2xl font-bold text-amber-300">--</span>
+                    <span class="text-xs text-slate-400">ms</span>
+                </div>
+                <div class="mt-2 text-xs text-slate-400 flex justify-between">
+                    <span id="stat-degraded-count">降级: --</span>
+                    <span id="stat-dead-count" class="text-rose-400">熔断: --</span>
+                </div>
+            </div>
+
+            <div class="glass-card p-4 rounded-xl">
+                <div class="flex justify-between items-start">
+                    <span class="text-xs font-medium text-slate-400">当前生效粘性租约</span>
+                    <span class="p-1.5 rounded-lg bg-purple-500/10 text-purple-400 text-sm">🔑</span>
+                </div>
+                <div class="mt-2 flex items-baseline space-x-2">
+                    <span id="stat-leases-count" class="text-2xl font-bold text-purple-300">--</span>
+                    <span class="text-xs text-slate-400">个账号映射</span>
+                </div>
+                <div class="mt-2 text-xs text-slate-400">
+                    <span>支持 CRC32 粘性会话与同域自愈</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Filter & Search Toolbar -->
+        <div class="glass p-4 rounded-xl flex flex-col md:flex-row gap-4 justify-between items-stretch md:items-center">
+            <!-- Search Input -->
+            <div class="relative flex-1 max-w-md">
+                <span class="absolute inset-y-0 left-3 flex items-center text-slate-400 text-sm">🔍</span>
+                <input type="text" id="filter-search" oninput="applyFilters()" placeholder="搜索节点名、内网IP、出口IP..."
+                    class="w-full pl-9 pr-4 py-2 bg-dark-700/80 border border-slate-700 rounded-lg text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-cyan-500 transition">
+            </div>
+
+            <!-- Region & Protocol Filter Pills -->
+            <div class="flex flex-wrap items-center gap-2">
+                <div class="flex items-center bg-dark-700/80 p-1 rounded-lg border border-slate-700 text-xs">
+                    <button class="filter-region-btn px-2.5 py-1 rounded-md bg-cyan-600 text-white font-medium" data-region="" onclick="setRegionFilter('')">全地域</button>
+                    <button class="filter-region-btn px-2.5 py-1 rounded-md text-slate-400 hover:text-white" data-region="tokyo" onclick="setRegionFilter('tokyo')">东京</button>
+                    <button class="filter-region-btn px-2.5 py-1 rounded-md text-slate-400 hover:text-white" data-region="singapore" onclick="setRegionFilter('singapore')">新加坡</button>
+                    <button class="filter-region-btn px-2.5 py-1 rounded-md text-slate-400 hover:text-white" data-region="netherlands" onclick="setRegionFilter('netherlands')">荷兰</button>
+                    <button class="filter-region-btn px-2.5 py-1 rounded-md text-slate-400 hover:text-white" data-region="india" onclick="setRegionFilter('india')">印度</button>
+                    <button class="filter-region-btn px-2.5 py-1 rounded-md text-slate-400 hover:text-white" data-region="hongkong" onclick="setRegionFilter('hongkong')">香港</button>
+                    <button class="filter-region-btn px-2.5 py-1 rounded-md text-slate-400 hover:text-white" data-region="us-west" onclick="setRegionFilter('us-west')">美西</button>
+                </div>
+
+                <div class="flex items-center bg-dark-700/80 p-1 rounded-lg border border-slate-700 text-xs">
+                    <button class="filter-status-btn px-2.5 py-1 rounded-md bg-cyan-600 text-white font-medium" data-status="" onclick="setStatusFilter('')">全状态</button>
+                    <button class="filter-status-btn px-2.5 py-1 rounded-md text-emerald-400 hover:text-white" data-status="healthy" onclick="setStatusFilter('healthy')">健康</button>
+                    <button class="filter-status-btn px-2.5 py-1 rounded-md text-amber-400 hover:text-white" data-status="degraded" onclick="setStatusFilter('degraded')">降级</button>
+                    <button class="filter-status-btn px-2.5 py-1 rounded-md text-rose-400 hover:text-white" data-status="dead" onclick="setStatusFilter('dead')">熔断</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Sticky Lease Simulator Drawer -->
+        <div class="glass p-5 rounded-xl border border-cyan-500/20">
+            <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+                <div>
+                    <h2 class="text-sm font-semibold text-white flex items-center space-x-2">
+                        <span>🧪 账号粘性租约与连通性模拟器</span>
+                        <span class="text-xs px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">验证端到端出站</span>
+                    </h2>
+                    <p class="text-xs text-slate-400 mt-1">输入业务账号或爬虫标识，即刻计算确定性 CRC32 路由映射，并发起真实公网请求验证</p>
+                </div>
+                <div class="flex flex-wrap items-center gap-2 w-full md:w-auto">
+                    <input type="text" id="sim-account" placeholder="输入 Account ID (如 user@mango.com)" value="demo_user@mango.com"
+                        class="px-3 py-1.5 bg-dark-700 border border-slate-700 rounded-lg text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-cyan-500 w-full sm:w-64">
+                    <select id="sim-region" class="px-2.5 py-1.5 bg-dark-700 border border-slate-700 rounded-lg text-xs text-slate-200 focus:outline-none">
+                        <option value="">全球随机优选</option>
+                        <option value="tokyo">偏好：东京 (Tokyo)</option>
+                        <option value="singapore">偏好：新加坡 (Singapore)</option>
+                        <option value="netherlands">偏好：荷兰 (Netherlands)</option>
+                        <option value="india">偏好：印度 (India)</option>
+                    </select>
+                    <button onclick="simulateAcquire()" class="px-3.5 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-medium rounded-lg transition shadow">
+                        计算租约
+                    </button>
+                </div>
+            </div>
+
+            <!-- Simulation Result Card -->
+            <div id="sim-result" class="hidden mt-4 p-4 rounded-lg bg-dark-800/80 border border-slate-700 text-xs flex flex-col md:flex-row justify-between items-start md:items-center gap-3">
+                <div class="space-y-1">
+                    <div class="flex items-center space-x-2">
+                        <span class="text-slate-400">账号标识:</span>
+                        <span id="sim-res-account" class="font-mono text-cyan-300 font-bold"></span>
+                        <span class="text-slate-500">→</span>
+                        <span class="text-slate-400">已分配节点:</span>
+                        <span id="sim-res-node" class="font-mono font-bold text-emerald-400"></span>
+                    </div>
+                    <div class="flex items-center space-x-4 text-slate-400">
+                        <span>Mesh 代理: <span id="sim-res-url" class="font-mono text-slate-200"></span></span>
+                        <span>区域: <span id="sim-res-region" class="uppercase text-cyan-400 font-semibold"></span></span>
+                        <span>类型: <span id="sim-res-type" class="text-slate-300"></span></span>
+                    </div>
+                </div>
+                <div class="flex items-center space-x-2">
+                    <span id="sim-live-status" class="text-slate-400"></span>
+                    <button id="btn-test-proxy" onclick="testSimProxy()" class="px-3 py-1 bg-dark-600 hover:bg-dark-500 border border-slate-600 rounded text-slate-200 text-xs">
+                        🚀 发起公网 Trace 验证
+                    </button>
+                </div>
+            </div>
+            <div id="sim-trace-output" class="hidden mt-3 p-3 rounded bg-black/60 font-mono text-xs text-emerald-400 whitespace-pre-wrap border border-slate-800"></div>
+        </div>
+
+        <!-- Node Matrix Section -->
+        <div class="space-y-4">
+            <div class="flex justify-between items-center">
+                <h2 class="text-base font-bold text-white flex items-center space-x-2">
+                    <span>🌍 全球节点矩阵分布</span>
+                    <span id="nodes-count-badge" class="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 border border-slate-700">加载中...</span>
+                </h2>
+                <div class="text-xs text-slate-400 flex items-center space-x-4">
+                    <span class="flex items-center space-x-1"><span class="w-2 h-2 rounded-full bg-emerald-400"></span><span>健康 (Healthy)</span></span>
+                    <span class="flex items-center space-x-1"><span class="w-2 h-2 rounded-full bg-amber-400"></span><span>降级 (Degraded)</span></span>
+                    <span class="flex items-center space-x-1"><span class="w-2 h-2 rounded-full bg-rose-500"></span><span>熔断 (Dead)</span></span>
+                </div>
+            </div>
+
+            <!-- Regional Groups Container -->
+            <div id="regions-container" class="space-y-6">
+                <!-- Injected via JavaScript -->
+            </div>
+        </div>
+
+        <!-- Recent Circuit Breaker Events Log -->
+        <div class="glass p-5 rounded-xl space-y-3">
+            <div class="flex justify-between items-center">
+                <h3 class="text-sm font-semibold text-white flex items-center space-x-2">
+                    <span>🛡️ 最近断路器与自愈审计事件</span>
+                    <span class="text-xs text-slate-400">(Circuit Breaker Events)</span>
+                </h3>
+                <button onclick="loadCircuitEvents()" class="text-xs text-cyan-400 hover:underline">刷新审计</button>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-xs text-slate-300">
+                    <thead class="bg-dark-700/60 text-slate-400 uppercase text-[10px] tracking-wider">
+                        <tr>
+                            <th class="py-2 px-3">时间</th>
+                            <th class="py-2 px-3">节点名称</th>
+                            <th class="py-2 px-3">原状态</th>
+                            <th class="py-2 px-3">新状态</th>
+                            <th class="py-2 px-3">原因</th>
+                        </tr>
+                    </thead>
+                    <tbody id="circuit-events-body" class="divide-y divide-slate-800">
+                        <tr><td colspan="5" class="py-4 text-center text-slate-500">正在获取断路器变迁记录...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </main>
+
+    <footer class="mt-12 py-6 border-t border-slate-800/60 text-center text-xs text-slate-500">
+        <p>Unified IP Pool System · Private EasyTier Backbone Mesh · Designed for Enterprise Resilient AI Scaling</p>
+    </footer>
+
+    <!-- JavaScript Application Logic -->
+    <script>
+        function escapeHtml(str) {
+            if (!str) return '';
+            return String(str).replace(/[&<>"']/g, m => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            })[m]);
+        }
+
+        let allNodes = [];
+        let currentRegionFilter = '';
+        let currentStatusFilter = '';
+        let currentLease = null;
+
+        const REGION_NAMES = {
+            'tokyo': '日本东京 (Tokyo AWS)',
+            'singapore': '新加坡 (Singapore Google云)',
+            'netherlands': '荷兰莱利斯塔德 (LeaseWeb NL)',
+            'india': '印度中部 (Central India Azure)',
+            'hongkong': '中国香港 (Hong Kong Azure)',
+            'us-west': '美西圣何塞 (US-West GCP)'
+        };
+
+        async function loadData() {
+            try {
+                // 1. Load Stats
+                const statsRes = await fetch('/v1/stats');
+                const stats = await statsRes.json();
+                renderStats(stats);
+
+                // 2. Load Nodes
+                const nodesRes = await fetch('/v1/nodes');
+                allNodes = await nodesRes.json();
+                applyFilters();
+
+                // 3. Load Events
+                loadCircuitEvents();
+            } catch (err) {
+                console.error("Failed to load pool data:", err);
+            }
+        }
+
+        function renderStats(stats) {
+            document.getElementById('stat-total-nodes').innerText = stats.total_nodes;
+            const ratio = stats.total_nodes > 0 ? Math.round((stats.healthy_nodes / stats.total_nodes) * 100) : 0;
+            document.getElementById('stat-healthy-ratio').innerText = ratio + '%';
+            document.getElementById('stat-healthy-count').innerText = `(${stats.healthy_nodes} / ${stats.total_nodes})`;
+            document.getElementById('stat-healthy-bar').style.width = ratio + '%';
+            document.getElementById('stat-degraded-count').innerText = `降级: ${stats.degraded_nodes}`;
+            document.getElementById('stat-dead-count').innerText = `熔断: ${stats.dead_nodes}`;
+        }
+
+        function setRegionFilter(region) {
+            currentRegionFilter = region;
+            document.querySelectorAll('.filter-region-btn').forEach(btn => {
+                if (btn.getAttribute('data-region') === region) {
+                    btn.classList.add('bg-cyan-600', 'text-white', 'font-medium');
+                    btn.classList.remove('text-slate-400');
+                } else {
+                    btn.classList.remove('bg-cyan-600', 'text-white', 'font-medium');
+                    btn.classList.add('text-slate-400');
+                }
+            });
+            applyFilters();
+        }
+
+        function setStatusFilter(status) {
+            currentStatusFilter = status;
+            document.querySelectorAll('.filter-status-btn').forEach(btn => {
+                if (btn.getAttribute('data-status') === status) {
+                    btn.classList.add('bg-cyan-600', 'text-white', 'font-medium');
+                    btn.classList.remove('text-slate-400');
+                } else {
+                    btn.classList.remove('bg-cyan-600', 'text-white', 'font-medium');
+                    btn.classList.add('text-slate-400');
+                }
+            });
+            applyFilters();
+        }
+
+        function applyFilters() {
+            const search = document.getElementById('filter-search').value.toLowerCase().trim();
+            const filtered = allNodes.filter(n => {
+                if (currentRegionFilter && n.region !== currentRegionFilter) return false;
+                if (currentStatusFilter && n.status !== currentStatusFilter) return false;
+                if (search) {
+                    const matchName = n.name.toLowerCase().includes(search);
+                    const matchHost = n.host.toLowerCase().includes(search);
+                    const matchExit = (n.exit_ip || '').toLowerCase().includes(search);
+                    if (!matchName && !matchHost && !matchExit) return false;
+                }
+                return true;
+            });
+
+            document.getElementById('nodes-count-badge').innerText = `展示 ${filtered.length} / ${allNodes.length} 个节点`;
+            renderRegions(filtered);
+        }
+
+        function renderRegions(nodes) {
+            const container = document.getElementById('regions-container');
+            container.innerHTML = '';
+
+            // Group by region
+            const grouped = {};
+            nodes.forEach(n => {
+                if (!grouped[n.region]) grouped[n.region] = [];
+                grouped[n.region].push(n);
+            });
+
+            const regions = Object.keys(grouped).sort();
+            if (regions.length === 0) {
+                container.innerHTML = `<div class="p-8 text-center text-slate-500 glass rounded-xl">无符合筛选条件的节点</div>`;
+                return;
+            }
+
+            regions.forEach(region => {
+                const regionNodes = grouped[region];
+                const regionName = REGION_NAMES[region] || region.toUpperCase();
+                const healthyCount = regionNodes.filter(n => n.status === 'healthy').length;
+
+                const regionCard = document.createElement('div');
+                regionCard.className = 'glass p-5 rounded-xl space-y-4';
+
+                regionCard.innerHTML = `
+                    <div class="flex justify-between items-center border-b border-slate-800 pb-3">
+                        <div class="flex items-center space-x-2.5">
+                            <span class="text-base font-bold text-white">${regionName}</span>
+                            <span class="px-2 py-0.5 rounded text-[11px] font-semibold bg-dark-700 text-cyan-400 border border-slate-700">${regionNodes.length} 个出口</span>
+                        </div>
+                        <div class="text-xs text-slate-400">
+                            健康节点: <span class="text-emerald-400 font-bold">${healthyCount}</span> / ${regionNodes.length}
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+                        ${regionNodes.map(renderNodeCard).join('')}
+                    </div>
+                `;
+                container.appendChild(regionCard);
+            });
+        }
+
+        function renderNodeCard(node) {
+            let statusBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">🟢 健康</span>';
+            if (node.status === 'degraded') {
+                statusBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20">🟡 降级</span>';
+            } else if (node.status === 'dead') {
+                statusBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-rose-500/10 text-rose-400 border border-rose-500/20">🔴 熔断</span>';
+            }
+
+            let typeBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/10 text-cyan-300">WARP v6</span>';
+            if (node.egress_type === 'native_ipv4') {
+                typeBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] bg-purple-500/10 text-purple-300">原生 v4</span>';
+            } else if (node.egress_type === 'native_ipv6') {
+                typeBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] bg-indigo-500/10 text-indigo-300">原生 v6</span>';
+            }
+
+            const latency = node.latency_ms ? `${node.latency_ms}ms` : '--';
+            let latencyColor = 'text-emerald-400';
+            if (node.latency_ms > 3000) latencyColor = 'text-amber-400';
+            if (node.latency_ms > 8000) latencyColor = 'text-rose-400';
+
+            const exitIp = node.exit_ip ? node.exit_ip : '未探活';
+            const safeName = escapeHtml(node.name);
+            const safeExitIp = escapeHtml(exitIp);
+            const safeEncodedName = encodeURIComponent(node.name);
+
+            return `
+                <div class="glass-card p-3 rounded-lg space-y-2 text-xs">
+                    <div class="flex justify-between items-center">
+                        <span class="font-mono font-bold text-slate-200 truncate pr-1" title="${safeName}">${safeName}</span>
+                        ${statusBadge}
+                    </div>
+                    <div class="flex justify-between items-center text-slate-400">
+                        <span>${typeBadge}</span>
+                        <span class="font-mono ${latencyColor}">${latency}</span>
+                    </div>
+                    <div class="p-1.5 rounded bg-black/40 border border-slate-800/80 font-mono text-[11px] text-slate-300 truncate" title="${safeExitIp}">
+                        ${safeExitIp}
+                    </div>
+                    <div class="flex justify-between items-center pt-1 border-t border-slate-800 text-[10px] text-slate-500">
+                        <span>:${node.port}</span>
+                        <div class="flex space-x-1.5">
+                            <button onclick="resetNodeCircuit(decodeURIComponent('${safeEncodedName}'))" class="text-slate-400 hover:text-cyan-400" title="重置断路器">🔄复位</button>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        async function triggerProbeAll() {
+            const btn = document.getElementById('btn-probe-all');
+            const spinner = document.getElementById('probe-spinner');
+            const icon = document.getElementById('probe-icon');
+            const text = document.getElementById('probe-text');
+
+            spinner.classList.remove('hidden');
+            icon.classList.add('hidden');
+            text.innerText = '探活已触发...';
+            btn.disabled = true;
+
+            try {
+                const res = await fetch('/v1/probe', { method: 'POST' });
+                const data = await res.json();
+                setTimeout(() => {
+                    loadData();
+                    spinner.classList.add('hidden');
+                    icon.classList.remove('hidden');
+                    text.innerText = '全池并发探活';
+                    btn.disabled = false;
+                }, 4000);
+            } catch (err) {
+                alert('探活请求失败: ' + err);
+                spinner.classList.add('hidden');
+                icon.classList.remove('hidden');
+                text.innerText = '全池并发探活';
+                btn.disabled = false;
+            }
+        }
+
+        async function simulateAcquire() {
+            const account = document.getElementById('sim-account').value.trim();
+            const region = document.getElementById('sim-region').value;
+            if (!account) return alert('请输入 Account ID');
+
+            let url = `/v1/acquire?account_id=${encodeURIComponent(account)}`;
+            if (region) url += `&region=${encodeURIComponent(region)}`;
+
+            try {
+                const res = await fetch(url);
+                if (!res.ok) throw new Error(await res.text());
+                const lease = await res.json();
+                currentLease = lease;
+
+                document.getElementById('sim-result').classList.remove('hidden');
+                document.getElementById('sim-res-account').innerText = lease.account_id;
+                document.getElementById('sim-res-node').innerText = lease.node_name;
+                document.getElementById('sim-res-url').innerText = lease.proxy_url;
+                document.getElementById('sim-res-region').innerText = lease.region;
+                document.getElementById('sim-res-type').innerText = lease.egress_type;
+                document.getElementById('sim-live-status').innerText = '';
+                document.getElementById('sim-trace-output').classList.add('hidden');
+            } catch (err) {
+                alert('获取租约失败: ' + err);
+            }
+        }
+
+        async function testSimProxy() {
+            if (!currentLease) return;
+            const btn = document.getElementById('btn-test-proxy');
+            const status = document.getElementById('sim-live-status');
+            const output = document.getElementById('sim-trace-output');
+
+            btn.disabled = true;
+            status.innerText = '正在通过代理向 Cloudflare 验证...';
+            output.classList.add('hidden');
+
+            try {
+                const res = await fetch(`/v1/probe/test_node?node_name=${encodeURIComponent(currentLease.node_name)}`, { method: 'POST' });
+                const data = await res.json();
+                status.innerText = data.success ? `✔ 验证成功 (RTT: ${data.latency_ms}ms)` : `❌ 验证失败: ${data.error}`;
+                output.innerText = JSON.stringify(data, null, 2);
+                output.classList.remove('hidden');
+            } catch (err) {
+                status.innerText = '❌ 测试异常: ' + err;
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        async function resetNodeCircuit(nodeName) {
+            try {
+                const res = await fetch(`/v1/circuit/reset?node_name=${encodeURIComponent(nodeName)}`, { method: 'POST' });
+                if (res.ok) {
+                    loadData();
+                } else {
+                    alert('复位失败: ' + await res.text());
+                }
+            } catch (err) {
+                alert('复位异常: ' + err);
+            }
+        }
+
+        async function loadCircuitEvents() {
+            try {
+                const res = await fetch('/v1/circuit/events?limit=10');
+                const events = await res.json();
+                const tbody = document.getElementById('circuit-events-body');
+                if (!events || events.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="5" class="py-3 text-center text-slate-500">暂无断路器变迁记录</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = events.map(e => `
+                    <tr class="hover:bg-dark-700/30 transition">
+                        <td class="py-2 px-3 text-slate-500">${escapeHtml(e.created_at ? e.created_at.replace('T', ' ').substring(0, 19) : '')}</td>
+                        <td class="py-2 px-3 font-mono font-medium text-cyan-300">${escapeHtml(e.node_name)}</td>
+                        <td class="py-2 px-3"><span class="px-1.5 py-0.5 rounded text-[10px] bg-slate-800 text-slate-400">${escapeHtml(e.from_state)}</span></td>
+                        <td class="py-2 px-3"><span class="px-1.5 py-0.5 rounded text-[10px] ${e.to_state === 'healthy' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-rose-500/10 text-rose-400'}">${escapeHtml(e.to_state)}</span></td>
+                        <td class="py-2 px-3 text-slate-400 truncate max-w-xs" title="${escapeHtml(e.reason)}">${escapeHtml(e.reason)}</td>
+                    </tr>
+                `).join('');
+            } catch (err) {
+                console.error('Failed to load events:', err);
+            }
+        }
+
+        // Initial Load
+        loadData();
+        setInterval(loadData, 30000); // 30s auto-refresh
+    </script>
+</body>
+</html>

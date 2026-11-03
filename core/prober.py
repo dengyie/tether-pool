@@ -1,18 +1,18 @@
 """
-core/prober.py - Asynchronous dual-stack health prober for IP Pool
+core/prober.py - Asynchronous dual-stack health prober with Circuit Breaker Integration
 """
 
 import asyncio
 import time
 import httpx
-from typing import List, Optional
-from core.models import ProxyNode, ProbeResult, EgressType
+from typing import List, Optional, Any
+from core.models import ProxyNode, ProbeResult, EgressType, HealthStatus
 from core.storage import Storage
+from core.circuit import CircuitBreaker
 
 DEFAULT_TIMEOUT = 12.0
 PROBE_URL_V4 = "https://api.ipify.org"
 PROBE_URL_CF_TRACE = "https://cloudflare.com/cdn-cgi/trace"
-PROBE_URL_V6 = "https://api64.ipify.org"
 
 
 def parse_cf_trace(text: str) -> dict:
@@ -25,11 +25,33 @@ def parse_cf_trace(text: str) -> dict:
 
 
 class Prober:
-    def __init__(self, storage: Storage, timeout: float = DEFAULT_TIMEOUT):
+    def __init__(self, storage: Storage, router: Optional[Any] = None, timeout: float = DEFAULT_TIMEOUT):
         self.storage = storage
+        self.router = router
         self.timeout = timeout
 
-    async def probe_node(self, node: ProxyNode, retries: int = 1) -> ProbeResult:
+    async def probe_node(self, node: ProxyNode, retries: int = 1, force: bool = False) -> ProbeResult:
+        # Check circuit breaker cooldown if node is DEAD
+        if not force and node.status == HealthStatus.DEAD.value:
+            if not CircuitBreaker.is_cooldown_expired(node):
+                # Cooldown still active, skip probing to respect isolation
+                return ProbeResult(
+                    node_name=node.name,
+                    success=False,
+                    latency_ms=0.0,
+                    error="circuit_open_in_cooldown"
+                )
+            else:
+                # Cooldown expired, mark as HALF_OPEN for trial canary probe
+                node.status = HealthStatus.HALF_OPEN.value
+                self.storage.update_node_status(node.name, HealthStatus.HALF_OPEN.value)
+                self.storage.record_circuit_event(
+                    node_name=node.name,
+                    from_state=HealthStatus.DEAD.value,
+                    to_state=HealthStatus.HALF_OPEN.value,
+                    reason="cooldown_expired_canary_probe"
+                )
+
         proxy_url = f"socks5h://{node.host}:{node.port}"
 
         # Choose primary probe URL
@@ -66,7 +88,7 @@ class Prober:
                         exit_ip=exit_ip,
                         latency_ms=latency
                     )
-                    self.storage.update_probe_result(res)
+                    _, event = self.storage.update_probe_result(res)
                     return res
                 else:
                     raise RuntimeError(f"HTTP status {resp.status_code}")
@@ -87,18 +109,27 @@ class Prober:
                     latency_ms=latency,
                     error=err_msg[:120]
                 )
-                self.storage.update_probe_result(res)
+                _, event = self.storage.update_probe_result(res)
+
+                # Automatic Self-Healing: If circuit tripped OPEN (DEAD), rehome attached leases
+                if event and event.to_state == HealthStatus.DEAD.value and self.router:
+                    try:
+                        rehome_res = self.router.rehome_leases_for_node(node.name)
+                        if rehome_res.get("rehomed_count", 0) > 0:
+                            print(f"[Self-Healing] Node {node.name} tripped OPEN. Rehomed {rehome_res['rehomed_count']} leases.")
+                    except Exception as rehome_err:
+                        print(f"[-] Error rehoming leases for {node.name}: {rehome_err}")
+
                 return res
 
-    async def probe_all(self, concurrency: int = 15) -> List[ProbeResult]:
+    async def probe_all(self, concurrency: int = 25, force: bool = False) -> List[ProbeResult]:
         nodes = self.storage.list_nodes()
         sem = asyncio.Semaphore(concurrency)
 
         async def _worker(node: ProxyNode) -> ProbeResult:
             async with sem:
-                return await self.probe_node(node)
+                return await self.probe_node(node, force=force)
 
         tasks = [_worker(node) for node in nodes]
         results = await asyncio.gather(*tasks)
         return results
-

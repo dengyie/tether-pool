@@ -5,14 +5,14 @@ tests/test_api.py - Unit tests for FastAPI REST API endpoints
 import os
 import pytest
 from starlette.testclient import TestClient
-from api.server import app, storage
+import api.server
 from core.models import ProxyNode, EgressType, HealthStatus
 
 
 @pytest.fixture
 def client():
-    # Insert a sample node into current storage
-    storage.upsert_node(ProxyNode(
+    # Insert a sample node into current isolated storage
+    api.server.storage.upsert_node(ProxyNode(
         name="api-test-node",
         host="10.144.144.3",
         port=10881,
@@ -20,7 +20,7 @@ def client():
         egress_type=EgressType.WARP_IPV6.value,
         status=HealthStatus.HEALTHY.value
     ))
-    return TestClient(app)
+    return TestClient(api.server.app)
 
 
 def test_health_endpoint(client):
@@ -68,3 +68,16 @@ def test_export_cpa_endpoint(client):
     assert res.status_code == 200
     data = res.json()
     assert "proxies" in data
+
+
+def test_dashboard_endpoint(client):
+    res = client.get("/dashboard")
+    assert res.status_code == 200
+    assert "IP Pool" in res.text
+    assert "text/html" in res.headers["content-type"]
+
+
+def test_root_redirect(client):
+    res = client.get("/", follow_redirects=False)
+    assert res.status_code in (302, 307)
+    assert res.headers["location"] == "/dashboard"
