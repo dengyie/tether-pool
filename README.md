@@ -168,7 +168,7 @@ ip-pool/
 │   ├── gemini_adapter.py       # Gemini Web reverse routing adapter
 │   ├── playwright_pool.py      # Python crawler & Playwright pool SDK
 │   └── grok2api_adapter.py     # Database synchronizer & account sharder
-├── tests/                      # Pytest isolated unit test suite (28 passing tests)
+├── tests/                      # Pytest isolated unit test suite (30 passing tests)
 ├── demo.py                     # Interactive end-to-end verification showcase
 ├── requirements.txt            # Python dependencies
 └── start.sh                    # Dual-process background daemon manager

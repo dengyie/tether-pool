@@ -170,7 +170,7 @@ ip-pool/
 │   ├── gemini_adapter.py       # Gemini Web 逆向出站适配器
 │   ├── playwright_pool.py      # Python 爬虫与 Playwright 代理池 SDK
 │   └── grok2api_adapter.py     # Grok 2,103 账号增量同步与洗牌
-├── tests/                      # 隔离沙箱自动化单元测试 (28 项全绿)
+├── tests/                      # 隔离沙箱自动化单元测试 (30 项全绿)
 ├── demo.py                     # 端到端交互式全功能演练脚本
 ├── requirements.txt            # Python 依赖清单
 └── start.sh                    # 双进程后台守护启停脚本
