@@ -77,8 +77,12 @@ class Prober:
                     if is_cf_trace:
                         parsed = parse_cf_trace(text)
                         exit_ip = parsed.get("ip", "")
-                        if not exit_ip or ":" not in exit_ip:
-                            raise ValueError(f"Expected IPv6 in trace, got: {exit_ip}")
+                        if node.egress_type == EgressType.WARP_IPV6.value:
+                            if not exit_ip or ":" not in exit_ip:
+                                raise ValueError(f"Expected IPv6 in WARP trace, got: {exit_ip}")
+                        else:
+                            if not exit_ip:
+                                raise ValueError(f"Expected valid IP in trace, got: {exit_ip}")
                     else:
                         exit_ip = text
 
@@ -133,3 +137,51 @@ class Prober:
         tasks = [_worker(node) for node in nodes]
         results = await asyncio.gather(*tasks)
         return results
+
+    async def probe_target_service(self, node: ProxyNode, target_url: str) -> ProbeResult:
+        """
+        Target-specific business probe (e.g. testing Cloudflare Turnstile, X signup, or OpenAI Auth).
+        Differentiates between general network reachability and domain-level anti-bot blockages.
+        """
+        proxy_url = f"socks5h://{node.host}:{node.port}"
+        start_t = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(proxy=proxy_url, timeout=self.timeout, follow_redirects=True) as client:
+                resp = await client.get(
+                    target_url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+                    }
+                )
+                latency = round((time.perf_counter() - start_t) * 1000, 1)
+
+                # Check for Cloudflare / Anti-Bot blockages
+                if resp.status_code in (403, 503) and ("challenge-running" in resp.text or "Just a moment" in resp.text or "cf-mitigated" in resp.headers):
+                    return ProbeResult(
+                        node_name=node.name,
+                        success=False,
+                        latency_ms=latency,
+                        error=f"Blocked by Cloudflare/WAF (HTTP {resp.status_code})"
+                    )
+                if resp.status_code >= 400 and resp.status_code not in (404, 401):
+                    return ProbeResult(
+                        node_name=node.name,
+                        success=False,
+                        latency_ms=latency,
+                        error=f"Target returned HTTP {resp.status_code}"
+                    )
+                return ProbeResult(
+                    node_name=node.name,
+                    success=True,
+                    exit_ip=node.exit_ip,
+                    latency_ms=latency
+                )
+        except Exception as e:
+            latency = round((time.perf_counter() - start_t) * 1000, 1)
+            return ProbeResult(
+                node_name=node.name,
+                success=False,
+                latency_ms=latency,
+                error=str(e)[:120]
+            )
+

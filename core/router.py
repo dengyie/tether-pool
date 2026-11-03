@@ -1,10 +1,15 @@
 """
-core/router.py - Routing and proxy assignment engine with Circuit-Aware Lease Re-homing
+core/router.py - Routing and proxy assignment engine with Circuit-Aware Lease Re-homing,
+Anti-Sybil Cooldown for Registration Bots, and Relay Bridge Resolution
 """
 
 import zlib
 from typing import Optional, List, Dict, Any
-from core.models import ProxyNode, LeaseInfo, EgressType, HealthStatus
+from datetime import datetime
+from core.models import (
+    ProxyNode, LeaseInfo, EgressType, HealthStatus,
+    RegistrationLease, BatteryEventReport, BatteryEventType, RelayMode
+)
 from core.storage import Storage
 
 
@@ -17,15 +22,34 @@ class Router:
         account_id: str,
         egress_type: Optional[str] = EgressType.WARP_IPV6.value,
         region: Optional[str] = None,
-        force_rebind: bool = False
+        force_rebind: bool = False,
+        service: Optional[str] = None
     ) -> Optional[LeaseInfo]:
         """
         Sticky assignment for an account.
-        Deterministic mapping: crc32(account_id) % len(healthy_nodes)
+        Prioritizes universal account allocations, falling back to deterministic CRC32 mapping.
         Only returns nodes in HEALTHY (Closed) state unless forced to fallback.
+        Ephemeral/anonymous requests bypass disk persistence to avoid storage leak.
         """
         # 1. Check existing lease if not forcing rebind
         if not force_rebind:
+            # 1a. Universal Allocation Engine bindings check first
+            alloc = self.storage.find_allocation_by_account(account_id, service=service)
+            if alloc:
+                node = self.storage.get_node(alloc["node_name"])
+                if node and node.status == HealthStatus.HEALTHY.value:
+                    if (not egress_type or node.egress_type == egress_type) and (not region or node.region == region):
+                        return LeaseInfo(
+                            account_id=account_id,
+                            node_name=node.name,
+                            proxy_url=node.proxy_url,
+                            exit_ip=node.exit_ip,
+                            region=node.region,
+                            egress_type=node.egress_type,
+                            assigned_at=alloc["allocated_at"]
+                        )
+
+            # 1b. Legacy lease table check
             existing = self.storage.get_lease(account_id)
             if existing:
                 node = self.storage.get_node(existing.node_name)
@@ -61,8 +85,26 @@ class Router:
         selected_idx = hash_val % len(candidates)
         selected_node = candidates[selected_idx]
 
-        # 4. Save and return lease
-        return self.storage.set_lease(account_id, selected_node.name)
+        now_str = datetime.now().isoformat()
+
+        # 4. Ephemeral/anonymous requests do NOT pollute database
+        if account_id.startswith("anon_"):
+            return LeaseInfo(
+                account_id=account_id,
+                node_name=selected_node.name,
+                proxy_url=selected_node.proxy_url,
+                exit_ip=selected_node.exit_ip,
+                region=selected_node.region,
+                egress_type=selected_node.egress_type,
+                assigned_at=now_str
+            )
+
+        # 5. Persist lease and synchronize with account_allocations
+        lease = self.storage.set_lease(account_id, selected_node.name)
+        svc = service or "default"
+        self.storage.batch_save_allocations([(svc, account_id, selected_node.name, now_str)])
+
+        return lease
 
     def rehome_leases_for_node(self, broken_node_name: str) -> Dict[str, Any]:
         """
@@ -117,3 +159,179 @@ class Router:
             })
 
         return {"rehomed_count": len(rehomed_details), "details": rehomed_details}
+
+    def resolve_relay_hop(self, node: ProxyNode) -> Optional[ProxyNode]:
+        """
+        Resolves the designated relay transit hop for a node.
+        If node.relay_hop_node is set, returns that node.
+        Otherwise falls back to an available Hong Kong, Tokyo, or US bridge node.
+        """
+        if node.relay_hop_node:
+            hop = self.storage.get_node(node.relay_hop_node)
+            if hop and hop.status == HealthStatus.HEALTHY.value:
+                return hop
+
+        # Fallback candidate pool: healthy clash_proxy nodes in key transit hubs
+        for hub_region in ["hongkong", "tokyo", "singapore", "us-west"]:
+            hub_nodes = self.storage.list_nodes(
+                region=hub_region,
+                egress_type=EgressType.CLASH_PROXY.value,
+                status=HealthStatus.HEALTHY.value
+            )
+            if hub_nodes:
+                # Avoid picking itself as relay
+                valid = [h for h in hub_nodes if h.name != node.name]
+                if valid:
+                    return valid[0]
+
+        return None
+
+    def acquire_for_registration(
+        self,
+        account_id: str,
+        target_service: str,
+        region: Optional[str] = None,
+        egress_type: Optional[str] = None,
+        cooldown_seconds: int = 1800
+    ) -> Optional[RegistrationLease]:
+        """
+        Dedicated anti-sybil egress assignment for batch account registration bots.
+        Ensures that allocated exit IPs have not been used for the same target service
+        within the cooldown window.
+        """
+        self.storage.clean_expired_cooldowns()
+
+        # 1. Fetch eligible candidates
+        candidates = self.storage.list_nodes(region=region, egress_type=egress_type, status=HealthStatus.HEALTHY.value)
+        if not candidates and region:
+            candidates = self.storage.list_nodes(region=region, status=HealthStatus.HEALTHY.value)
+        if not candidates and egress_type:
+            candidates = self.storage.list_nodes(egress_type=egress_type, status=HealthStatus.HEALTHY.value)
+        if not candidates:
+            candidates = self.storage.list_nodes(status=HealthStatus.HEALTHY.value)
+        if not candidates:
+            candidates = self.storage.list_nodes(region=region, egress_type=egress_type)
+        if not candidates:
+            candidates = self.storage.list_nodes()
+
+        if not candidates:
+            return None
+
+        # 2. Filter out candidates whose exit_ip is currently in cooldown for target_service
+        cooled_exit_ips = {
+            c.exit_ip for c in self.storage.get_active_cooldowns(target_service=target_service)
+            if c.exit_ip
+        }
+
+        clean_candidates = [
+            c for c in candidates
+            if not c.exit_ip or c.exit_ip not in cooled_exit_ips
+        ]
+
+        if not clean_candidates:
+            # All available nodes are in cooldown; reuse least recent
+            clean_candidates = candidates
+
+        clean_candidates.sort(key=lambda x: x.name)
+
+        # 3. Hash assignment
+        hash_val = zlib.crc32(f"{account_id}:{target_service}".encode("utf-8")) & 0xFFFFFFFF
+        selected_idx = hash_val % len(clean_candidates)
+        selected_node = clean_candidates[selected_idx]
+
+        # 4. Lock IP cooldown
+        now_str = datetime.now().isoformat()
+        ip_to_lock = selected_node.exit_ip or selected_node.host
+        cooldown_record = self.storage.add_ip_cooldown(
+            exit_ip=ip_to_lock,
+            target_service=target_service,
+            node_name=selected_node.name,
+            cooldown_seconds=cooldown_seconds
+        )
+
+        # 5. Persist lease
+        self.storage.set_lease(account_id, selected_node.name)
+
+        # 6. Resolve relay hop
+        relay_hop = self.resolve_relay_hop(selected_node)
+        relay_hop_url = f"{relay_hop.host}:{relay_hop.port}" if relay_hop else None
+
+        return RegistrationLease(
+            account_id=account_id,
+            target_service=target_service,
+            node_name=selected_node.name,
+            proxy_url=selected_node.proxy_url,
+            exit_ip=selected_node.exit_ip,
+            region=selected_node.region,
+            egress_type=selected_node.egress_type,
+            cooldown_seconds=cooldown_seconds,
+            leased_at=now_str,
+            cooled_until=cooldown_record.cooled_until,
+            relay_mode=selected_node.relay_mode,
+            relay_hop=relay_hop_url
+        )
+
+    def handle_battery_event(self, report: BatteryEventReport) -> Dict[str, Any]:
+        """
+        Handles battery degradation / 429 / 401 events reported by downstream battery consumers
+        (e.g., grok2api, cpa-manager-plus). Performs automatic battery swapping (lease rebind).
+        """
+        event_id = self.storage.record_battery_event(report)
+        new_lease = None
+
+        if report.force_rebind or report.event_type in (
+            BatteryEventType.RATE_LIMITED_429.value,
+            BatteryEventType.BANNED_401.value,
+            BatteryEventType.TURNSTILE_FAILED.value
+        ):
+            target_region = None
+            target_egress = None
+
+            # 1. Check account_allocations first
+            alloc = self.storage.find_allocation_by_account(report.account_id, service=report.target_service)
+            if alloc:
+                old_node = self.storage.get_node(alloc["node_name"])
+                if old_node:
+                    target_region = old_node.region
+                    target_egress = old_node.egress_type
+            else:
+                existing_lease = self.storage.get_lease(report.account_id)
+                if existing_lease:
+                    old_node = self.storage.get_node(existing_lease.node_name)
+                    if old_node:
+                        target_region = old_node.region
+                        target_egress = old_node.egress_type
+
+            new_lease = self.acquire_for_account(
+                account_id=report.account_id,
+                region=target_region,
+                egress_type=target_egress,
+                force_rebind=True,
+                service=report.target_service
+            )
+
+            # 2. Synchronize all service allocations associated with this account
+            if new_lease:
+                services_to_update = set()
+                if report.target_service:
+                    services_to_update.add(report.target_service)
+                for svc in self.storage.find_services_for_account(report.account_id):
+                    services_to_update.add(svc)
+                if not services_to_update:
+                    services_to_update.add("default")
+
+                now_str = datetime.now().isoformat()
+                records = [(svc, report.account_id, new_lease.node_name, now_str) for svc in services_to_update]
+                self.storage.batch_save_allocations(records)
+
+        lease_dict = None
+        if new_lease:
+            lease_dict = new_lease.model_dump() if hasattr(new_lease, "model_dump") else new_lease.dict()
+
+        return {
+            "event_id": event_id,
+            "status": "processed",
+            "battery_swapped": new_lease is not None,
+            "new_lease": lease_dict
+        }
+

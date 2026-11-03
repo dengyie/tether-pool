@@ -17,7 +17,7 @@ from typing import Optional, Tuple, Dict
 # Ensure project root is in sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.models import ProxyNode, LeaseInfo, EgressType
+from core.models import ProxyNode, LeaseInfo, EgressType, RelayMode
 from core.storage import Storage
 from core.router import Router
 
@@ -27,61 +27,103 @@ BUFFER_SIZE = 65536
 CONNECT_TIMEOUT = 10.0
 
 
-async def socks5_connect(proxy_host: str, proxy_port: int, target_host: str, target_port: int, timeout: float = CONNECT_TIMEOUT) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-    """
-    Establishes connection to an upstream SOCKS5 proxy and asks it to connect to target_host:target_port.
-    Uses SOCKS5 domain name resolution (0x03) to ensure remote DNS resolution.
-    Guarantees writer socket closure on any error or timeout.
-    """
+async def socks5_handshake_on_stream(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    target_host: str,
+    target_port: int,
+    timeout: float = CONNECT_TIMEOUT
+) -> None:
+    """Performs SOCKS5 auth negotiation and CONNECT command on an existing open stream."""
+    # 1. Auth negotiation (No authentication: 0x00)
+    writer.write(b"\x05\x01\x00")
+    await writer.drain()
+
+    auth_resp = await asyncio.wait_for(reader.readexactly(2), timeout=timeout)
+    if auth_resp != b"\x05\x00":
+        raise ConnectionError(f"Upstream SOCKS5 handshake rejected: {auth_resp.hex()}")
+
+    # 2. Connect request
+    try:
+        ip_v4 = socket.inet_aton(target_host)
+        addr_bytes = b"\x01" + ip_v4
+    except OSError:
+        try:
+            ip_v6 = socket.inet_pton(socket.AF_INET6, target_host)
+            addr_bytes = b"\x04" + ip_v6
+        except OSError:
+            host_bytes = target_host.encode("utf-8")
+            if len(host_bytes) > 255:
+                raise ValueError(f"Domain name exceeds SOCKS5 limit (255 bytes): {len(host_bytes)}")
+            addr_bytes = b"\x03" + bytes([len(host_bytes)]) + host_bytes
+
+    port_bytes = struct.pack("!H", target_port)
+    req = b"\x05\x01\x00" + addr_bytes + port_bytes
+    writer.write(req)
+    await writer.drain()
+
+    # 3. Read reply
+    reply_head = await asyncio.wait_for(reader.readexactly(4), timeout=timeout)
+    ver, rep, rsv, atyp = reply_head
+    if rep != 0x00:
+        raise ConnectionError(f"Upstream SOCKS5 connect failed with code: {rep}")
+
+    # Consume bound address
+    if atyp == 0x01:  # IPv4
+        await reader.readexactly(4 + 2)
+    elif atyp == 0x03:  # Domain
+        dlen = (await reader.readexactly(1))[0]
+        await reader.readexactly(dlen + 2)
+    elif atyp == 0x04:  # IPv6
+        await reader.readexactly(16 + 2)
+
+
+async def socks5_connect(
+    proxy_host: str,
+    proxy_port: int,
+    target_host: str,
+    target_port: int,
+    timeout: float = CONNECT_TIMEOUT
+) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """Establishes a single-hop connection to an upstream SOCKS5 proxy."""
     reader, writer = await asyncio.wait_for(
         asyncio.open_connection(proxy_host, proxy_port),
         timeout=timeout
     )
-
     try:
-        # 1. Auth negotiation (No authentication: 0x00)
-        writer.write(b"\x05\x01\x00")
-        await writer.drain()
-
-        auth_resp = await asyncio.wait_for(reader.readexactly(2), timeout=timeout)
-        if auth_resp != b"\x05\x00":
-            raise ConnectionError(f"Upstream SOCKS5 handshake rejected: {auth_resp.hex()}")
-
-        # 2. Connect request
-        # Detect IP vs Domain
+        await socks5_handshake_on_stream(reader, writer, target_host, target_port, timeout=timeout)
+        return reader, writer
+    except Exception:
+        writer.close()
         try:
-            ip_v4 = socket.inet_aton(target_host)
-            addr_bytes = b"\x01" + ip_v4
-        except OSError:
-            try:
-                ip_v6 = socket.inet_pton(socket.AF_INET6, target_host)
-                addr_bytes = b"\x04" + ip_v6
-            except OSError:
-                host_bytes = target_host.encode("utf-8")
-                if len(host_bytes) > 255:
-                    raise ValueError(f"Domain name exceeds SOCKS5 limit (255 bytes): {len(host_bytes)}")
-                addr_bytes = b"\x03" + bytes([len(host_bytes)]) + host_bytes
+            await writer.wait_closed()
+        except Exception:
+            pass
+        raise
 
-        port_bytes = struct.pack("!H", target_port)
-        req = b"\x05\x01\x00" + addr_bytes + port_bytes
-        writer.write(req)
-        await writer.drain()
 
-        # 3. Read reply
-        reply_head = await asyncio.wait_for(reader.readexactly(4), timeout=timeout)
-        ver, rep, rsv, atyp = reply_head
-        if rep != 0x00:
-            raise ConnectionError(f"Upstream SOCKS5 connect failed with code: {rep}")
-
-        # Consume bound address
-        if atyp == 0x01:  # IPv4
-            await reader.readexactly(4 + 2)
-        elif atyp == 0x03:  # Domain
-            dlen = (await reader.readexactly(1))[0]
-            await reader.readexactly(dlen + 2)
-        elif atyp == 0x04:  # IPv6
-            await reader.readexactly(16 + 2)
-
+async def socks5_relay_connect(
+    relay_host: str,
+    relay_port: int,
+    target_proxy_host: str,
+    target_proxy_port: int,
+    dest_host: str,
+    dest_port: int,
+    timeout: float = CONNECT_TIMEOUT
+) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """
+    Two-hop chained SOCKS5 connection:
+    Client/Gateway -> Relay Hop -> Target Proxy Node -> Destination Host:Port
+    """
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(relay_host, relay_port),
+        timeout=timeout
+    )
+    try:
+        # Hop 1: Connect through Relay Hop to Target Proxy Node
+        await socks5_handshake_on_stream(reader, writer, target_proxy_host, target_proxy_port, timeout=timeout)
+        # Hop 2: Connect through Target Proxy Node to Destination
+        await socks5_handshake_on_stream(reader, writer, dest_host, dest_port, timeout=timeout)
         return reader, writer
     except Exception:
         writer.close()
@@ -159,6 +201,85 @@ async def pump_streams(r1: asyncio.StreamReader, w1: asyncio.StreamWriter, r2: a
                 pass
 
 
+def parse_proxy_credentials(raw_user: str) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
+    """
+    Parses parametric proxy username into (account_id, region, egress_type, service).
+    Supported formats:
+    1. Plain account ID: 'bot_user_01'
+    2. Double-underscore tags: 'bot_01__type_warp_ipv6__region_tokyo__service_grok2api'
+    3. Query-string format: 'bot_01?region=tokyo&type=warp_ipv6&service=grok2api'
+    4. Key-value dash format: 'account=bot_01-region=tokyo-type=warp_ipv6-service=grok2api'
+    """
+    if not raw_user:
+        return f"anon_{uuid.uuid4().hex[:8]}", None, None, None
+
+    raw_user = raw_user.strip()
+    account_id = raw_user
+    region = None
+    egress_type = None
+    service = None
+
+    # Format 3: Query-string format
+    if "?" in raw_user:
+        base, query_str = raw_user.split("?", 1)
+        account_id = base
+        for part in query_str.split("&"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                k = k.strip().lower()
+                v = v.strip()
+                if k in ("region", "country", "geo"):
+                    region = v
+                elif k in ("type", "egress", "egress_type"):
+                    egress_type = v
+                elif k in ("service", "app", "target"):
+                    service = v
+
+    # Format 2: Double-underscore format (e.g. acc_001__type_warp_ipv6__region_tokyo__service_grok2api)
+    elif "__" in raw_user:
+        parts = raw_user.split("__")
+        account_id = parts[0]
+        for p in parts[1:]:
+            p_lower = p.lower()
+            if p_lower.startswith("type_"):
+                egress_type = p[5:]
+            elif p_lower.startswith("egress_"):
+                egress_type = p[7:]
+            elif p_lower.startswith("region_"):
+                region = p[7:]
+            elif p_lower.startswith("country_"):
+                region = p[8:]
+            elif p_lower.startswith("service_"):
+                service = p[8:]
+            elif p_lower.startswith("app_"):
+                service = p[4:]
+
+    # Format 4: Dash-separated key-value (e.g. account=bot_01-region=tokyo-service=grok2api)
+    elif "account=" in raw_user.lower() or "region=" in raw_user.lower() or "type=" in raw_user.lower() or "service=" in raw_user.lower():
+        parts = raw_user.split("-")
+        for p in parts:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                k = k.strip().lower()
+                v = v.strip()
+                if k in ("account", "user", "acc"):
+                    account_id = v
+                elif k in ("region", "country", "geo"):
+                    region = v
+                elif k in ("type", "egress", "egress_type"):
+                    egress_type = v
+                elif k in ("service", "app", "target"):
+                    service = v
+
+    # Sanitize and unquote account_id
+    account_id = urllib.parse.unquote(account_id.strip()) if account_id else f"anon_{uuid.uuid4().hex[:8]}"
+    region = region.strip() if region and region.strip() else None
+    egress_type = egress_type.strip() if egress_type and egress_type.strip() else None
+    service = service.strip() if service and service.strip() else None
+
+    return account_id, region, egress_type, service
+
+
 class ForwardProxyGateway:
     def __init__(self, storage: Storage, router: Router, host: str = DEFAULT_GATEWAY_HOST, port: int = DEFAULT_GATEWAY_PORT):
         self.storage = storage
@@ -167,25 +288,28 @@ class ForwardProxyGateway:
         self.port = port
         self.server = None
 
-    def _extract_routing_headers(self, headers_dict: Dict[str, str], client_ip: str) -> Tuple[str, Optional[str], Optional[str]]:
+    def _extract_routing_headers(self, headers_dict: Dict[str, str], client_ip: str) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
         """
-        Extracts account_id, region, and egress_type from headers.
-        Checks:
+        Extracts account_id, region, egress_type, and service from headers or Proxy-Authorization.
+        Supports:
         - X-Account-Id
-        - Proxy-Authorization: Basic <base64(account_id:password)>
+        - Proxy-Authorization: Basic <base64(parametric_user:password)>
         - X-Region
         - X-Egress-Type
+        - X-Service / X-Target-Service
         """
         account_id = headers_dict.get("x-account-id")
+        auth_region = None
+        auth_egress = None
+        auth_service = None
+
         if not account_id and "proxy-authorization" in headers_dict:
             auth_val = headers_dict["proxy-authorization"].strip()
             if auth_val.lower().startswith("basic "):
                 try:
                     decoded = base64.b64decode(auth_val[6:].strip()).decode("utf-8")
-                    if ":" in decoded:
-                        account_id = decoded.split(":", 1)[0]
-                    else:
-                        account_id = decoded
+                    user_part = decoded.split(":", 1)[0] if ":" in decoded else decoded
+                    account_id, auth_region, auth_egress, auth_service = parse_proxy_credentials(user_part)
                 except Exception:
                     pass
 
@@ -193,10 +317,64 @@ class ForwardProxyGateway:
             # Ephemeral ID for anonymous requests so pool naturally distributes without pinning all localhost requests
             account_id = f"anon_{uuid.uuid4().hex[:8]}"
 
-        region = headers_dict.get("x-region")
-        egress_type = headers_dict.get("x-egress-type", EgressType.WARP_IPV6.value)
+        region = headers_dict.get("x-region") or auth_region
+        egress_type = headers_dict.get("x-egress-type") or auth_egress or EgressType.WARP_IPV6.value
+        service = headers_dict.get("x-service") or headers_dict.get("x-target-service") or auth_service
 
-        return account_id, region, egress_type
+        return account_id, region, egress_type, service
+
+    async def connect_upstream_adaptive(
+        self,
+        node: ProxyNode,
+        target_host: str,
+        target_port: int,
+        timeout: float = CONNECT_TIMEOUT
+    ) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """
+        Adaptive upstream connection supporting Direct, Relay Cascade, and Fallback.
+        Handles unreachable mesh nodes or sandboxed environments without IPv6.
+        """
+        relay_hop = self.router.resolve_relay_hop(node)
+
+        # 1. DIRECT_ONLY mode
+        if node.relay_mode == RelayMode.DIRECT_ONLY.value or not relay_hop:
+            return await socks5_connect(node.host, node.port, target_host, target_port, timeout=timeout)
+
+        # 2. RELAY_PREFERRED mode
+        if node.relay_mode == RelayMode.RELAY_PREFERRED.value:
+            try:
+                return await socks5_relay_connect(
+                    relay_host=relay_hop.host,
+                    relay_port=relay_hop.port,
+                    target_proxy_host=node.host,
+                    target_proxy_port=node.port,
+                    dest_host=target_host,
+                    dest_port=target_port,
+                    timeout=timeout
+                )
+            except Exception:
+                return await socks5_connect(node.host, node.port, target_host, target_port, timeout=timeout)
+
+        # 3. RELAY_FALLBACK mode (Default)
+        direct_timeout = min(timeout, 2.0)
+        try:
+            return await socks5_connect(node.host, node.port, target_host, target_port, timeout=direct_timeout)
+        except Exception:
+            # Direct connection failed (e.g. host unreachable, UDP blocked, no IPv6).
+            # Fallback to relay cascade!
+            try:
+                return await socks5_relay_connect(
+                    relay_host=relay_hop.host,
+                    relay_port=relay_hop.port,
+                    target_proxy_host=node.host,
+                    target_proxy_port=node.port,
+                    dest_host=target_host,
+                    dest_port=target_port,
+                    timeout=timeout
+                )
+            except Exception:
+                # Both direct and chained relay failed; emergency bridge via relay hop directly as egress
+                return await socks5_connect(relay_hop.host, relay_hop.port, target_host, target_port, timeout=timeout)
 
     async def handle_client(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
         peer = client_writer.get_extra_info("peername")
@@ -227,13 +405,14 @@ class ForwardProxyGateway:
                     headers_dict[k.strip().lower()] = v.strip()
 
             # 2. Extract routing constraints
-            account_id, region, egress_type = self._extract_routing_headers(headers_dict, client_ip)
+            account_id, region, egress_type, service = self._extract_routing_headers(headers_dict, client_ip)
 
             # 3. Resolve sticky lease
             lease = self.router.acquire_for_account(
                 account_id=account_id,
                 region=region,
-                egress_type=egress_type
+                egress_type=egress_type,
+                service=service
             )
             if not lease:
                 err_resp = b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\r\nNo available proxy nodes in IP pool\r\n"
@@ -251,9 +430,6 @@ class ForwardProxyGateway:
                 client_writer.close()
                 return
 
-            upstream_host = node.host
-            upstream_port = node.port
-
             # 4. Handle HTTP CONNECT (HTTPS)
             if method.upper() == "CONNECT":
                 try:
@@ -266,8 +442,10 @@ class ForwardProxyGateway:
                     return
 
                 try:
-                    remote_reader, remote_writer = await socks5_connect(
-                        upstream_host, upstream_port, target_host, target_port
+                    remote_reader, remote_writer = await self.connect_upstream_adaptive(
+                        node=node,
+                        target_host=target_host,
+                        target_port=target_port
                     )
                 except Exception as conn_err:
                     err_resp = f"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\n\r\nFailed to connect upstream SOCKS5 node: {conn_err}\r\n".encode()
@@ -301,8 +479,10 @@ class ForwardProxyGateway:
                     path_and_query += f"?{parsed_url.query}"
 
                 try:
-                    remote_reader, remote_writer = await socks5_connect(
-                        upstream_host, upstream_port, target_host, target_port
+                    remote_reader, remote_writer = await self.connect_upstream_adaptive(
+                        node=node,
+                        target_host=target_host,
+                        target_port=target_port
                     )
                 except Exception as conn_err:
                     err_resp = f"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\n\r\nFailed to connect upstream SOCKS5 node: {conn_err}\r\n".encode()

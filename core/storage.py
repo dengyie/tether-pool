@@ -6,9 +6,13 @@ import sqlite3
 import json
 import os
 from typing import List, Optional, Dict, Tuple, Any
-from datetime import datetime
+from datetime import datetime, timedelta
 from contextlib import contextmanager
-from core.models import ProxyNode, ProbeResult, LeaseInfo, PoolStats, HealthStatus, EgressType, CircuitEvent
+from core.models import (
+    ProxyNode, ProbeResult, LeaseInfo, PoolStats, HealthStatus,
+    EgressType, CircuitEvent, RelayMode, IpCooldownRecord,
+    BatteryEventReport, BatteryEventType
+)
 from core.circuit import CircuitBreaker
 
 DB_PATH = os.environ.get("IP_POOL_DB", os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "ip_pool.db"))
@@ -84,12 +88,43 @@ class Storage:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS ip_cooldowns (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    exit_ip TEXT NOT NULL,
+                    target_service TEXT NOT NULL,
+                    node_name TEXT NOT NULL,
+                    cooled_until TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS battery_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    node_name TEXT,
+                    event_type TEXT NOT NULL,
+                    target_service TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS account_allocations (
+                    service TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    node_name TEXT NOT NULL,
+                    allocated_at TEXT NOT NULL,
+                    PRIMARY KEY (service, account_id),
+                    FOREIGN KEY (node_name) REFERENCES nodes(name)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_nodes_region ON nodes(region);
                 CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);
                 CREATE INDEX IF NOT EXISTS idx_nodes_egress ON nodes(egress_type);
                 CREATE INDEX IF NOT EXISTS idx_history_time ON probe_history(probed_at);
                 CREATE INDEX IF NOT EXISTS idx_circuit_events_node ON circuit_events(node_name);
                 CREATE INDEX IF NOT EXISTS idx_circuit_events_time ON circuit_events(created_at);
+                CREATE INDEX IF NOT EXISTS idx_cooldown_lookup ON ip_cooldowns(exit_ip, target_service, cooled_until);
+                CREATE INDEX IF NOT EXISTS idx_battery_events_acc ON battery_events(account_id);
+                CREATE INDEX IF NOT EXISTS idx_allocations_service ON account_allocations(service);
+                CREATE INDEX IF NOT EXISTS idx_allocations_node ON account_allocations(node_name);
             """)
 
             # Migration for existing databases
@@ -98,7 +133,9 @@ class Storage:
                 ("circuit_state", "TEXT", "'unprobed'"),
                 ("consecutive_failures", "INTEGER", "0"),
                 ("consecutive_successes", "INTEGER", "0"),
-                ("next_probe_allowed_at", "TEXT", "NULL")
+                ("next_probe_allowed_at", "TEXT", "NULL"),
+                ("relay_mode", "TEXT", "'relay_fallback'"),
+                ("relay_hop_node", "TEXT", "NULL")
             ]:
                 if col not in existing_cols:
                     conn.execute(f"ALTER TABLE nodes ADD COLUMN {col} {col_type} DEFAULT {default_val}")
@@ -109,9 +146,10 @@ class Storage:
                 INSERT INTO nodes (
                     name, host, port, protocol, region, egress_type, tags, weight,
                     exit_ip, latency_ms, status, fail_count, last_probed_at,
-                    circuit_state, consecutive_failures, consecutive_successes, next_probe_allowed_at
+                    circuit_state, consecutive_failures, consecutive_successes, next_probe_allowed_at,
+                    relay_mode, relay_hop_node
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     host=excluded.host,
                     port=excluded.port,
@@ -120,6 +158,8 @@ class Storage:
                     egress_type=excluded.egress_type,
                     tags=excluded.tags,
                     weight=excluded.weight,
+                    relay_mode=excluded.relay_mode,
+                    relay_hop_node=excluded.relay_hop_node,
                     status=CASE WHEN excluded.status != 'unprobed' THEN excluded.status ELSE nodes.status END,
                     circuit_state=CASE WHEN excluded.circuit_state != 'unprobed' THEN excluded.circuit_state ELSE nodes.circuit_state END,
                     consecutive_failures=CASE WHEN excluded.status != 'unprobed' THEN excluded.consecutive_failures ELSE nodes.consecutive_failures END,
@@ -130,7 +170,8 @@ class Storage:
                 node.egress_type, json.dumps(node.tags), node.weight,
                 node.exit_ip, node.latency_ms, node.status, node.fail_count, node.last_probed_at,
                 node.circuit_state or node.status, node.consecutive_failures,
-                node.consecutive_successes, node.next_probe_allowed_at
+                node.consecutive_successes, node.next_probe_allowed_at,
+                node.relay_mode, node.relay_hop_node
             ))
 
     def update_node_status(self, node_name: str, status: str):
@@ -274,7 +315,9 @@ class Storage:
             circuit_state=row["circuit_state"] if "circuit_state" in keys and row["circuit_state"] else row["status"],
             consecutive_failures=row["consecutive_failures"] if "consecutive_failures" in keys and row["consecutive_failures"] else 0,
             consecutive_successes=row["consecutive_successes"] if "consecutive_successes" in keys and row["consecutive_successes"] else 0,
-            next_probe_allowed_at=row["next_probe_allowed_at"] if "next_probe_allowed_at" in keys else None
+            next_probe_allowed_at=row["next_probe_allowed_at"] if "next_probe_allowed_at" in keys else None,
+            relay_mode=row["relay_mode"] if "relay_mode" in keys and row["relay_mode"] else RelayMode.RELAY_FALLBACK.value,
+            relay_hop_node=row["relay_hop_node"] if "relay_hop_node" in keys else None
         )
 
     def set_lease(self, account_id: str, node_name: str) -> LeaseInfo:
@@ -471,4 +514,211 @@ class Storage:
                 GROUP BY n.region, c.from_state, c.to_state
             """).fetchall()
             return [{"region": r["region"], "from_state": r["from_state"], "to_state": r["to_state"], "count": r["cnt"]} for r in rows]
+
+    # --- Anti-Sybil IP Cooldown for Registration Bots ---
+
+    def add_ip_cooldown(self, exit_ip: str, target_service: str, node_name: str, cooldown_seconds: int = 1800) -> IpCooldownRecord:
+        """Locks an exit IP into cooldown for target_service to prevent registration anti-sybil bans."""
+        now = datetime.now()
+        cooled_until = (now + timedelta(seconds=cooldown_seconds)).isoformat()
+        now_str = now.isoformat()
+        with self._get_conn() as conn:
+            cur = conn.execute("""
+                INSERT INTO ip_cooldowns (exit_ip, target_service, node_name, cooled_until, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (exit_ip, target_service, node_name, cooled_until, now_str))
+            return IpCooldownRecord(
+                id=cur.lastrowid,
+                exit_ip=exit_ip,
+                target_service=target_service,
+                node_name=node_name,
+                cooled_until=cooled_until,
+                created_at=now_str
+            )
+
+    def is_ip_cooled(self, exit_ip: str, target_service: str) -> bool:
+        """Checks if an exit IP is currently cooled for the specific target service."""
+        now_str = datetime.now().isoformat()
+        with self._get_conn() as conn:
+            row = conn.execute("""
+                SELECT id FROM ip_cooldowns
+                WHERE exit_ip = ? AND target_service = ? AND cooled_until > ?
+                LIMIT 1
+            """, (exit_ip, target_service, now_str)).fetchone()
+            return row is not None
+
+    def get_active_cooldowns(self, target_service: Optional[str] = None) -> List[IpCooldownRecord]:
+        now_str = datetime.now().isoformat()
+        query = "SELECT * FROM ip_cooldowns WHERE cooled_until > ?"
+        params = [now_str]
+        if target_service:
+            query += " AND target_service = ?"
+            params.append(target_service)
+        query += " ORDER BY cooled_until ASC"
+        with self._get_conn() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [
+                IpCooldownRecord(
+                    id=r["id"],
+                    exit_ip=r["exit_ip"],
+                    target_service=r["target_service"],
+                    node_name=r["node_name"],
+                    cooled_until=r["cooled_until"],
+                    created_at=r["created_at"]
+                )
+                for r in rows
+            ]
+
+    def release_ip_cooldown(self, exit_ip: str, target_service: str) -> bool:
+        """Manually unlocks an IP from cooldown (e.g. if registration failed before submission)."""
+        with self._get_conn() as conn:
+            cur = conn.execute("""
+                DELETE FROM ip_cooldowns
+                WHERE exit_ip = ? AND target_service = ?
+            """, (exit_ip, target_service))
+            return cur.rowcount > 0
+
+    def clean_expired_cooldowns(self) -> int:
+        now_str = datetime.now().isoformat()
+        with self._get_conn() as conn:
+            cur = conn.execute("DELETE FROM ip_cooldowns WHERE cooled_until <= ?", (now_str,))
+            return cur.rowcount
+
+    # --- Battery Lifecycle Events ---
+
+    def record_battery_event(self, report: BatteryEventReport) -> int:
+        now_str = datetime.now().isoformat()
+        with self._get_conn() as conn:
+            cur = conn.execute("""
+                INSERT INTO battery_events (account_id, node_name, event_type, target_service, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (report.account_id, report.node_name, report.event_type, report.target_service, now_str))
+            return cur.lastrowid
+
+    def list_battery_events(self, account_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        query = "SELECT * FROM battery_events"
+        params = []
+        if account_id:
+            query += " WHERE account_id = ?"
+            params.append(account_id)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        with self._get_conn() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [dict(r) for r in rows]
+
+    # --- Universal Account Allocation & Distribution ---
+
+    def batch_save_allocations(self, records: List[Tuple[str, str, str, str]]):
+        """
+        Atomically upserts account allocations: List of (service, account_id, node_name, allocated_at).
+        """
+        if not records:
+            return
+        with self._get_conn() as conn:
+            conn.executemany("""
+                INSERT INTO account_allocations (service, account_id, node_name, allocated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(service, account_id) DO UPDATE SET
+                    node_name = excluded.node_name,
+                    allocated_at = excluded.allocated_at;
+            """, records)
+
+    def find_allocation_by_account(self, account_id: str, service: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Finds active allocation for an account, optionally scoped by service.
+        """
+        query = """
+            SELECT a.service, a.account_id, a.node_name, a.allocated_at,
+                   n.host, n.port, n.protocol, n.region, n.egress_type, n.exit_ip, n.status
+            FROM account_allocations a
+            JOIN nodes n ON a.node_name = n.name
+            WHERE a.account_id = ?
+        """
+        params = [account_id]
+        if service:
+            query += " AND a.service = ?"
+            params.append(service)
+        query += " ORDER BY a.allocated_at DESC LIMIT 1"
+
+        with self._get_conn() as conn:
+            row = conn.execute(query, params).fetchone()
+            return dict(row) if row else None
+
+    def find_services_for_account(self, account_id: str) -> List[str]:
+        """
+        Lists all services that have an allocation for the given account.
+        """
+        with self._get_conn() as conn:
+            rows = conn.execute("SELECT DISTINCT service FROM account_allocations WHERE account_id = ?", (account_id,)).fetchall()
+            return [r[0] for r in rows]
+
+    def update_allocation_node(self, service: str, account_id: str, new_node_name: str) -> bool:
+        now_str = datetime.now().isoformat()
+        with self._get_conn() as conn:
+            cur = conn.execute("""
+                UPDATE account_allocations
+                SET node_name = ?, allocated_at = ?
+                WHERE service = ? AND account_id = ?
+            """, (new_node_name, now_str, service, account_id))
+            return cur.rowcount > 0
+
+    def get_allocation(self, service: str, account_id: str) -> Optional[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            row = conn.execute("""
+                SELECT a.service, a.account_id, a.node_name, a.allocated_at,
+                       n.host, n.port, n.protocol, n.region, n.egress_type, n.exit_ip, n.status
+                FROM account_allocations a
+                JOIN nodes n ON a.node_name = n.name
+                WHERE a.service = ? AND a.account_id = ?
+            """, (service, account_id)).fetchone()
+            return dict(row) if row else None
+
+    def list_allocations_by_service(self, service: str) -> List[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT a.service, a.account_id, a.node_name, a.allocated_at,
+                       n.host, n.port, n.protocol, n.region, n.egress_type, n.exit_ip, n.status
+                FROM account_allocations a
+                JOIN nodes n ON a.node_name = n.name
+                WHERE a.service = ?
+                ORDER BY a.account_id ASC
+            """, (service,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def delete_allocation(self, service: str, account_id: str) -> bool:
+        with self._get_conn() as conn:
+            cur = conn.execute("""
+                DELETE FROM account_allocations
+                WHERE service = ? AND account_id = ?
+            """, (service, account_id))
+            return cur.rowcount > 0
+
+    def get_allocations_overview(self) -> Dict[str, Any]:
+        """
+        Returns statistical overview of account distribution across nodes.
+        """
+        with self._get_conn() as conn:
+            total_allocations = conn.execute("SELECT COUNT(*) FROM account_allocations").fetchone()[0]
+
+            services = {}
+            for row in conn.execute("SELECT service, COUNT(*) as c FROM account_allocations GROUP BY service").fetchall():
+                services[row["service"]] = row["c"]
+
+            node_rows = conn.execute("""
+                SELECT n.name as node_name, n.region, n.egress_type, n.exit_ip, COUNT(a.account_id) as account_count
+                FROM nodes n
+                LEFT JOIN account_allocations a ON n.name = a.node_name
+                GROUP BY n.name, n.region, n.egress_type, n.exit_ip
+                HAVING account_count > 0
+                ORDER BY account_count DESC
+            """).fetchall()
+
+            return {
+                "total_allocations": total_allocations,
+                "service_distribution": services,
+                "node_stats": [dict(r) for r in node_rows]
+            }
+
+
 

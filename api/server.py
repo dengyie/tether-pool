@@ -7,15 +7,21 @@ import yaml
 import asyncio
 from contextlib import asynccontextmanager
 from typing import Optional, List
-from fastapi import FastAPI, Query, BackgroundTasks, HTTPException
+from fastapi import FastAPI, Query, BackgroundTasks, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, HTMLResponse, RedirectResponse
 
-from core.models import ProxyNode, PoolStats, LeaseInfo, ProbeResult, CircuitEvent
+from core.models import (
+    ProxyNode, PoolStats, LeaseInfo, ProbeResult, CircuitEvent,
+    RegistrationLease, IpCooldownRecord, BatteryEventReport,
+    BatchAllocationRequest, BatchAllocationResponse, AccountAllocationItem,
+    AllocationOverviewResponse
+)
 from core.storage import Storage
 from core.prober import Prober
 from core.router import Router
 from core.metrics import MetricsCollector
+from core.allocator import AllocationEngine
 from adapters.cpa_adapter import CpaAdapter
 
 CONFIG_FILE = os.environ.get("IP_POOL_CONFIG", os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "nodes.yaml"))
@@ -24,6 +30,7 @@ DASHBOARD_HTML = os.path.join(os.path.dirname(os.path.dirname(__file__)), "web",
 storage = Storage()
 router = Router(storage)
 prober = Prober(storage, router=router)
+allocator = AllocationEngine(storage)
 metrics_collector = MetricsCollector(storage)
 cpa_adapter = CpaAdapter(storage)
 
@@ -42,7 +49,9 @@ def load_initial_nodes():
                     region=item["region"],
                     egress_type=item["egress_type"],
                     tags=item.get("tags", []),
-                    weight=item.get("weight", 100)
+                    weight=item.get("weight", 100),
+                    relay_mode=item.get("relay_mode", "relay_fallback"),
+                    relay_hop_node=item.get("relay_hop_node")
                 )
                 storage.upsert_node(node)
         print(f"[+] Loaded/upserted {len(nodes_data)} nodes into storage.")
@@ -153,6 +162,19 @@ async def test_single_node(node_name: str = Query(..., description="Node name to
     return res
 
 
+@app.post("/v1/probe/target", response_model=ProbeResult)
+async def test_target_service(
+    node_name: str = Query(..., description="Node name to test"),
+    target_url: str = Query(..., description="Target service URL to probe (e.g. https://x.com/i/flow/signup)")
+):
+    """Probe a specific business target URL through a proxy node to test anti-bot evasion"""
+    node = storage.get_node(node_name)
+    if not node:
+        raise HTTPException(status_code=404, detail=f"Node {node_name} not found")
+    res = await prober.probe_target_service(node, target_url)
+    return res
+
+
 @app.get("/v1/export/grok2api")
 def export_grok2api():
     """Export healthy nodes formatted for grok2api egress node injection"""
@@ -210,4 +232,137 @@ def trigger_node_rehome(node_name: str = Query(..., description="Node name whose
     """Trigger manual lease re-homing for a node"""
     result = router.rehome_leases_for_node(node_name)
     return result
+
+
+# --- Registration Anti-Sybil Endpoints ---
+
+@app.get("/v1/acquire_for_registration", response_model=RegistrationLease)
+def acquire_for_registration(
+    account_id: str = Query(..., description="Unique registration account ID / email"),
+    target_service: str = Query(..., description="Target service identifier (e.g., grok_reg, openai_signup)"),
+    cooldown: int = Query(1800, description="IP cooldown seconds after registration"),
+    region: Optional[str] = Query(None, description="Optional target region preference"),
+    egress_type: Optional[str] = Query(None, description="Optional preferred egress type (clash_proxy, native_ipv4, warp_ipv6)")
+):
+    """
+    Dedicated anti-sybil egress lease assignment for batch registration bots.
+    Ensures exit IP has not been used for target_service within the cooldown period.
+    """
+    lease = router.acquire_for_registration(
+        account_id=account_id,
+        target_service=target_service,
+        region=region,
+        egress_type=egress_type,
+        cooldown_seconds=cooldown
+    )
+    if not lease:
+        raise HTTPException(status_code=503, detail="No clean proxy node available for registration (all candidates cooled)")
+    return lease
+
+
+@app.get("/v1/cooldowns", response_model=List[IpCooldownRecord])
+def list_cooldowns(target_service: Optional[str] = Query(None, description="Filter by target service")):
+    """List active IP cooldown locks for anti-sybil tracking"""
+    return storage.get_active_cooldowns(target_service=target_service)
+
+
+@app.post("/v1/release_cooldown")
+def release_cooldown(
+    exit_ip: str = Query(..., description="Exit IP to release"),
+    target_service: str = Query(..., description="Target service")
+):
+    """Early unlock of an IP from cooldown (e.g. registration failed before form submission)"""
+    success = storage.release_ip_cooldown(exit_ip=exit_ip, target_service=target_service)
+    return {"success": success, "exit_ip": exit_ip, "target_service": target_service}
+
+
+# --- Battery Lifecycle & Hot Swapping Endpoints ---
+
+@app.post("/v1/battery/event")
+def report_battery_event(report: BatteryEventReport):
+    """
+    Downstream battery consumers (e.g., grok2api, cpa-manager-plus) report 429/401/Turnstile failures.
+    Triggers automatic battery swapping (lease re-homing to a fresh healthy node).
+    """
+    result = router.handle_battery_event(report)
+    return result
+
+
+@app.get("/v1/battery/events")
+def list_battery_events(
+    account_id: Optional[str] = Query(None, description="Filter by account ID"),
+    limit: int = Query(50, ge=1, le=200)
+):
+    """List recent battery lifecycle events"""
+    return storage.list_battery_events(account_id=account_id, limit=limit)
+
+
+# --- Universal Account Allocation & Distribution Endpoints ---
+
+@app.post("/v1/allocation/batch", response_model=BatchAllocationResponse)
+def batch_allocate_accounts(request: BatchAllocationRequest):
+    """
+    Universal batch account allocation interface (e.g. grok2api 2,100+ accounts).
+    Evenly distributes accounts across pool exits (e.g. 100 WARP IPv6 nodes) with minimal variance.
+    Generates both direct SOCKS5 and transparent gateway URLs.
+    """
+    try:
+        return allocator.batch_allocate(request)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/allocation/acquire", response_model=AccountAllocationItem)
+def acquire_account_allocation(
+    service: str = Query(..., description="Service identifier, e.g. grok2api"),
+    account_id: str = Query(..., description="Unique account ID or email"),
+    egress_preference: Optional[str] = Query("warp_ipv6", description="Preferred egress type"),
+    region: Optional[str] = Query(None, description="Optional region preference"),
+    force_rebalance: bool = Query(False, description="Force reallocating to a different node")
+):
+    """
+    On-demand allocation for a single account with load-aware capacity distribution.
+    """
+    try:
+        return allocator.acquire_single(
+            service=service,
+            account_id=account_id,
+            egress_preference=egress_preference,
+            region=region,
+            force_rebalance=force_rebalance
+        )
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.get("/v1/allocation/status", response_model=AllocationOverviewResponse)
+def get_allocation_overview():
+    """
+    Statistical overview of account distributions and node capacity utilization.
+    """
+    return storage.get_allocations_overview()
+
+
+@app.get("/v1/allocation/accounts")
+def list_service_allocations(service: str = Query(..., description="Service identifier")):
+    """
+    List all active account allocations for a given service.
+    """
+    return storage.list_allocations_by_service(service)
+
+
+@app.post("/v1/allocation/release")
+def release_account_allocation(
+    service: str = Query(..., description="Service identifier"),
+    account_id: str = Query(..., description="Account ID to release")
+):
+    """
+    Release or unbind an account allocation.
+    """
+    success = storage.delete_allocation(service, account_id)
+    return {"success": success, "service": service, "account_id": account_id}
+
+
 

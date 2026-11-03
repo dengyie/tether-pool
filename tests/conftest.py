@@ -9,6 +9,7 @@ from core.storage import Storage
 from core.router import Router
 from core.prober import Prober
 from core.metrics import MetricsCollector
+from core.allocator import AllocationEngine
 from adapters.cpa_adapter import CpaAdapter
 import api.server
 
@@ -28,10 +29,12 @@ def isolate_api_storage(tmp_path, monkeypatch):
     isolated_prober = Prober(isolated_storage, router=isolated_router)
     isolated_metrics = MetricsCollector(isolated_storage)
     isolated_cpa = CpaAdapter(isolated_storage)
+    isolated_allocator = AllocationEngine(isolated_storage)
 
     monkeypatch.setattr(api.server, "storage", isolated_storage)
     monkeypatch.setattr(api.server, "router", isolated_router)
     monkeypatch.setattr(api.server, "prober", isolated_prober)
+    monkeypatch.setattr(api.server, "allocator", isolated_allocator)
     monkeypatch.setattr(api.server, "metrics_collector", isolated_metrics)
     monkeypatch.setattr(api.server, "cpa_adapter", isolated_cpa)
 

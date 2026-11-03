@@ -32,12 +32,14 @@ def test_extract_routing_headers(temp_gateway):
     h1 = {
         "x-account-id": "alice_test",
         "x-region": "tokyo",
-        "x-egress-type": "warp_ipv6"
+        "x-egress-type": "warp_ipv6",
+        "x-service": "grok2api"
     }
-    acc, reg, egr = gateway._extract_routing_headers(h1, "127.0.0.1")
+    acc, reg, egr, svc = gateway._extract_routing_headers(h1, "127.0.0.1")
     assert acc == "alice_test"
     assert reg == "tokyo"
     assert egr == "warp_ipv6"
+    assert svc == "grok2api"
 
     # 2. Proxy-Authorization Basic header
     auth_str = base64.b64encode(b"bob_user:password123").decode("utf-8")
@@ -45,16 +47,18 @@ def test_extract_routing_headers(temp_gateway):
         "proxy-authorization": f"Basic {auth_str}",
         "x-region": "singapore"
     }
-    acc2, reg2, egr2 = gateway._extract_routing_headers(h2, "127.0.0.1")
+    acc2, reg2, egr2, svc2 = gateway._extract_routing_headers(h2, "127.0.0.1")
     assert acc2 == "bob_user"
     assert reg2 == "singapore"
     assert egr2 == "warp_ipv6"
+    assert svc2 is None
 
     # 3. Anonymous fallback generates distributed ephemeral id
     h3 = {}
-    acc3, reg3, egr3 = gateway._extract_routing_headers(h3, "192.168.1.50")
+    acc3, reg3, egr3, svc3 = gateway._extract_routing_headers(h3, "192.168.1.50")
     assert acc3.startswith("anon_")
     assert len(acc3) > 5
+    assert svc3 is None
 
 
 @pytest.mark.asyncio
