@@ -108,7 +108,7 @@ class Storage:
                 conn.execute("""
                     UPDATE nodes SET
                         fail_count = fail_count + 1,
-                        status = CASE WHEN fail_count >= 2 THEN 'dead' ELSE 'degraded' END,
+                        status = CASE WHEN fail_count + 1 >= 2 THEN 'dead' ELSE 'degraded' END,
                         last_probed_at = ?
                     WHERE name = ?
                 """, (now_str, res.node_name))
