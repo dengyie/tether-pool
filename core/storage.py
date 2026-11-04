@@ -920,3 +920,54 @@ class Storage:
             conn.execute(f"DELETE FROM nodes WHERE name IN ({placeholders})", stale)
             return stale
 
+    def delete_node(self, name: str, prune_bindings: bool = True) -> bool:
+        """
+        Deletes a single node by name.
+        If prune_bindings is True, also deletes any attached allocations and leases.
+        Returns True if the node existed and was deleted, False otherwise.
+        """
+        with self._get_conn() as conn:
+            if prune_bindings:
+                conn.execute("DELETE FROM leases WHERE node_name = ?", (name,))
+                conn.execute("DELETE FROM account_allocations WHERE node_name = ?", (name,))
+            cur = conn.execute("DELETE FROM nodes WHERE name = ?", (name,))
+            return cur.rowcount > 0
+
+    def update_node(self, name: str, updates: Dict[str, Any]) -> Optional[ProxyNode]:
+        """
+        Updates specific fields of a node by name.
+        Supported fields: host, port, protocol, region, egress_type, tags, weight,
+        status, circuit_state, tier, configured_tier, relay_mode, relay_hop_node,
+        quality_score.
+        """
+        if not updates:
+            return self.get_node(name)
+
+        allowed_fields = {
+            "host", "port", "protocol", "region", "egress_type", "tags",
+            "weight", "status", "circuit_state", "tier", "configured_tier",
+            "relay_mode", "relay_hop_node", "quality_score"
+        }
+        valid_updates = {k: v for k, v in updates.items() if k in allowed_fields}
+        if not valid_updates:
+            return self.get_node(name)
+
+        # Convert tags to json if provided as list
+        if "tags" in valid_updates and isinstance(valid_updates["tags"], list):
+            valid_updates["tags"] = json.dumps(valid_updates["tags"])
+
+        set_clauses = [f"{k} = ?" for k in valid_updates.keys()]
+        values = list(valid_updates.values())
+        values.append(name)
+
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                f"UPDATE nodes SET {', '.join(set_clauses)} WHERE name = ?",
+                values
+            )
+            if cur.rowcount == 0:
+                return None
+
+        return self.get_node(name)
+
+

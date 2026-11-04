@@ -15,7 +15,8 @@ from core.models import (
     ProxyNode, PoolStats, LeaseInfo, ProbeResult, CircuitEvent,
     RegistrationLease, IpCooldownRecord, BatteryEventReport,
     BatchAllocationRequest, BatchAllocationResponse, AccountAllocationItem,
-    AllocationOverviewResponse
+    AllocationOverviewResponse, NodeCreateRequest, NodeUpdateRequest,
+    HealthStatus
 )
 from core.storage import Storage
 from core.prober import Prober
@@ -232,6 +233,120 @@ def list_nodes(
     tier: Optional[str] = Query(None, description="Optional quality tier filter: premium or standard")
 ):
     return storage.list_nodes(region=region, egress_type=egress_type, status=status, tier=tier)
+
+
+@app.get("/v1/nodes/{name}", response_model=ProxyNode)
+def get_node(name: str):
+    """Retrieves a single proxy node by its unique identifier."""
+    node = storage.get_node(name)
+    if not node:
+        raise HTTPException(status_code=404, detail=f"Node '{name}' not found")
+    return node
+
+
+@app.post("/v1/nodes", response_model=ProxyNode)
+def create_or_upsert_node(req: NodeCreateRequest):
+    """
+    Directly creates or updates a proxy node in the pool via API.
+    Evaluates quality scores and configures quality tiers dynamically.
+    """
+    configured_tier = req.configured_tier or req.tier
+    score, init_tier, _ = IPQualityEvaluator.evaluate_node(
+        tags=req.tags,
+        egress_type=req.egress_type,
+        status="unprobed",
+        configured_tier=configured_tier
+    )
+    final_tier = req.tier or init_tier
+    node = ProxyNode(
+        name=req.name,
+        host=req.host,
+        port=req.port,
+        protocol=req.protocol,
+        region=req.region,
+        egress_type=req.egress_type,
+        tags=req.tags,
+        weight=req.weight,
+        relay_mode=req.relay_mode,
+        relay_hop_node=req.relay_hop_node,
+        tier=final_tier,
+        configured_tier=configured_tier,
+        quality_score=score
+    )
+    storage.upsert_node(node)
+    saved = storage.get_node(req.name)
+    if not saved:
+        raise HTTPException(status_code=500, detail="Failed to save node")
+    return saved
+
+
+@app.patch("/v1/nodes/{name}", response_model=ProxyNode)
+def update_node(name: str, req: NodeUpdateRequest):
+    """
+    Updates specific attributes of an existing proxy node (weight, tags, tier, status, relay).
+    If status is set to dead, automatically triggers rehoming of active account bindings.
+    """
+    existing = storage.get_node(name)
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Node '{name}' not found")
+
+    updates = req.model_dump(exclude_unset=True)
+    if not updates:
+        return existing
+
+    if "tier" in updates and "configured_tier" not in updates:
+        updates["configured_tier"] = updates["tier"]
+
+    updated_node = storage.update_node(name, updates)
+    if not updated_node:
+        raise HTTPException(status_code=404, detail=f"Node '{name}' not found")
+
+    if updates.get("status") == HealthStatus.DEAD.value:
+        router.rehome_leases_for_node(name)
+
+    return updated_node
+
+
+@app.delete("/v1/nodes/{name}")
+def delete_node(
+    name: str,
+    rehome: bool = Query(True, description="Automatically rehome attached accounts before deleting")
+):
+    """
+    Deletes a proxy node from the pool.
+    Optionally auto-rehomes any bound accounts before removal.
+    """
+    existing = storage.get_node(name)
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Node '{name}' not found")
+
+    rehome_result = None
+    if rehome:
+        rehome_result = router.rehome_leases_for_node(name)
+
+    deleted = storage.delete_node(name, prune_bindings=True)
+    return {
+        "deleted": deleted,
+        "node_name": name,
+        "rehome_result": rehome_result
+    }
+
+
+@app.post("/v1/config/reload")
+def reload_config():
+    """
+    Hot-reloads node topology from disk without requiring a systemd service restart.
+    """
+    try:
+        count = load_initial_nodes()
+        return {
+            "reloaded": True,
+            "config_file": CONFIG_FILE,
+            "nodes_loaded": count
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to reload config: {str(e)}")
+
 
 
 def _lease_from_allocation(account_id: str, alloc: dict, st: Optional[Storage] = None) -> Optional[LeaseInfo]:

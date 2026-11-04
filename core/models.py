@@ -207,3 +207,34 @@ class AllocationOverviewResponse(BaseModel):
     node_stats: List[NodeAllocationStat]
 
 
+class NodeCreateRequest(BaseModel):
+    name: str
+    host: str
+    port: int
+    protocol: str = "socks5h"
+    region: str
+    egress_type: str
+    tags: List[str] = Field(default_factory=list)
+    weight: int = 100
+    tier: Optional[str] = None
+    configured_tier: Optional[str] = None
+    relay_mode: str = RelayMode.RELAY_FALLBACK.value
+    relay_hop_node: Optional[str] = None
+
+
+class NodeUpdateRequest(BaseModel):
+    host: Optional[str] = None
+    port: Optional[int] = None
+    protocol: Optional[str] = None
+    region: Optional[str] = None
+    egress_type: Optional[str] = None
+    tags: Optional[List[str]] = None
+    weight: Optional[int] = None
+    status: Optional[str] = None
+    tier: Optional[str] = None
+    configured_tier: Optional[str] = None
+    relay_mode: Optional[str] = None
+    relay_hop_node: Optional[str] = None
+
+
+
