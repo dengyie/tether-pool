@@ -272,3 +272,20 @@ def test_internal_routing_headers_are_stripped(header):
 @pytest.mark.parametrize("header", ["Host", "User-Agent", "Accept", "X-Requested-With", "Content-Type"])
 def test_origin_headers_are_preserved(header):
     assert _is_internal_header(header) is False
+
+
+# ------------------------------------------------------------ control plane
+
+def test_optional_bearer_token_guards_control_plane(monkeypatch):
+    """When IP_POOL_API_TOKEN is set, /v1/* must reject unauthenticated callers."""
+    from starlette.testclient import TestClient
+    import api.server
+
+    monkeypatch.setattr(api.server, "API_TOKEN", "s3cret")
+    client = TestClient(api.server.app)
+
+    assert client.get("/health").status_code == 200
+    assert client.get("/v1/stats").status_code == 401
+    assert client.get("/v1/stats", headers={"Authorization": "Bearer wrong"}).status_code == 401
+    assert client.get("/v1/stats", headers={"Authorization": "Bearer s3cret"}).status_code == 200
+

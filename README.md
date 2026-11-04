@@ -5,7 +5,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-83%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-84%20passed-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 [中文文档 (README.zh-CN.md)](README.zh-CN.md)
@@ -88,7 +88,7 @@ pip install -r requirements.txt
 ```
 Verifies pool topology, multi-region probing, circuit breaker self-healing, forward proxy gateway tunneling, and adapter exports in ~10 seconds.
 
-### 3. Run Unit Tests (83 Tests Passing)
+### 3. Run Unit Tests (84 Tests Passing)
 ```bash
 .venv/bin/pytest -v
 ```
@@ -175,7 +175,7 @@ ip-pool/
 │   ├── gemini_adapter.py       # Gemini Web reverse routing adapter
 │   ├── playwright_pool.py      # Python crawler & Playwright pool SDK
 │   └── tetherpool_client.py    # Zero-dependency HTTP client for the control plane
-├── tests/                      # Pytest isolated unit test suite (83 passing tests)
+├── tests/                      # Pytest isolated unit test suite (84 passing tests)
 ├── demo.py                     # Interactive end-to-end verification showcase
 ├── requirements.txt            # Python dependencies
 └── start.sh                    # Dual-process background daemon manager

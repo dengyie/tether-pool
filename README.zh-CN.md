@@ -5,7 +5,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-83%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-84%20passed-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 [English Documentation (README.md)](README.md)
@@ -90,7 +90,7 @@ pip install -r requirements.txt
 ```
 10 秒内完整跑通全池拓扑校验、双栈实时探活、断路器熔断自愈演练与 `:9101` 正向网关转发验证。
 
-### 3. 执行自动化测试 (83 项全绿)
+### 3. 执行自动化测试 (84 项全绿)
 ```bash
 .venv/bin/pytest -v
 ```
@@ -176,7 +176,7 @@ ip-pool/
 │   ├── gemini_adapter.py       # Gemini Web 逆向出站适配器
 │   ├── playwright_pool.py      # Python 爬虫与 Playwright 代理池 SDK
 │   └── tetherpool_client.py    # 控制面零依赖 HTTP 客户端
-├── tests/                      # 隔离沙箱自动化单元测试 (83 项全绿)
+├── tests/                      # 隔离沙箱自动化单元测试 (84 项全绿)
 ├── demo.py                     # 端到端交互式全功能演练脚本
 ├── requirements.txt            # Python 依赖清单
 └── start.sh                    # 双进程后台守护启停脚本
