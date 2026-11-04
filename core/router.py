@@ -93,10 +93,18 @@ class Router:
                 return False
             return True
 
-        # 1. Check existing lease if not forcing rebind
+        # 1. Check existing lease if not forcing rebind. On a forced rebind the
+        # existing binding is still read — as the node a rebind must NOT land
+        # back on (a rebind that re-hashes onto the same sticky node is a
+        # no-op dressed up as a rebinding, which is exactly what the
+        # deterministic CRC32 mapping below would otherwise do).
+        current_node_name = None
+        alloc = self.storage.find_allocation_by_account(account_id, service=svc)
+        if alloc and alloc.get("node_name"):
+            current_node_name = alloc["node_name"]
+
         if not force_rebind:
             # 1a. Universal Allocation Engine bindings check first
-            alloc = self.storage.find_allocation_by_account(account_id, service=svc)
             if alloc:
                 node = self.storage.get_node(alloc["node_name"])
                 if node and node.status == HealthStatus.HEALTHY.value and node.name != exclude_node:
@@ -123,6 +131,8 @@ class Router:
                     if _node_matches_constraints(node):
                         return existing
                     binding_conflict = True
+            if current_node_name is None and existing:
+                current_node_name = existing.node_name
 
         # 2. Get eligible candidates (tier-aware ladder search)
         candidates = self._get_candidates_for_tier_policy(
@@ -131,8 +141,17 @@ class Router:
             policy=policy
         )
 
+        excluded = set()
         if exclude_node:
-            filtered = [c for c in candidates if c.name != exclude_node]
+            excluded.add(exclude_node)
+        if force_rebind and current_node_name:
+            # A forced rebind must move the account: the deterministic hash
+            # below would otherwise re-select the very node the caller is
+            # trying to leave (observed 2026-11-05: __rebind_true re-landed on
+            # the same sticky node, making the documented parameter a no-op).
+            excluded.add(current_node_name)
+        if excluded:
+            filtered = [c for c in candidates if c.name not in excluded]
             # Only honour the exclusion if it leaves usable options
             if filtered:
                 candidates = filtered

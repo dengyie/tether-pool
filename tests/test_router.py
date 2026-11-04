@@ -62,3 +62,22 @@ def test_filter_by_egress_type(temp_router):
     lease = router.acquire_for_account("user_native_only", egress_type=EgressType.NATIVE_IPV4.value)
     assert lease is not None
     assert lease.node_name == "sg-native-01"
+
+def test_force_rebind_without_exclude_moves_off_the_current_node(temp_router):
+    """A bare __rebind_true (no exclude_node) must not re-land on the same
+    sticky node: the deterministic CRC32 hash below would otherwise re-select
+    the very node the caller is trying to leave (observed 2026-11-05 with the
+    opencode2api per-key egress integration)."""
+    router, storage = temp_router
+
+    first = router.acquire_for_account("acc_rebind_user", region="tokyo",
+                                       egress_type=EgressType.WARP_IPV6.value)
+    assert first is not None
+    second = router.acquire_for_account("acc_rebind_user", region="tokyo",
+                                        egress_type=EgressType.WARP_IPV6.value,
+                                        force_rebind=True)
+    assert second is not None
+    assert second.node_name != first.node_name
+    # The rebind persists the new binding
+    alloc = storage.find_allocation_by_account("acc_rebind_user", service="default")
+    assert alloc["node_name"] == second.node_name

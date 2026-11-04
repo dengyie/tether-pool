@@ -237,3 +237,22 @@ async def test_gateway_connect_malformed_target(temp_gateway):
 
     assert b"400 Bad Request" in resp
 
+
+def test_relay_counters_and_metrics_rendering(temp_gateway):
+    """Per-account relay counters aggregate anon ids under one label and the
+    /metrics rendering is valid Prometheus text (ops attribution feature)."""
+    gateway, storage, router = temp_gateway
+
+    gateway._record_relay("oc2api_Fk8KFb", "sg-warp-01", "example.com:443")
+    gateway._record_relay("oc2api_Fk8KFb", "sg-warp-01", "example.com:443")
+    gateway._record_relay("anon_abcdef12", "sg-warp-01", "example.com:443")
+
+    assert gateway.relay_total["oc2api_Fk8KFb"] == 2
+    assert gateway.relay_total["anon"] == 1
+
+    body = gateway.render_metrics().decode()
+    assert '# TYPE tetherpool_gateway_relay_total counter' in body
+    assert 'tetherpool_gateway_relay_total{account="oc2api_Fk8KFb"} 2' in body
+    assert 'tetherpool_gateway_relay_total{account="anon"} 1' in body
+    # anon uuid ids must never leak as individual labels
+    assert "anon_abcdef12" not in body

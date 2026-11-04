@@ -5,6 +5,7 @@ Transparently maps client requests to sticky EasyTier SOCKS5 exits based on head
 
 import asyncio
 import base64
+import logging
 import os
 import sys
 import socket
@@ -28,6 +29,8 @@ CONNECT_TIMEOUT = 10.0
 HALF_CLOSE_GRACE_SECONDS = 5.0
 
 # Routing metadata consumed by the gateway itself; never forwarded to origins.
+logger = logging.getLogger("tetherpool.gateway")
+
 INTERNAL_ROUTING_HEADERS = frozenset({
     "x-account-id",
     "x-region",
@@ -448,6 +451,26 @@ class ForwardProxyGateway:
         self.host = host
         self.port = port
         self.server = None
+        # Per-account relay counters (ops feedback: the unified gateway had no
+        # way to attribute traffic to downstream accounts). anon_* ids are
+        # aggregated under the single "anon" label to bound cardinality.
+        self.relay_total = {}
+
+    def _record_relay(self, account_id: str, node_name: str, target: str) -> None:
+        key = account_id if not account_id.startswith("anon_") else "anon"
+        if key not in self.relay_total and len(self.relay_total) >= 2000:
+            key = "other"
+        self.relay_total[key] = self.relay_total.get(key, 0) + 1
+        logger.info("relay established account=%s node=%s target=%s", key, node_name, target)
+
+    def render_metrics(self) -> bytes:
+        lines = [
+            "# HELP tetherpool_gateway_relay_total Relay connections established per account.",
+            "# TYPE tetherpool_gateway_relay_total counter",
+        ]
+        for acct, count in sorted(self.relay_total.items()):
+            lines.append('tetherpool_gateway_relay_total{account="%s"} %d' % (acct, count))
+        return ("\n".join(lines) + "\n").encode()
 
     def _extract_routing_headers(self, headers_dict: Dict[str, str], client_ip: str) -> RoutingContext:
         """
@@ -610,9 +633,10 @@ class ForwardProxyGateway:
                 raise NoPoolNodesError("Target proxy node not found in registry")
 
             try:
-                return await self.connect_upstream_adaptive(
+                stream = await self.connect_upstream_adaptive(
                     node=node, target_host=target_host, target_port=target_port
                 )
+                return stream[0], stream[1], node.name
             except Exception as exc:
                 last_err = exc
                 excluded = node.name
@@ -660,6 +684,18 @@ class ForwardProxyGateway:
             # 2. Extract routing constraints
             route_ctx = self._extract_routing_headers(headers_dict, client_ip)
 
+            # Internal Prometheus endpoint (mesh-only service): GET /metrics
+            # never proxies; it reports per-account relay counters.
+            if method.upper() == "GET" and target.split("?")[0] == "/metrics":
+                body = self.render_metrics()
+                resp = ("HTTP/1.1 200 OK" + "\r\n"
+                        + "Content-Type: text/plain; version=0.0.4\r\n"
+                        + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode() + body
+                client_writer.write(resp)
+                await client_writer.drain()
+                client_writer.close()
+                return
+
             # 3. Handle HTTP CONNECT (HTTPS)
             if method.upper() == "CONNECT":
                 try:
@@ -672,7 +708,7 @@ class ForwardProxyGateway:
                     return
 
                 try:
-                    remote_reader, remote_writer = await self._open_upstream(
+                    remote_reader, remote_writer, node_name = await self._open_upstream(
                         account_id=route_ctx.account_id,
                         region=route_ctx.region,
                         egress_type=route_ctx.egress_type,
@@ -683,6 +719,7 @@ class ForwardProxyGateway:
                         tier_policy=route_ctx.tier_policy,
                         force_rebind=route_ctx.force_rebind,
                     )
+                    self._record_relay(route_ctx.account_id, node_name, f"{target_host}:{target_port}")
                 except NoPoolNodesError as pool_err:
                     err_resp = f"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\r\n{pool_err}\r\n".encode()
                     client_writer.write(err_resp)
@@ -724,7 +761,7 @@ class ForwardProxyGateway:
                     path_and_query += f"?{parsed_url.query}"
 
                 try:
-                    remote_reader, remote_writer = await self._open_upstream(
+                    remote_reader, remote_writer, node_name = await self._open_upstream(
                         account_id=route_ctx.account_id,
                         region=route_ctx.region,
                         egress_type=route_ctx.egress_type,
@@ -735,6 +772,7 @@ class ForwardProxyGateway:
                         tier_policy=route_ctx.tier_policy,
                         force_rebind=route_ctx.force_rebind,
                     )
+                    self._record_relay(route_ctx.account_id, node_name, f"{target_host}:{target_port}")
                 except NoPoolNodesError as pool_err:
                     err_resp = f"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\r\n{pool_err}\r\n".encode()
                     client_writer.write(err_resp)
@@ -788,6 +826,7 @@ class ForwardProxyGateway:
 
 
 async def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     storage = Storage()
     router = Router(storage)
     gateway = ForwardProxyGateway(storage, router)
