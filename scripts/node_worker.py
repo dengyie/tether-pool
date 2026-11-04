@@ -232,6 +232,9 @@ def update_sing_box_config(endpoints, mesh_ip, start_port=10881, has_native_v6=F
         ep_tag = f"warp-ep{i:02d}"
         ib_tag = f"socks-warp-{i:02d}"
         port = start_port + i - 1
+        if port >= 11010:
+            # Skip 11010 to avoid conflicting with EasyTier mesh listener
+            port += 1
 
         new_endpoints.append({
             "type": "wireguard",

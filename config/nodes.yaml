@@ -13,8 +13,8 @@ nodes:
   region: tokyo
   egress_type: native_ipv4
   tags:
+  - self_hosted
   - native
-  - ipv4
   - aws
   - tokyo
   weight: 100
@@ -26,10 +26,88 @@ nodes:
   region: tokyo
   egress_type: native_ipv6
   tags:
+  - self_hosted
   - native
-  - ipv6
   - aws
   - tokyo
+  weight: 100
+  tier: premium
+- name: huawei-sg-native-v4
+  host: 10.144.144.13
+  port: 10801
+  protocol: socks5h
+  region: singapore
+  egress_type: native_ipv4
+  tags:
+  - self_hosted
+  - native
+  - huawei
+  - singapore
+  weight: 100
+  tier: premium
+- name: leaseweb-nl-native-v4
+  host: 10.144.144.12
+  port: 10801
+  protocol: socks5h
+  region: netherlands
+  egress_type: native_ipv4
+  tags:
+  - self_hosted
+  - native
+  - leaseweb
+  - netherlands
+  weight: 100
+  tier: premium
+- name: leaseweb-nl-native-v6
+  host: 10.144.144.12
+  port: 10802
+  protocol: socks5h
+  region: netherlands
+  egress_type: native_ipv6
+  tags:
+  - self_hosted
+  - native
+  - leaseweb
+  - netherlands
+  weight: 100
+  tier: premium
+- name: azure-india-native-v4
+  host: 10.144.144.5
+  port: 10801
+  protocol: socks5h
+  region: india
+  egress_type: native_ipv4
+  tags:
+  - self_hosted
+  - native
+  - azure
+  - india
+  weight: 100
+  tier: premium
+- name: azure-hk-native-v4
+  host: 10.144.144.2
+  port: 10801
+  protocol: socks5h
+  region: hongkong
+  egress_type: native_ipv4
+  tags:
+  - self_hosted
+  - native
+  - azure
+  - hongkong
+  weight: 100
+  tier: premium
+- name: gcp-uswest-native-v4
+  host: 10.144.144.4
+  port: 10801
+  protocol: socks5h
+  region: us-west
+  egress_type: native_ipv4
+  tags:
+  - self_hosted
+  - native
+  - gcp
+  - us-west
   weight: 100
   tier: premium
 - name: aws-tokyo-warp-01
@@ -332,345 +410,186 @@ nodes:
   - tokyo
   weight: 100
   tier: standard
-- name: mesh-nl-native-v4
-  host: 10.144.144.12
-  port: 10801
+- name: aws-tokyo-warp-26
+  host: 10.144.144.3
+  port: 10906
   protocol: socks5h
-  region: netherlands
-  egress_type: native_ipv4
-  tags:
-  - native
-  - ipv4
-  - leaseweb
-  - netherlands
-  weight: 100
-  tier: premium
-- name: mesh-nl-native-v6
-  host: 10.144.144.12
-  port: 10802
-  protocol: socks5h
-  region: netherlands
-  egress_type: native_ipv6
-  tags:
-  - native
-  - ipv6
-  - leaseweb
-  - netherlands
-  weight: 100
-  tier: premium
-- name: mesh-nl-warp-01
-  host: 10.144.144.12
-  port: 10881
-  protocol: socks5h
-  region: netherlands
+  region: tokyo
   egress_type: warp_ipv6
   tags:
   - warp
   - ipv6
-  - netherlands
+  - tokyo
   weight: 100
   tier: standard
-- name: mesh-nl-warp-02
-  host: 10.144.144.12
-  port: 10882
+- name: aws-tokyo-warp-27
+  host: 10.144.144.3
+  port: 10907
   protocol: socks5h
-  region: netherlands
+  region: tokyo
   egress_type: warp_ipv6
   tags:
   - warp
   - ipv6
-  - netherlands
+  - tokyo
   weight: 100
   tier: standard
-- name: mesh-nl-warp-03
-  host: 10.144.144.12
-  port: 10883
+- name: aws-tokyo-warp-28
+  host: 10.144.144.3
+  port: 10908
   protocol: socks5h
-  region: netherlands
+  region: tokyo
   egress_type: warp_ipv6
   tags:
   - warp
   - ipv6
-  - netherlands
+  - tokyo
   weight: 100
   tier: standard
-- name: mesh-nl-warp-04
-  host: 10.144.144.12
-  port: 10884
+- name: aws-tokyo-warp-29
+  host: 10.144.144.3
+  port: 10909
   protocol: socks5h
-  region: netherlands
+  region: tokyo
   egress_type: warp_ipv6
   tags:
   - warp
   - ipv6
-  - netherlands
+  - tokyo
   weight: 100
   tier: standard
-- name: mesh-nl-warp-05
-  host: 10.144.144.12
-  port: 10885
+- name: aws-tokyo-warp-30
+  host: 10.144.144.3
+  port: 10910
   protocol: socks5h
-  region: netherlands
+  region: tokyo
   egress_type: warp_ipv6
   tags:
   - warp
   - ipv6
-  - netherlands
+  - tokyo
   weight: 100
   tier: standard
-- name: mesh-nl-warp-06
-  host: 10.144.144.12
-  port: 10886
+- name: aws-tokyo-warp-31
+  host: 10.144.144.3
+  port: 10911
   protocol: socks5h
-  region: netherlands
+  region: tokyo
   egress_type: warp_ipv6
   tags:
   - warp
   - ipv6
-  - netherlands
+  - tokyo
   weight: 100
   tier: standard
-- name: mesh-nl-warp-07
-  host: 10.144.144.12
-  port: 10887
+- name: aws-tokyo-warp-32
+  host: 10.144.144.3
+  port: 10912
   protocol: socks5h
-  region: netherlands
+  region: tokyo
   egress_type: warp_ipv6
   tags:
   - warp
   - ipv6
-  - netherlands
+  - tokyo
   weight: 100
   tier: standard
-- name: mesh-nl-warp-08
-  host: 10.144.144.12
-  port: 10888
+- name: aws-tokyo-warp-33
+  host: 10.144.144.3
+  port: 10913
   protocol: socks5h
-  region: netherlands
+  region: tokyo
   egress_type: warp_ipv6
   tags:
   - warp
   - ipv6
-  - netherlands
+  - tokyo
   weight: 100
   tier: standard
-- name: mesh-nl-warp-09
-  host: 10.144.144.12
-  port: 10889
+- name: aws-tokyo-warp-34
+  host: 10.144.144.3
+  port: 10914
   protocol: socks5h
-  region: netherlands
+  region: tokyo
   egress_type: warp_ipv6
   tags:
   - warp
   - ipv6
-  - netherlands
+  - tokyo
   weight: 100
   tier: standard
-- name: mesh-nl-warp-10
-  host: 10.144.144.12
-  port: 10890
+- name: aws-tokyo-warp-35
+  host: 10.144.144.3
+  port: 10915
   protocol: socks5h
-  region: netherlands
+  region: tokyo
   egress_type: warp_ipv6
   tags:
   - warp
   - ipv6
-  - netherlands
+  - tokyo
   weight: 100
   tier: standard
-- name: mesh-nl-warp-11
-  host: 10.144.144.12
-  port: 10891
+- name: aws-tokyo-warp-36
+  host: 10.144.144.3
+  port: 10916
   protocol: socks5h
-  region: netherlands
+  region: tokyo
   egress_type: warp_ipv6
   tags:
   - warp
   - ipv6
-  - netherlands
+  - tokyo
   weight: 100
   tier: standard
-- name: mesh-nl-warp-12
-  host: 10.144.144.12
-  port: 10892
+- name: aws-tokyo-warp-37
+  host: 10.144.144.3
+  port: 10917
   protocol: socks5h
-  region: netherlands
+  region: tokyo
   egress_type: warp_ipv6
   tags:
   - warp
   - ipv6
-  - netherlands
+  - tokyo
   weight: 100
   tier: standard
-- name: mesh-nl-warp-13
-  host: 10.144.144.12
-  port: 10893
+- name: aws-tokyo-warp-38
+  host: 10.144.144.3
+  port: 10918
   protocol: socks5h
-  region: netherlands
+  region: tokyo
   egress_type: warp_ipv6
   tags:
   - warp
   - ipv6
-  - netherlands
+  - tokyo
   weight: 100
   tier: standard
-- name: mesh-nl-warp-14
-  host: 10.144.144.12
-  port: 10894
+- name: aws-tokyo-warp-39
+  host: 10.144.144.3
+  port: 10919
   protocol: socks5h
-  region: netherlands
+  region: tokyo
   egress_type: warp_ipv6
   tags:
   - warp
   - ipv6
-  - netherlands
+  - tokyo
   weight: 100
   tier: standard
-- name: mesh-nl-warp-15
-  host: 10.144.144.12
-  port: 10895
+- name: aws-tokyo-warp-40
+  host: 10.144.144.3
+  port: 10920
   protocol: socks5h
-  region: netherlands
+  region: tokyo
   egress_type: warp_ipv6
   tags:
   - warp
   - ipv6
-  - netherlands
+  - tokyo
   weight: 100
   tier: standard
-- name: mesh-nl-warp-16
-  host: 10.144.144.12
-  port: 10896
-  protocol: socks5h
-  region: netherlands
-  egress_type: warp_ipv6
-  tags:
-  - warp
-  - ipv6
-  - netherlands
-  weight: 100
-  tier: standard
-- name: mesh-nl-warp-17
-  host: 10.144.144.12
-  port: 10897
-  protocol: socks5h
-  region: netherlands
-  egress_type: warp_ipv6
-  tags:
-  - warp
-  - ipv6
-  - netherlands
-  weight: 100
-  tier: standard
-- name: mesh-nl-warp-18
-  host: 10.144.144.12
-  port: 10898
-  protocol: socks5h
-  region: netherlands
-  egress_type: warp_ipv6
-  tags:
-  - warp
-  - ipv6
-  - netherlands
-  weight: 100
-  tier: standard
-- name: mesh-nl-warp-19
-  host: 10.144.144.12
-  port: 10899
-  protocol: socks5h
-  region: netherlands
-  egress_type: warp_ipv6
-  tags:
-  - warp
-  - ipv6
-  - netherlands
-  weight: 100
-  tier: standard
-- name: mesh-nl-warp-20
-  host: 10.144.144.12
-  port: 10900
-  protocol: socks5h
-  region: netherlands
-  egress_type: warp_ipv6
-  tags:
-  - warp
-  - ipv6
-  - netherlands
-  weight: 100
-  tier: standard
-- name: mesh-nl-warp-21
-  host: 10.144.144.12
-  port: 10901
-  protocol: socks5h
-  region: netherlands
-  egress_type: warp_ipv6
-  tags:
-  - warp
-  - ipv6
-  - netherlands
-  weight: 100
-  tier: standard
-- name: mesh-nl-warp-22
-  host: 10.144.144.12
-  port: 10902
-  protocol: socks5h
-  region: netherlands
-  egress_type: warp_ipv6
-  tags:
-  - warp
-  - ipv6
-  - netherlands
-  weight: 100
-  tier: standard
-- name: mesh-nl-warp-23
-  host: 10.144.144.12
-  port: 10903
-  protocol: socks5h
-  region: netherlands
-  egress_type: warp_ipv6
-  tags:
-  - warp
-  - ipv6
-  - netherlands
-  weight: 100
-  tier: standard
-- name: mesh-nl-warp-24
-  host: 10.144.144.12
-  port: 10904
-  protocol: socks5h
-  region: netherlands
-  egress_type: warp_ipv6
-  tags:
-  - warp
-  - ipv6
-  - netherlands
-  weight: 100
-  tier: standard
-- name: mesh-nl-warp-25
-  host: 10.144.144.12
-  port: 10905
-  protocol: socks5h
-  region: netherlands
-  egress_type: warp_ipv6
-  tags:
-  - warp
-  - ipv6
-  - netherlands
-  weight: 100
-  tier: standard
-- name: huawei-sg-native-v4
-  host: 10.144.144.13
-  port: 10801
-  protocol: socks5h
-  region: singapore
-  egress_type: native_ipv4
-  tags:
-  - native
-  - ipv4
-  - huawei
-  - singapore
-  weight: 100
-  tier: premium
 - name: huawei-sg-warp-01
   host: 10.144.144.13
   port: 10881
@@ -971,20 +890,667 @@ nodes:
   - singapore
   weight: 100
   tier: standard
-- name: india-native-v4
-  host: 10.144.144.5
-  port: 10801
+- name: huawei-sg-warp-26
+  host: 10.144.144.13
+  port: 10906
   protocol: socks5h
-  region: india
-  egress_type: native_ipv4
+  region: singapore
+  egress_type: warp_ipv6
   tags:
-  - native
-  - ipv4
-  - azure
-  - india
+  - warp
+  - ipv6
+  - singapore
   weight: 100
-  tier: premium
-- name: india-warp-01
+  tier: standard
+- name: huawei-sg-warp-27
+  host: 10.144.144.13
+  port: 10907
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-28
+  host: 10.144.144.13
+  port: 10908
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-29
+  host: 10.144.144.13
+  port: 10909
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-30
+  host: 10.144.144.13
+  port: 10910
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-31
+  host: 10.144.144.13
+  port: 10911
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-32
+  host: 10.144.144.13
+  port: 10912
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-33
+  host: 10.144.144.13
+  port: 10913
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-34
+  host: 10.144.144.13
+  port: 10914
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-35
+  host: 10.144.144.13
+  port: 10915
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-36
+  host: 10.144.144.13
+  port: 10916
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-37
+  host: 10.144.144.13
+  port: 10917
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-38
+  host: 10.144.144.13
+  port: 10918
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-39
+  host: 10.144.144.13
+  port: 10919
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-40
+  host: 10.144.144.13
+  port: 10920
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-41
+  host: 10.144.144.13
+  port: 10921
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-42
+  host: 10.144.144.13
+  port: 10922
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-43
+  host: 10.144.144.13
+  port: 10923
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-44
+  host: 10.144.144.13
+  port: 10924
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-45
+  host: 10.144.144.13
+  port: 10925
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-46
+  host: 10.144.144.13
+  port: 10926
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-47
+  host: 10.144.144.13
+  port: 10927
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-48
+  host: 10.144.144.13
+  port: 10928
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-49
+  host: 10.144.144.13
+  port: 10929
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-50
+  host: 10.144.144.13
+  port: 10930
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-51
+  host: 10.144.144.13
+  port: 10931
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-52
+  host: 10.144.144.13
+  port: 10932
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-53
+  host: 10.144.144.13
+  port: 10933
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-54
+  host: 10.144.144.13
+  port: 10934
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-55
+  host: 10.144.144.13
+  port: 10935
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-56
+  host: 10.144.144.13
+  port: 10936
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-57
+  host: 10.144.144.13
+  port: 10937
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-58
+  host: 10.144.144.13
+  port: 10938
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-59
+  host: 10.144.144.13
+  port: 10939
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-60
+  host: 10.144.144.13
+  port: 10940
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-61
+  host: 10.144.144.13
+  port: 10941
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-62
+  host: 10.144.144.13
+  port: 10942
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-63
+  host: 10.144.144.13
+  port: 10943
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-64
+  host: 10.144.144.13
+  port: 10944
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-65
+  host: 10.144.144.13
+  port: 10945
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-66
+  host: 10.144.144.13
+  port: 10946
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-67
+  host: 10.144.144.13
+  port: 10947
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-68
+  host: 10.144.144.13
+  port: 10948
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-69
+  host: 10.144.144.13
+  port: 10949
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-70
+  host: 10.144.144.13
+  port: 10950
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-71
+  host: 10.144.144.13
+  port: 10951
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-72
+  host: 10.144.144.13
+  port: 10952
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-73
+  host: 10.144.144.13
+  port: 10953
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-74
+  host: 10.144.144.13
+  port: 10954
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-75
+  host: 10.144.144.13
+  port: 10955
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-76
+  host: 10.144.144.13
+  port: 10956
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-77
+  host: 10.144.144.13
+  port: 10957
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-78
+  host: 10.144.144.13
+  port: 10958
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-79
+  host: 10.144.144.13
+  port: 10959
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: huawei-sg-warp-80
+  host: 10.144.144.13
+  port: 10960
+  protocol: socks5h
+  region: singapore
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - singapore
+  weight: 100
+  tier: standard
+- name: azure-india-warp-01
   host: 10.144.144.5
   port: 10881
   protocol: socks5h
@@ -996,7 +1562,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-02
+- name: azure-india-warp-02
   host: 10.144.144.5
   port: 10882
   protocol: socks5h
@@ -1008,7 +1574,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-03
+- name: azure-india-warp-03
   host: 10.144.144.5
   port: 10883
   protocol: socks5h
@@ -1020,7 +1586,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-04
+- name: azure-india-warp-04
   host: 10.144.144.5
   port: 10884
   protocol: socks5h
@@ -1032,7 +1598,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-05
+- name: azure-india-warp-05
   host: 10.144.144.5
   port: 10885
   protocol: socks5h
@@ -1044,7 +1610,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-06
+- name: azure-india-warp-06
   host: 10.144.144.5
   port: 10886
   protocol: socks5h
@@ -1056,7 +1622,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-07
+- name: azure-india-warp-07
   host: 10.144.144.5
   port: 10887
   protocol: socks5h
@@ -1068,7 +1634,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-08
+- name: azure-india-warp-08
   host: 10.144.144.5
   port: 10888
   protocol: socks5h
@@ -1080,7 +1646,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-09
+- name: azure-india-warp-09
   host: 10.144.144.5
   port: 10889
   protocol: socks5h
@@ -1092,7 +1658,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-10
+- name: azure-india-warp-10
   host: 10.144.144.5
   port: 10890
   protocol: socks5h
@@ -1104,7 +1670,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-11
+- name: azure-india-warp-11
   host: 10.144.144.5
   port: 10891
   protocol: socks5h
@@ -1116,7 +1682,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-12
+- name: azure-india-warp-12
   host: 10.144.144.5
   port: 10892
   protocol: socks5h
@@ -1128,7 +1694,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-13
+- name: azure-india-warp-13
   host: 10.144.144.5
   port: 10893
   protocol: socks5h
@@ -1140,7 +1706,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-14
+- name: azure-india-warp-14
   host: 10.144.144.5
   port: 10894
   protocol: socks5h
@@ -1152,7 +1718,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-15
+- name: azure-india-warp-15
   host: 10.144.144.5
   port: 10895
   protocol: socks5h
@@ -1164,7 +1730,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-16
+- name: azure-india-warp-16
   host: 10.144.144.5
   port: 10896
   protocol: socks5h
@@ -1176,7 +1742,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-17
+- name: azure-india-warp-17
   host: 10.144.144.5
   port: 10897
   protocol: socks5h
@@ -1188,7 +1754,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-18
+- name: azure-india-warp-18
   host: 10.144.144.5
   port: 10898
   protocol: socks5h
@@ -1200,7 +1766,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-19
+- name: azure-india-warp-19
   host: 10.144.144.5
   port: 10899
   protocol: socks5h
@@ -1212,7 +1778,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-20
+- name: azure-india-warp-20
   host: 10.144.144.5
   port: 10900
   protocol: socks5h
@@ -1224,7 +1790,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-21
+- name: azure-india-warp-21
   host: 10.144.144.5
   port: 10901
   protocol: socks5h
@@ -1236,7 +1802,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-22
+- name: azure-india-warp-22
   host: 10.144.144.5
   port: 10902
   protocol: socks5h
@@ -1248,7 +1814,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-23
+- name: azure-india-warp-23
   host: 10.144.144.5
   port: 10903
   protocol: socks5h
@@ -1260,7 +1826,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-24
+- name: azure-india-warp-24
   host: 10.144.144.5
   port: 10904
   protocol: socks5h
@@ -1272,7 +1838,7 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: india-warp-25
+- name: azure-india-warp-25
   host: 10.144.144.5
   port: 10905
   protocol: socks5h
@@ -1284,32 +1850,3306 @@ nodes:
   - india
   weight: 100
   tier: standard
-- name: hk-native-v4
-  host: 10.144.144.2
-  port: 10801
+- name: azure-india-warp-26
+  host: 10.144.144.5
+  port: 10906
   protocol: socks5h
-  region: hongkong
-  egress_type: native_ipv4
+  region: india
+  egress_type: warp_ipv6
   tags:
-  - native
-  - ipv4
-  - azure
-  - hongkong
+  - warp
+  - ipv6
+  - india
   weight: 100
-  tier: premium
-- name: google-native-v4
-  host: 10.144.144.4
-  port: 10801
+  tier: standard
+- name: azure-india-warp-27
+  host: 10.144.144.5
+  port: 10907
   protocol: socks5h
-  region: us-west
-  egress_type: native_ipv4
+  region: india
+  egress_type: warp_ipv6
   tags:
-  - native
-  - ipv4
-  - gcp
-  - us-west
+  - warp
+  - ipv6
+  - india
   weight: 100
-  tier: premium
+  tier: standard
+- name: azure-india-warp-28
+  host: 10.144.144.5
+  port: 10908
+  protocol: socks5h
+  region: india
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - india
+  weight: 100
+  tier: standard
+- name: azure-india-warp-29
+  host: 10.144.144.5
+  port: 10909
+  protocol: socks5h
+  region: india
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - india
+  weight: 100
+  tier: standard
+- name: azure-india-warp-30
+  host: 10.144.144.5
+  port: 10910
+  protocol: socks5h
+  region: india
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - india
+  weight: 100
+  tier: standard
+- name: azure-india-warp-31
+  host: 10.144.144.5
+  port: 10911
+  protocol: socks5h
+  region: india
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - india
+  weight: 100
+  tier: standard
+- name: azure-india-warp-32
+  host: 10.144.144.5
+  port: 10912
+  protocol: socks5h
+  region: india
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - india
+  weight: 100
+  tier: standard
+- name: azure-india-warp-33
+  host: 10.144.144.5
+  port: 10913
+  protocol: socks5h
+  region: india
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - india
+  weight: 100
+  tier: standard
+- name: azure-india-warp-34
+  host: 10.144.144.5
+  port: 10914
+  protocol: socks5h
+  region: india
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - india
+  weight: 100
+  tier: standard
+- name: azure-india-warp-35
+  host: 10.144.144.5
+  port: 10915
+  protocol: socks5h
+  region: india
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - india
+  weight: 100
+  tier: standard
+- name: azure-india-warp-36
+  host: 10.144.144.5
+  port: 10916
+  protocol: socks5h
+  region: india
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - india
+  weight: 100
+  tier: standard
+- name: azure-india-warp-37
+  host: 10.144.144.5
+  port: 10917
+  protocol: socks5h
+  region: india
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - india
+  weight: 100
+  tier: standard
+- name: azure-india-warp-38
+  host: 10.144.144.5
+  port: 10918
+  protocol: socks5h
+  region: india
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - india
+  weight: 100
+  tier: standard
+- name: azure-india-warp-39
+  host: 10.144.144.5
+  port: 10919
+  protocol: socks5h
+  region: india
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - india
+  weight: 100
+  tier: standard
+- name: azure-india-warp-40
+  host: 10.144.144.5
+  port: 10920
+  protocol: socks5h
+  region: india
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - india
+  weight: 100
+  tier: standard
+- name: azure-india-warp-41
+  host: 10.144.144.5
+  port: 10921
+  protocol: socks5h
+  region: india
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - india
+  weight: 100
+  tier: standard
+- name: azure-india-warp-42
+  host: 10.144.144.5
+  port: 10922
+  protocol: socks5h
+  region: india
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - india
+  weight: 100
+  tier: standard
+- name: azure-india-warp-43
+  host: 10.144.144.5
+  port: 10923
+  protocol: socks5h
+  region: india
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - india
+  weight: 100
+  tier: standard
+- name: azure-india-warp-44
+  host: 10.144.144.5
+  port: 10924
+  protocol: socks5h
+  region: india
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - india
+  weight: 100
+  tier: standard
+- name: azure-india-warp-45
+  host: 10.144.144.5
+  port: 10925
+  protocol: socks5h
+  region: india
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - india
+  weight: 100
+  tier: standard
+- name: azure-india-warp-46
+  host: 10.144.144.5
+  port: 10926
+  protocol: socks5h
+  region: india
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - india
+  weight: 100
+  tier: standard
+- name: azure-india-warp-47
+  host: 10.144.144.5
+  port: 10927
+  protocol: socks5h
+  region: india
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - india
+  weight: 100
+  tier: standard
+- name: azure-india-warp-48
+  host: 10.144.144.5
+  port: 10928
+  protocol: socks5h
+  region: india
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - india
+  weight: 100
+  tier: standard
+- name: azure-india-warp-49
+  host: 10.144.144.5
+  port: 10929
+  protocol: socks5h
+  region: india
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - india
+  weight: 100
+  tier: standard
+- name: azure-india-warp-50
+  host: 10.144.144.5
+  port: 10930
+  protocol: socks5h
+  region: india
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - india
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-001
+  host: 10.144.144.12
+  port: 10881
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-002
+  host: 10.144.144.12
+  port: 10882
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-003
+  host: 10.144.144.12
+  port: 10883
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-004
+  host: 10.144.144.12
+  port: 10884
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-005
+  host: 10.144.144.12
+  port: 10885
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-006
+  host: 10.144.144.12
+  port: 10886
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-007
+  host: 10.144.144.12
+  port: 10887
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-008
+  host: 10.144.144.12
+  port: 10888
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-009
+  host: 10.144.144.12
+  port: 10889
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-010
+  host: 10.144.144.12
+  port: 10890
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-011
+  host: 10.144.144.12
+  port: 10891
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-012
+  host: 10.144.144.12
+  port: 10892
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-013
+  host: 10.144.144.12
+  port: 10893
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-014
+  host: 10.144.144.12
+  port: 10894
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-015
+  host: 10.144.144.12
+  port: 10895
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-016
+  host: 10.144.144.12
+  port: 10896
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-017
+  host: 10.144.144.12
+  port: 10897
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-018
+  host: 10.144.144.12
+  port: 10898
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-019
+  host: 10.144.144.12
+  port: 10899
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-020
+  host: 10.144.144.12
+  port: 10900
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-021
+  host: 10.144.144.12
+  port: 10901
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-022
+  host: 10.144.144.12
+  port: 10902
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-023
+  host: 10.144.144.12
+  port: 10903
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-024
+  host: 10.144.144.12
+  port: 10904
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-025
+  host: 10.144.144.12
+  port: 10905
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-026
+  host: 10.144.144.12
+  port: 10906
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-027
+  host: 10.144.144.12
+  port: 10907
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-028
+  host: 10.144.144.12
+  port: 10908
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-029
+  host: 10.144.144.12
+  port: 10909
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-030
+  host: 10.144.144.12
+  port: 10910
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-031
+  host: 10.144.144.12
+  port: 10911
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-032
+  host: 10.144.144.12
+  port: 10912
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-033
+  host: 10.144.144.12
+  port: 10913
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-034
+  host: 10.144.144.12
+  port: 10914
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-035
+  host: 10.144.144.12
+  port: 10915
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-036
+  host: 10.144.144.12
+  port: 10916
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-037
+  host: 10.144.144.12
+  port: 10917
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-038
+  host: 10.144.144.12
+  port: 10918
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-039
+  host: 10.144.144.12
+  port: 10919
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-040
+  host: 10.144.144.12
+  port: 10920
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-041
+  host: 10.144.144.12
+  port: 10921
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-042
+  host: 10.144.144.12
+  port: 10922
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-043
+  host: 10.144.144.12
+  port: 10923
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-044
+  host: 10.144.144.12
+  port: 10924
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-045
+  host: 10.144.144.12
+  port: 10925
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-046
+  host: 10.144.144.12
+  port: 10926
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-047
+  host: 10.144.144.12
+  port: 10927
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-048
+  host: 10.144.144.12
+  port: 10928
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-049
+  host: 10.144.144.12
+  port: 10929
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-050
+  host: 10.144.144.12
+  port: 10930
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-051
+  host: 10.144.144.12
+  port: 10931
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-052
+  host: 10.144.144.12
+  port: 10932
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-053
+  host: 10.144.144.12
+  port: 10933
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-054
+  host: 10.144.144.12
+  port: 10934
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-055
+  host: 10.144.144.12
+  port: 10935
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-056
+  host: 10.144.144.12
+  port: 10936
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-057
+  host: 10.144.144.12
+  port: 10937
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-058
+  host: 10.144.144.12
+  port: 10938
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-059
+  host: 10.144.144.12
+  port: 10939
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-060
+  host: 10.144.144.12
+  port: 10940
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-061
+  host: 10.144.144.12
+  port: 10941
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-062
+  host: 10.144.144.12
+  port: 10942
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-063
+  host: 10.144.144.12
+  port: 10943
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-064
+  host: 10.144.144.12
+  port: 10944
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-065
+  host: 10.144.144.12
+  port: 10945
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-066
+  host: 10.144.144.12
+  port: 10946
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-067
+  host: 10.144.144.12
+  port: 10947
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-068
+  host: 10.144.144.12
+  port: 10948
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-069
+  host: 10.144.144.12
+  port: 10949
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-070
+  host: 10.144.144.12
+  port: 10950
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-071
+  host: 10.144.144.12
+  port: 10951
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-072
+  host: 10.144.144.12
+  port: 10952
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-073
+  host: 10.144.144.12
+  port: 10953
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-074
+  host: 10.144.144.12
+  port: 10954
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-075
+  host: 10.144.144.12
+  port: 10955
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-076
+  host: 10.144.144.12
+  port: 10956
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-077
+  host: 10.144.144.12
+  port: 10957
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-078
+  host: 10.144.144.12
+  port: 10958
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-079
+  host: 10.144.144.12
+  port: 10959
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-080
+  host: 10.144.144.12
+  port: 10960
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-081
+  host: 10.144.144.12
+  port: 10961
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-082
+  host: 10.144.144.12
+  port: 10962
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-083
+  host: 10.144.144.12
+  port: 10963
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-084
+  host: 10.144.144.12
+  port: 10964
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-085
+  host: 10.144.144.12
+  port: 10965
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-086
+  host: 10.144.144.12
+  port: 10966
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-087
+  host: 10.144.144.12
+  port: 10967
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-088
+  host: 10.144.144.12
+  port: 10968
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-089
+  host: 10.144.144.12
+  port: 10969
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-090
+  host: 10.144.144.12
+  port: 10970
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-091
+  host: 10.144.144.12
+  port: 10971
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-092
+  host: 10.144.144.12
+  port: 10972
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-093
+  host: 10.144.144.12
+  port: 10973
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-094
+  host: 10.144.144.12
+  port: 10974
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-095
+  host: 10.144.144.12
+  port: 10975
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-096
+  host: 10.144.144.12
+  port: 10976
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-097
+  host: 10.144.144.12
+  port: 10977
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-098
+  host: 10.144.144.12
+  port: 10978
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-099
+  host: 10.144.144.12
+  port: 10979
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-100
+  host: 10.144.144.12
+  port: 10980
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-101
+  host: 10.144.144.12
+  port: 10981
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-102
+  host: 10.144.144.12
+  port: 10982
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-103
+  host: 10.144.144.12
+  port: 10983
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-104
+  host: 10.144.144.12
+  port: 10984
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-105
+  host: 10.144.144.12
+  port: 10985
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-106
+  host: 10.144.144.12
+  port: 10986
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-107
+  host: 10.144.144.12
+  port: 10987
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-108
+  host: 10.144.144.12
+  port: 10988
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-109
+  host: 10.144.144.12
+  port: 10989
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-110
+  host: 10.144.144.12
+  port: 10990
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-111
+  host: 10.144.144.12
+  port: 10991
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-112
+  host: 10.144.144.12
+  port: 10992
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-113
+  host: 10.144.144.12
+  port: 10993
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-114
+  host: 10.144.144.12
+  port: 10994
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-115
+  host: 10.144.144.12
+  port: 10995
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-116
+  host: 10.144.144.12
+  port: 10996
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-117
+  host: 10.144.144.12
+  port: 10997
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-118
+  host: 10.144.144.12
+  port: 10998
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-119
+  host: 10.144.144.12
+  port: 10999
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-120
+  host: 10.144.144.12
+  port: 11000
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-121
+  host: 10.144.144.12
+  port: 11001
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-122
+  host: 10.144.144.12
+  port: 11002
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-123
+  host: 10.144.144.12
+  port: 11003
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-124
+  host: 10.144.144.12
+  port: 11004
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-125
+  host: 10.144.144.12
+  port: 11005
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-126
+  host: 10.144.144.12
+  port: 11006
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-127
+  host: 10.144.144.12
+  port: 11007
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-128
+  host: 10.144.144.12
+  port: 11008
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-129
+  host: 10.144.144.12
+  port: 11009
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-130
+  host: 10.144.144.12
+  port: 11011
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-131
+  host: 10.144.144.12
+  port: 11012
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-132
+  host: 10.144.144.12
+  port: 11013
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-133
+  host: 10.144.144.12
+  port: 11014
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-134
+  host: 10.144.144.12
+  port: 11015
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-135
+  host: 10.144.144.12
+  port: 11016
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-136
+  host: 10.144.144.12
+  port: 11017
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-137
+  host: 10.144.144.12
+  port: 11018
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-138
+  host: 10.144.144.12
+  port: 11019
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-139
+  host: 10.144.144.12
+  port: 11020
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-140
+  host: 10.144.144.12
+  port: 11021
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-141
+  host: 10.144.144.12
+  port: 11022
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-142
+  host: 10.144.144.12
+  port: 11023
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-143
+  host: 10.144.144.12
+  port: 11024
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-144
+  host: 10.144.144.12
+  port: 11025
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-145
+  host: 10.144.144.12
+  port: 11026
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-146
+  host: 10.144.144.12
+  port: 11027
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-147
+  host: 10.144.144.12
+  port: 11028
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-148
+  host: 10.144.144.12
+  port: 11029
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-149
+  host: 10.144.144.12
+  port: 11030
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: leaseweb-nl-warp-150
+  host: 10.144.144.12
+  port: 11031
+  protocol: socks5h
+  region: netherlands
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - netherlands
+  weight: 100
+  tier: standard
+- name: cue-us-warp-001
+  host: 10.144.144.81
+  port: 10881
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-002
+  host: 10.144.144.81
+  port: 10882
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-003
+  host: 10.144.144.81
+  port: 10883
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-004
+  host: 10.144.144.81
+  port: 10884
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-005
+  host: 10.144.144.81
+  port: 10885
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-006
+  host: 10.144.144.81
+  port: 10886
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-007
+  host: 10.144.144.81
+  port: 10887
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-008
+  host: 10.144.144.81
+  port: 10888
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-009
+  host: 10.144.144.81
+  port: 10889
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-010
+  host: 10.144.144.81
+  port: 10890
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-011
+  host: 10.144.144.81
+  port: 10891
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-012
+  host: 10.144.144.81
+  port: 10892
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-013
+  host: 10.144.144.81
+  port: 10893
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-014
+  host: 10.144.144.81
+  port: 10894
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-015
+  host: 10.144.144.81
+  port: 10895
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-016
+  host: 10.144.144.81
+  port: 10896
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-017
+  host: 10.144.144.81
+  port: 10897
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-018
+  host: 10.144.144.81
+  port: 10898
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-019
+  host: 10.144.144.81
+  port: 10899
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-020
+  host: 10.144.144.81
+  port: 10900
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-021
+  host: 10.144.144.81
+  port: 10901
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-022
+  host: 10.144.144.81
+  port: 10902
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-023
+  host: 10.144.144.81
+  port: 10903
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-024
+  host: 10.144.144.81
+  port: 10904
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-025
+  host: 10.144.144.81
+  port: 10905
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-026
+  host: 10.144.144.81
+  port: 10906
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-027
+  host: 10.144.144.81
+  port: 10907
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-028
+  host: 10.144.144.81
+  port: 10908
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-029
+  host: 10.144.144.81
+  port: 10909
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-030
+  host: 10.144.144.81
+  port: 10910
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-031
+  host: 10.144.144.81
+  port: 10911
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-032
+  host: 10.144.144.81
+  port: 10912
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-033
+  host: 10.144.144.81
+  port: 10913
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-034
+  host: 10.144.144.81
+  port: 10914
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-035
+  host: 10.144.144.81
+  port: 10915
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-036
+  host: 10.144.144.81
+  port: 10916
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-037
+  host: 10.144.144.81
+  port: 10917
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-038
+  host: 10.144.144.81
+  port: 10918
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-039
+  host: 10.144.144.81
+  port: 10919
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-040
+  host: 10.144.144.81
+  port: 10920
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-041
+  host: 10.144.144.81
+  port: 10921
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-042
+  host: 10.144.144.81
+  port: 10922
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-043
+  host: 10.144.144.81
+  port: 10923
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-044
+  host: 10.144.144.81
+  port: 10924
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-045
+  host: 10.144.144.81
+  port: 10925
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-046
+  host: 10.144.144.81
+  port: 10926
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-047
+  host: 10.144.144.81
+  port: 10927
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-048
+  host: 10.144.144.81
+  port: 10928
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-049
+  host: 10.144.144.81
+  port: 10929
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-050
+  host: 10.144.144.81
+  port: 10930
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-051
+  host: 10.144.144.81
+  port: 10931
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-052
+  host: 10.144.144.81
+  port: 10932
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-053
+  host: 10.144.144.81
+  port: 10933
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-054
+  host: 10.144.144.81
+  port: 10934
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-055
+  host: 10.144.144.81
+  port: 10935
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-056
+  host: 10.144.144.81
+  port: 10936
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-057
+  host: 10.144.144.81
+  port: 10937
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-058
+  host: 10.144.144.81
+  port: 10938
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-059
+  host: 10.144.144.81
+  port: 10939
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-060
+  host: 10.144.144.81
+  port: 10940
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-061
+  host: 10.144.144.81
+  port: 10941
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-062
+  host: 10.144.144.81
+  port: 10942
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-063
+  host: 10.144.144.81
+  port: 10943
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-064
+  host: 10.144.144.81
+  port: 10944
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-065
+  host: 10.144.144.81
+  port: 10945
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-066
+  host: 10.144.144.81
+  port: 10946
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-067
+  host: 10.144.144.81
+  port: 10947
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-068
+  host: 10.144.144.81
+  port: 10948
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-069
+  host: 10.144.144.81
+  port: 10949
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-070
+  host: 10.144.144.81
+  port: 10950
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-071
+  host: 10.144.144.81
+  port: 10951
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-072
+  host: 10.144.144.81
+  port: 10952
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-073
+  host: 10.144.144.81
+  port: 10953
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-074
+  host: 10.144.144.81
+  port: 10954
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-075
+  host: 10.144.144.81
+  port: 10955
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-076
+  host: 10.144.144.81
+  port: 10956
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-077
+  host: 10.144.144.81
+  port: 10957
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-078
+  host: 10.144.144.81
+  port: 10958
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-079
+  host: 10.144.144.81
+  port: 10959
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-080
+  host: 10.144.144.81
+  port: 10960
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-081
+  host: 10.144.144.81
+  port: 10961
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-082
+  host: 10.144.144.81
+  port: 10962
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-083
+  host: 10.144.144.81
+  port: 10963
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-084
+  host: 10.144.144.81
+  port: 10964
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-085
+  host: 10.144.144.81
+  port: 10965
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-086
+  host: 10.144.144.81
+  port: 10966
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-087
+  host: 10.144.144.81
+  port: 10967
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-088
+  host: 10.144.144.81
+  port: 10968
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-089
+  host: 10.144.144.81
+  port: 10969
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-090
+  host: 10.144.144.81
+  port: 10970
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-091
+  host: 10.144.144.81
+  port: 10971
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-092
+  host: 10.144.144.81
+  port: 10972
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-093
+  host: 10.144.144.81
+  port: 10973
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-094
+  host: 10.144.144.81
+  port: 10974
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-095
+  host: 10.144.144.81
+  port: 10975
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-096
+  host: 10.144.144.81
+  port: 10976
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-097
+  host: 10.144.144.81
+  port: 10977
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-098
+  host: 10.144.144.81
+  port: 10978
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-099
+  host: 10.144.144.81
+  port: 10979
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
+- name: cue-us-warp-100
+  host: 10.144.144.81
+  port: 10980
+  protocol: socks5h
+  region: us-central
+  egress_type: warp_ipv6
+  tags:
+  - warp
+  - ipv6
+  - us-central
+  weight: 100
+  tier: standard
 - name: clash-001-home-win-mesh
   host: 127.0.0.1
   port: 11001
