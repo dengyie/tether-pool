@@ -28,6 +28,18 @@ class HealthStatus(str, Enum):
     UNPROBED = "unprobed"
 
 
+class Tier(str, Enum):
+    PREMIUM = "premium"
+    STANDARD = "standard"
+
+
+class TierPolicy(str, Enum):
+    STANDARD_FIRST = "standard_first"    # 默认：保护优质自建资源，优先使用普通池
+    PREMIUM_FIRST = "premium_first"      # 核心/敏感业务：优先优质池，不可用时降级普通池
+    PREMIUM_ONLY = "premium_only"        # 严禁降级，只使用优质池
+    STANDARD_ONLY = "standard_only"      # 严禁占用优质池，只使用普通池
+
+
 class ProxyNode(BaseModel):
     name: str
     host: str
@@ -48,6 +60,8 @@ class ProxyNode(BaseModel):
     next_probe_allowed_at: Optional[str] = None
     relay_mode: str = RelayMode.RELAY_FALLBACK.value
     relay_hop_node: Optional[str] = None
+    tier: str = Tier.STANDARD.value
+    quality_score: int = 50
 
     @property
     def proxy_url(self) -> str:
@@ -79,6 +93,7 @@ class LeaseInfo(BaseModel):
     region: str
     egress_type: str
     assigned_at: str
+    tier: Optional[str] = None
 
 
 class PoolStats(BaseModel):
@@ -92,6 +107,8 @@ class PoolStats(BaseModel):
     native_ipv6_count: int
     clash_proxy_count: int = 0
     region_distribution: dict
+    tier_distribution: Dict[str, int] = Field(default_factory=dict)
+    average_quality_score: float = 50.0
 
 
 class RegistrationLease(BaseModel):
@@ -107,6 +124,7 @@ class RegistrationLease(BaseModel):
     cooled_until: str
     relay_mode: str = RelayMode.RELAY_FALLBACK.value
     relay_hop: Optional[str] = None
+    tier: Optional[str] = None
 
 
 class IpCooldownRecord(BaseModel):
@@ -149,6 +167,7 @@ class AccountAllocationItem(BaseModel):
     egress_type: str
     service: str
     allocated_at: str
+    tier: Optional[str] = None
 
 
 class BatchAllocationRequest(BaseModel):
@@ -157,6 +176,8 @@ class BatchAllocationRequest(BaseModel):
     strategy: str = AllocationStrategy.BALANCED_ROUND_ROBIN.value
     egress_preference: Optional[str] = EgressType.WARP_IPV6.value
     region: Optional[str] = None
+    tier: Optional[str] = None
+    tier_policy: Optional[str] = None
     max_accounts_per_ip: int = 50
     force_rebalance: bool = False
 

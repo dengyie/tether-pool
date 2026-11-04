@@ -7,7 +7,7 @@ import zlib
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
 from core.models import (
-    ProxyNode, LeaseInfo, EgressType, HealthStatus,
+    ProxyNode, LeaseInfo, EgressType, HealthStatus, Tier, TierPolicy,
     RegistrationLease, BatteryEventReport, BatteryEventType
 )
 from core.storage import Storage
@@ -23,6 +23,8 @@ class Router:
         account_id: str,
         egress_type: Optional[str] = EgressType.WARP_IPV6.value,
         region: Optional[str] = None,
+        tier: Optional[str] = None,
+        tier_policy: Optional[str] = None,
         force_rebind: bool = False,
         service: Optional[str] = None,
         exclude_node: Optional[str] = None
@@ -37,7 +39,7 @@ class Router:
         caller omitting the service can never pick up another service's binding.
         `exclude_node` prevents a forced rebind from landing back on the failing node.
 
-        A caller-supplied region/egress filter is a *per-call* constraint, not a reason to
+        A caller-supplied region/egress/tier filter is a *per-call* constraint, not a reason to
         rewrite an existing binding: when a healthy binding exists but does not satisfy the
         filter, a constrained node is returned ephemerally and the stored binding is left
         untouched. Only an explicit `force_rebind` (or the absence of any binding) persists
@@ -46,6 +48,30 @@ class Router:
         svc = service or "default"
         binding_conflict = False
 
+        # Determine effective tier policy
+        # Default is standard_first (protects self-hosted/premium IPs).
+        if tier_policy:
+            policy = tier_policy.lower()
+        elif tier == Tier.PREMIUM.value:
+            policy = TierPolicy.PREMIUM_FIRST.value
+        elif tier == Tier.STANDARD.value:
+            policy = TierPolicy.STANDARD_FIRST.value
+        else:
+            policy = TierPolicy.STANDARD_FIRST.value
+
+        def _node_matches_constraints(node: ProxyNode) -> bool:
+            if egress_type and node.egress_type != egress_type:
+                return False
+            if region and node.region != region:
+                return False
+            if policy == TierPolicy.PREMIUM_ONLY.value and node.tier != Tier.PREMIUM.value:
+                return False
+            if policy == TierPolicy.STANDARD_ONLY.value and node.tier != Tier.STANDARD.value:
+                return False
+            if tier and node.tier != tier:
+                return False
+            return True
+
         # 1. Check existing lease if not forcing rebind
         if not force_rebind:
             # 1a. Universal Allocation Engine bindings check first
@@ -53,7 +79,7 @@ class Router:
             if alloc:
                 node = self.storage.get_node(alloc["node_name"])
                 if node and node.status == HealthStatus.HEALTHY.value and node.name != exclude_node:
-                    if (not egress_type or node.egress_type == egress_type) and (not region or node.region == region):
+                    if _node_matches_constraints(node):
                         return LeaseInfo(
                             account_id=account_id,
                             node_name=node.name,
@@ -61,7 +87,8 @@ class Router:
                             exit_ip=node.exit_ip,
                             region=node.region,
                             egress_type=node.egress_type,
-                            assigned_at=alloc["allocated_at"]
+                            assigned_at=alloc["allocated_at"],
+                            tier=node.tier
                         )
                     # Healthy binding that only fails this call's filter -> keep it.
                     binding_conflict = True
@@ -72,25 +99,16 @@ class Router:
                 node = self.storage.get_node(existing.node_name)
                 # Ensure existing node is HEALTHY (Closed)
                 if node and node.status == HealthStatus.HEALTHY.value and node.name != exclude_node:
-                    if (not egress_type or node.egress_type == egress_type) and (not region or node.region == region):
+                    if _node_matches_constraints(node):
                         return existing
                     binding_conflict = True
 
-        # 2. Get eligible candidates (strict healthy first)
-        candidates = self.storage.list_nodes(region=region, egress_type=egress_type, status=HealthStatus.HEALTHY.value)
-        if not candidates:
-            # Fallback to any healthy node matching region
-            if region:
-                candidates = self.storage.list_nodes(region=region, status=HealthStatus.HEALTHY.value)
-        if not candidates:
-            # Fallback to all healthy nodes globally
-            candidates = self.storage.list_nodes(status=HealthStatus.HEALTHY.value)
-        if not candidates:
-            # Emergency fallback to degraded nodes before dead
-            candidates = self.storage.list_nodes(region=region, egress_type=egress_type, status=HealthStatus.DEGRADED.value)
-        if not candidates:
-            # Final fallback to all nodes
-            candidates = self.storage.list_nodes()
+        # 2. Get eligible candidates (tier-aware ladder search)
+        candidates = self._get_candidates_for_tier_policy(
+            region=region,
+            egress_type=egress_type,
+            policy=policy
+        )
 
         if exclude_node:
             filtered = [c for c in candidates if c.name != exclude_node]
@@ -121,7 +139,8 @@ class Router:
                 exit_ip=selected_node.exit_ip,
                 region=selected_node.region,
                 egress_type=selected_node.egress_type,
-                assigned_at=now_str
+                assigned_at=now_str,
+                tier=selected_node.tier
             )
 
         # 5. Persist lease and synchronize with account_allocations
@@ -129,6 +148,75 @@ class Router:
         self.storage.batch_save_allocations([(svc, account_id, selected_node.name, now_str)])
 
         return lease
+
+    def _get_candidates_for_tier_policy(
+        self,
+        region: Optional[str],
+        egress_type: Optional[str],
+        policy: str
+    ) -> List[ProxyNode]:
+        def find_pool(p_tier: Optional[str], p_status: str, match_egress: bool, match_region: bool) -> List[ProxyNode]:
+            r = region if match_region else None
+            e = egress_type if match_egress else None
+            return self.storage.list_nodes(region=r, egress_type=e, status=p_status, tier=p_tier)
+
+        if policy == TierPolicy.PREMIUM_ONLY.value:
+            tiers_order = [Tier.PREMIUM.value]
+            allow_cross_tier = False
+        elif policy == TierPolicy.STANDARD_ONLY.value:
+            tiers_order = [Tier.STANDARD.value]
+            allow_cross_tier = False
+        elif policy == TierPolicy.PREMIUM_FIRST.value:
+            tiers_order = [Tier.PREMIUM.value, Tier.STANDARD.value]
+            allow_cross_tier = True
+        else:  # STANDARD_FIRST (default)
+            tiers_order = [Tier.STANDARD.value, Tier.PREMIUM.value]
+            allow_cross_tier = True
+
+        # 1. Healthy search
+        for t in tiers_order:
+            if region and egress_type:
+                c = find_pool(t, HealthStatus.HEALTHY.value, match_egress=True, match_region=True)
+                if c:
+                    return c
+            if region:
+                c = find_pool(t, HealthStatus.HEALTHY.value, match_egress=False, match_region=True)
+                if c:
+                    return c
+            if egress_type:
+                c = find_pool(t, HealthStatus.HEALTHY.value, match_egress=True, match_region=False)
+                if c:
+                    return c
+            c = find_pool(t, HealthStatus.HEALTHY.value, match_egress=False, match_region=False)
+            if c:
+                return c
+            if not allow_cross_tier:
+                break
+
+        # 2. Degraded emergency search
+        for t in tiers_order:
+            if region and egress_type:
+                c = find_pool(t, HealthStatus.DEGRADED.value, match_egress=True, match_region=True)
+                if c:
+                    return c
+            if region:
+                c = find_pool(t, HealthStatus.DEGRADED.value, match_egress=False, match_region=True)
+                if c:
+                    return c
+            c = find_pool(t, HealthStatus.DEGRADED.value, match_egress=False, match_region=False)
+            if c:
+                return c
+            if not allow_cross_tier:
+                break
+
+        # 3. Final fallback if cross-tier allowed (strictly exclude DEAD nodes to respect circuit breaker)
+        if allow_cross_tier:
+            c = [n for n in self.storage.list_nodes(region=region, egress_type=egress_type) if n.status != HealthStatus.DEAD.value]
+            if c:
+                return c
+            return [n for n in self.storage.list_nodes() if n.status != HealthStatus.DEAD.value]
+
+        return []
 
     def rehome_leases_for_node(self, broken_node_name: str) -> Dict[str, Any]:
         """
@@ -148,13 +236,30 @@ class Router:
         broken_node = self.storage.get_node(broken_node_name)
         target_region = broken_node.region if broken_node else None
         target_egress = broken_node.egress_type if broken_node else None
+        target_tier = broken_node.tier if broken_node else None
 
-        # Find healthy candidates in the same region
-        candidates = self.storage.list_nodes(
-            region=target_region,
-            egress_type=target_egress,
-            status=HealthStatus.HEALTHY.value
-        )
+        # Find healthy candidates in the same region, prioritizing the same tier
+        candidates = []
+        if target_tier:
+            candidates = self.storage.list_nodes(
+                region=target_region,
+                egress_type=target_egress,
+                status=HealthStatus.HEALTHY.value,
+                tier=target_tier
+            )
+            if not candidates and target_region:
+                candidates = self.storage.list_nodes(
+                    region=target_region,
+                    status=HealthStatus.HEALTHY.value,
+                    tier=target_tier
+                )
+
+        if not candidates:
+            candidates = self.storage.list_nodes(
+                region=target_region,
+                egress_type=target_egress,
+                status=HealthStatus.HEALTHY.value
+            )
         if not candidates and target_region:
             candidates = self.storage.list_nodes(region=target_region, status=HealthStatus.HEALTHY.value)
         if not candidates:
@@ -253,12 +358,13 @@ class Router:
         target_service: str,
         region: Optional[str] = None,
         egress_type: Optional[str] = None,
+        tier: Optional[str] = Tier.PREMIUM.value,
         cooldown_seconds: int = 1800
     ) -> Optional[RegistrationLease]:
         """
         Dedicated anti-sybil egress assignment for batch account registration bots.
         Ensures that allocated exit IPs have not been used for the same target service
-        within the cooldown window.
+        within the cooldown window. Defaults to premium tier to protect registrations.
 
         The choose-then-lock window is serialized: without it, two concurrent registrations
         both pass the cooldown filter and receive the same exit, which is exactly the reuse
@@ -266,7 +372,7 @@ class Router:
         """
         with BINDING_WRITE_LOCK:
             return self._acquire_for_registration(
-                account_id, target_service, region, egress_type, cooldown_seconds
+                account_id, target_service, region, egress_type, tier, cooldown_seconds
             )
 
     def _acquire_for_registration(
@@ -275,22 +381,34 @@ class Router:
         target_service: str,
         region: Optional[str],
         egress_type: Optional[str],
+        tier: Optional[str] = Tier.PREMIUM.value,
         cooldown_seconds: int = 1800
     ) -> Optional[RegistrationLease]:
         self.storage.clean_expired_cooldowns()
 
-        # 1. Fetch eligible candidates
-        candidates = self.storage.list_nodes(region=region, egress_type=egress_type, status=HealthStatus.HEALTHY.value)
-        if not candidates and region:
-            candidates = self.storage.list_nodes(region=region, status=HealthStatus.HEALTHY.value)
-        if not candidates and egress_type:
-            candidates = self.storage.list_nodes(egress_type=egress_type, status=HealthStatus.HEALTHY.value)
+        # 1. Fetch eligible candidates (tier-aware)
+        candidates = []
+        if tier:
+            candidates = self.storage.list_nodes(region=region, egress_type=egress_type, status=HealthStatus.HEALTHY.value, tier=tier)
+            if not candidates and region:
+                candidates = self.storage.list_nodes(region=region, status=HealthStatus.HEALTHY.value, tier=tier)
+            if not candidates and egress_type:
+                candidates = self.storage.list_nodes(egress_type=egress_type, status=HealthStatus.HEALTHY.value, tier=tier)
+            if not candidates:
+                candidates = self.storage.list_nodes(status=HealthStatus.HEALTHY.value, tier=tier)
+
         if not candidates:
-            candidates = self.storage.list_nodes(status=HealthStatus.HEALTHY.value)
-        if not candidates:
-            candidates = self.storage.list_nodes(region=region, egress_type=egress_type)
-        if not candidates:
-            candidates = self.storage.list_nodes()
+            candidates = self.storage.list_nodes(region=region, egress_type=egress_type, status=HealthStatus.HEALTHY.value)
+            if not candidates and region:
+                candidates = self.storage.list_nodes(region=region, status=HealthStatus.HEALTHY.value)
+            if not candidates and egress_type:
+                candidates = self.storage.list_nodes(egress_type=egress_type, status=HealthStatus.HEALTHY.value)
+            if not candidates:
+                candidates = self.storage.list_nodes(status=HealthStatus.HEALTHY.value)
+            if not candidates:
+                candidates = self.storage.list_nodes(region=region, egress_type=egress_type)
+            if not candidates:
+                candidates = self.storage.list_nodes()
 
         if not candidates:
             return None
@@ -350,7 +468,8 @@ class Router:
             leased_at=now_str,
             cooled_until=cooldown_record.cooled_until,
             relay_mode=selected_node.relay_mode,
-            relay_hop=relay_hop_url
+            relay_hop=relay_hop_url,
+            tier=selected_node.tier
         )
 
     def handle_battery_event(self, report: BatteryEventReport) -> Dict[str, Any]:
@@ -373,6 +492,7 @@ class Router:
         ):
             target_region = None
             target_egress = None
+            target_tier = None
             previous_node_name = None
 
             # 1. Check account_allocations first
@@ -382,6 +502,7 @@ class Router:
                 if old_node:
                     target_region = old_node.region
                     target_egress = old_node.egress_type
+                    target_tier = old_node.tier
                     previous_node_name = old_node.name
             else:
                 existing_lease = self.storage.get_lease(report.account_id)
@@ -390,12 +511,14 @@ class Router:
                     if old_node:
                         target_region = old_node.region
                         target_egress = old_node.egress_type
+                        target_tier = old_node.tier
                         previous_node_name = old_node.name
 
             new_lease = self.acquire_for_account(
                 account_id=report.account_id,
                 region=target_region,
                 egress_type=target_egress,
+                tier=target_tier,
                 force_rebind=True,
                 service=svc,
                 # A swap that recomputes the same node is a no-op; exclude it.

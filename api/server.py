@@ -22,6 +22,7 @@ from core.prober import Prober
 from core.router import Router
 from core.metrics import MetricsCollector
 from core.allocator import AllocationEngine
+from core.quality import IPQualityEvaluator
 from adapters.cpa_adapter import CpaAdapter
 
 CONFIG_FILE = os.environ.get("IP_POOL_CONFIG", os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "nodes.yaml"))
@@ -64,6 +65,13 @@ def load_initial_nodes():
             return 0
         nodes_data = data.get("nodes", []) or []
         for item in nodes_data:
+            configured_tier = item.get("tier")
+            score, init_tier, _ = IPQualityEvaluator.evaluate_node(
+                tags=item.get("tags", []),
+                egress_type=item.get("egress_type"),
+                status="unprobed",
+                configured_tier=configured_tier
+            )
             node = ProxyNode(
                 name=item["name"],
                 host=item["host"],
@@ -74,7 +82,9 @@ def load_initial_nodes():
                 tags=item.get("tags", []),
                 weight=item.get("weight", 100),
                 relay_mode=item.get("relay_mode", "relay_fallback"),
-                relay_hop_node=item.get("relay_hop_node")
+                relay_hop_node=item.get("relay_hop_node"),
+                tier=init_tier,
+                quality_score=score
             )
             storage.upsert_node(node)
     print(f"[+] Loaded/upserted {len(nodes_data)} nodes into storage.")
@@ -217,9 +227,10 @@ def get_stats():
 def list_nodes(
     region: Optional[str] = None,
     egress_type: Optional[str] = None,
-    status: Optional[str] = None
+    status: Optional[str] = None,
+    tier: Optional[str] = Query(None, description="Optional quality tier filter: premium or standard")
 ):
-    return storage.list_nodes(region=region, egress_type=egress_type, status=status)
+    return storage.list_nodes(region=region, egress_type=egress_type, status=status, tier=tier)
 
 
 def _lease_from_allocation(account_id: str, alloc: dict) -> Optional[LeaseInfo]:
@@ -266,13 +277,15 @@ def acquire_node(
     account_id: str = Query(..., description="Unique account ID / email"),
     egress_type: Optional[str] = Query(None, description="Optional egress type constraint (warp_ipv6, native_ipv4, native_ipv6)"),
     region: Optional[str] = Query(None, description="Optional target region (tokyo, netherlands, singapore, india)"),
+    tier: Optional[str] = Query(None, description="Optional quality tier constraint (premium or standard)"),
+    tier_policy: Optional[str] = Query(None, description="Optional tier routing policy (standard_first, premium_first, premium_only, standard_only)"),
     force_rebind: bool = Query(False, description="Force re-allocating a new node"),
     service: Optional[str] = Query(None, description="Service namespace (defaults to 'default')")
 ):
     """
     Acquires (or returns) the account's sticky binding.
 
-    `egress_type`/`region` are optional constraints for this call: when the account
+    `egress_type`/`region`/`tier` are optional constraints for this call: when the account
     already has a healthy binding that does not match them, the constrained node is
     returned without overwriting the stored binding. Use `force_rebind=true` to
     deliberately re-point the account.
@@ -281,6 +294,8 @@ def acquire_node(
         account_id=account_id,
         egress_type=egress_type,
         region=region,
+        tier=tier,
+        tier_policy=tier_policy,
         force_rebind=force_rebind,
         service=service
     )
@@ -390,7 +405,8 @@ def acquire_for_registration(
     target_service: str = Query(..., description="Target service identifier (e.g., grok_reg, openai_signup)"),
     cooldown: int = Query(1800, description="IP cooldown seconds after registration"),
     region: Optional[str] = Query(None, description="Optional target region preference"),
-    egress_type: Optional[str] = Query(None, description="Optional preferred egress type (clash_proxy, native_ipv4, warp_ipv6)")
+    egress_type: Optional[str] = Query(None, description="Optional preferred egress type (clash_proxy, native_ipv4, warp_ipv6)"),
+    tier: Optional[str] = Query("premium", description="Optional quality tier preference (defaults to premium for registration protection)")
 ):
     """
     Dedicated anti-sybil egress lease assignment for batch registration bots.
@@ -401,6 +417,7 @@ def acquire_for_registration(
         target_service=target_service,
         region=region,
         egress_type=egress_type,
+        tier=tier,
         cooldown_seconds=cooldown
     )
     if not lease:

@@ -10,9 +10,11 @@ from datetime import datetime, timedelta
 from contextlib import contextmanager
 from core.models import (
     ProxyNode, ProbeResult, LeaseInfo, PoolStats, HealthStatus,
-    CircuitEvent, RelayMode, IpCooldownRecord, BatteryEventReport
+    CircuitEvent, RelayMode, IpCooldownRecord, BatteryEventReport,
+    Tier
 )
 from core.circuit import CircuitBreaker
+from core.quality import IPQualityEvaluator
 
 DB_PATH = os.environ.get("IP_POOL_DB", os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "ip_pool.db"))
 
@@ -59,7 +61,11 @@ class Storage:
                     circuit_state TEXT DEFAULT 'unprobed',
                     consecutive_failures INTEGER DEFAULT 0,
                     consecutive_successes INTEGER DEFAULT 0,
-                    next_probe_allowed_at TEXT
+                    next_probe_allowed_at TEXT,
+                    relay_mode TEXT DEFAULT 'relay_fallback',
+                    relay_hop_node TEXT,
+                    tier TEXT DEFAULT 'standard',
+                    quality_score INTEGER DEFAULT 50
                 );
 
                 CREATE TABLE IF NOT EXISTS leases (
@@ -135,10 +141,14 @@ class Storage:
                 ("consecutive_successes", "INTEGER", "0"),
                 ("next_probe_allowed_at", "TEXT", "NULL"),
                 ("relay_mode", "TEXT", "'relay_fallback'"),
-                ("relay_hop_node", "TEXT", "NULL")
+                ("relay_hop_node", "TEXT", "NULL"),
+                ("tier", "TEXT", "'standard'"),
+                ("quality_score", "INTEGER", "50")
             ]:
                 if col not in existing_cols:
                     conn.execute(f"ALTER TABLE nodes ADD COLUMN {col} {col_type} DEFAULT {default_val}")
+
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_tier ON nodes(tier);")
 
     def upsert_node(self, node: ProxyNode):
         with self._get_conn() as conn:
@@ -147,9 +157,9 @@ class Storage:
                     name, host, port, protocol, region, egress_type, tags, weight,
                     exit_ip, latency_ms, status, fail_count, last_probed_at,
                     circuit_state, consecutive_failures, consecutive_successes, next_probe_allowed_at,
-                    relay_mode, relay_hop_node
+                    relay_mode, relay_hop_node, tier, quality_score
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     host=excluded.host,
                     port=excluded.port,
@@ -160,6 +170,8 @@ class Storage:
                     weight=excluded.weight,
                     relay_mode=excluded.relay_mode,
                     relay_hop_node=excluded.relay_hop_node,
+                    tier=excluded.tier,
+                    quality_score=excluded.quality_score,
                     status=CASE WHEN excluded.status != 'unprobed' THEN excluded.status ELSE nodes.status END,
                     circuit_state=CASE WHEN excluded.circuit_state != 'unprobed' THEN excluded.circuit_state ELSE nodes.circuit_state END,
                     consecutive_failures=CASE WHEN excluded.status != 'unprobed' THEN excluded.consecutive_failures ELSE nodes.consecutive_failures END,
@@ -171,7 +183,8 @@ class Storage:
                 node.exit_ip, node.latency_ms, node.status, node.fail_count, node.last_probed_at,
                 node.circuit_state or node.status, node.consecutive_failures,
                 node.consecutive_successes, node.next_probe_allowed_at,
-                node.relay_mode, node.relay_hop_node
+                node.relay_mode, node.relay_hop_node,
+                node.tier or Tier.STANDARD.value, node.quality_score or 50
             ))
 
     def update_node_status(self, node_name: str, status: str):
@@ -216,9 +229,22 @@ class Storage:
 
             next_allowed_str = next_allowed.isoformat() if next_allowed else None
 
+            # Calculate updated quality score & tier
+            new_fails = 0 if res.success else (node.consecutive_failures + 1)
+            new_succs = (node.consecutive_successes + 1) if res.success else 0
+            cur_lat = res.latency_ms if res.success else node.latency_ms
+            cur_ip = res.exit_ip if res.success else node.exit_ip
+            q_score, q_tier, _ = IPQualityEvaluator.evaluate_node(
+                tags=node.tags,
+                egress_type=node.egress_type,
+                latency_ms=cur_lat,
+                status=new_state,
+                consecutive_failures=new_fails,
+                exit_ip=cur_ip,
+                configured_tier=node.tier
+            )
+
             if res.success:
-                new_fails = 0
-                new_succs = node.consecutive_successes + 1
                 conn.execute("""
                     UPDATE nodes SET
                         exit_ip = ?,
@@ -229,15 +255,16 @@ class Storage:
                         consecutive_failures = ?,
                         consecutive_successes = ?,
                         next_probe_allowed_at = ?,
-                        last_probed_at = ?
+                        last_probed_at = ?,
+                        tier = ?,
+                        quality_score = ?
                     WHERE name = ?
                 """, (
                     res.exit_ip, res.latency_ms, new_state, new_state,
-                    new_fails, new_succs, next_allowed_str, now_str, res.node_name
+                    new_fails, new_succs, next_allowed_str, now_str,
+                    q_tier, q_score, res.node_name
                 ))
             else:
-                new_fails = node.consecutive_failures + 1
-                new_succs = 0
                 conn.execute("""
                     UPDATE nodes SET
                         fail_count = fail_count + 1,
@@ -246,11 +273,14 @@ class Storage:
                         consecutive_failures = ?,
                         consecutive_successes = ?,
                         next_probe_allowed_at = ?,
-                        last_probed_at = ?
+                        last_probed_at = ?,
+                        tier = ?,
+                        quality_score = ?
                     WHERE name = ?
                 """, (
                     new_state, new_state, new_fails, new_succs,
-                    next_allowed_str, now_str, res.node_name
+                    next_allowed_str, now_str,
+                    q_tier, q_score, res.node_name
                 ))
 
             # 4. Record circuit event if state changed
@@ -278,7 +308,13 @@ class Storage:
                 return self._row_to_node(row)
         return None
 
-    def list_nodes(self, region: Optional[str] = None, egress_type: Optional[str] = None, status: Optional[str] = None) -> List[ProxyNode]:
+    def list_nodes(
+        self,
+        region: Optional[str] = None,
+        egress_type: Optional[str] = None,
+        status: Optional[str] = None,
+        tier: Optional[str] = None
+    ) -> List[ProxyNode]:
         query = "SELECT * FROM nodes WHERE 1=1"
         params = []
         if region:
@@ -290,6 +326,9 @@ class Storage:
         if status:
             query += " AND status = ?"
             params.append(status)
+        if tier:
+            query += " AND tier = ?"
+            params.append(tier)
         query += " ORDER BY name ASC"
 
         with self._get_conn() as conn:
@@ -317,7 +356,9 @@ class Storage:
             consecutive_successes=row["consecutive_successes"] if "consecutive_successes" in keys and row["consecutive_successes"] else 0,
             next_probe_allowed_at=row["next_probe_allowed_at"] if "next_probe_allowed_at" in keys else None,
             relay_mode=row["relay_mode"] if "relay_mode" in keys and row["relay_mode"] else RelayMode.RELAY_FALLBACK.value,
-            relay_hop_node=row["relay_hop_node"] if "relay_hop_node" in keys else None
+            relay_hop_node=row["relay_hop_node"] if "relay_hop_node" in keys else None,
+            tier=row["tier"] if "tier" in keys and row["tier"] else Tier.STANDARD.value,
+            quality_score=row["quality_score"] if "quality_score" in keys and row["quality_score"] is not None else 50
         )
 
     def set_lease(self, account_id: str, node_name: str) -> LeaseInfo:
@@ -339,13 +380,14 @@ class Storage:
             exit_ip=node.exit_ip if node else None,
             region=node.region if node else "",
             egress_type=node.egress_type if node else "",
-            assigned_at=now_str
+            assigned_at=now_str,
+            tier=node.tier if node else None
         )
 
     def get_lease(self, account_id: str) -> Optional[LeaseInfo]:
         with self._get_conn() as conn:
             row = conn.execute("""
-                SELECT l.account_id, l.node_name, l.assigned_at, n.host, n.port, n.protocol, n.exit_ip, n.region, n.egress_type
+                SELECT l.account_id, l.node_name, l.assigned_at, n.host, n.port, n.protocol, n.exit_ip, n.region, n.egress_type, n.tier
                 FROM leases l
                 JOIN nodes n ON l.node_name = n.name
                 WHERE l.account_id = ?
@@ -358,14 +400,15 @@ class Storage:
                     exit_ip=row["exit_ip"],
                     region=row["region"],
                     egress_type=row["egress_type"],
-                    assigned_at=row["assigned_at"]
+                    assigned_at=row["assigned_at"],
+                    tier=row["tier"]
                 )
         return None
 
     def get_leases_for_node(self, node_name: str) -> List[LeaseInfo]:
         with self._get_conn() as conn:
             rows = conn.execute("""
-                SELECT l.account_id, l.node_name, l.assigned_at, n.host, n.port, n.protocol, n.exit_ip, n.region, n.egress_type
+                SELECT l.account_id, l.node_name, l.assigned_at, n.host, n.port, n.protocol, n.exit_ip, n.region, n.egress_type, n.tier
                 FROM leases l
                 JOIN nodes n ON l.node_name = n.name
                 WHERE l.node_name = ?
@@ -378,7 +421,8 @@ class Storage:
                     exit_ip=r["exit_ip"],
                     region=r["region"],
                     egress_type=r["egress_type"],
-                    assigned_at=r["assigned_at"]
+                    assigned_at=r["assigned_at"],
+                    tier=r["tier"]
                 )
                 for r in rows
             ]
@@ -453,6 +497,13 @@ class Storage:
             for row in conn.execute("SELECT region, COUNT(*) as c FROM nodes GROUP BY region").fetchall():
                 regions[row["region"]] = row["c"]
 
+            tier_dist = {}
+            for row in conn.execute("SELECT tier, COUNT(*) as c FROM nodes GROUP BY tier").fetchall():
+                tier_dist[row["tier"] or "standard"] = row["c"]
+
+            avg_score_row = conn.execute("SELECT AVG(quality_score) FROM nodes WHERE status != 'dead'").fetchone()
+            avg_score = float(avg_score_row[0]) if avg_score_row and avg_score_row[0] is not None else 50.0
+
             return PoolStats(
                 total_nodes=total,
                 healthy_nodes=healthy,
@@ -463,7 +514,9 @@ class Storage:
                 native_ipv4_count=nat_v4,
                 native_ipv6_count=nat_v6,
                 clash_proxy_count=clash_proxy,
-                region_distribution=regions
+                region_distribution=regions,
+                tier_distribution=tier_dist,
+                average_quality_score=round(avg_score, 1)
             )
 
     def get_metrics_node_distribution(self) -> List[Dict[str, Any]]:

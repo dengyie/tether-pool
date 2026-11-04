@@ -32,6 +32,8 @@ INTERNAL_ROUTING_HEADERS = frozenset({
     "x-account-id",
     "x-region",
     "x-egress-type",
+    "x-tier",
+    "x-tier-policy",
     "x-service",
     "x-target-service",
     "proxy-authorization",
@@ -246,23 +248,98 @@ async def pump_streams(r1: asyncio.StreamReader, w1: asyncio.StreamWriter, r2: a
                 pass
 
 
-def parse_proxy_credentials(raw_user: str) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
+class ParsedCredentials:
     """
-    Parses parametric proxy username into (account_id, region, egress_type, service).
+    Parametric credential parse result. Supports 4-item tuple unpacking for full backward
+    compatibility, as well as property access for tier and tier_policy.
+    """
+    def __init__(
+        self,
+        account_id: str,
+        region: Optional[str] = None,
+        egress_type: Optional[str] = None,
+        service: Optional[str] = None,
+        tier: Optional[str] = None,
+        tier_policy: Optional[str] = None
+    ):
+        self.account_id = account_id
+        self.region = region
+        self.egress_type = egress_type
+        self.service = service
+        self.tier = tier
+        self.tier_policy = tier_policy
+
+    def __iter__(self):
+        yield self.account_id
+        yield self.region
+        yield self.egress_type
+        yield self.service
+
+    def __getitem__(self, idx):
+        items = [self.account_id, self.region, self.egress_type, self.service]
+        return items[idx]
+
+    def __len__(self):
+        return 4
+
+    def as_tuple(self) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
+        return (self.account_id, self.region, self.egress_type, self.service, self.tier, self.tier_policy)
+
+
+class RoutingContext:
+    """
+    Gateway request routing context. Supports 4-item unpacking for backward compatibility,
+    as well as properties for tier and tier_policy.
+    """
+    def __init__(
+        self,
+        account_id: str,
+        region: Optional[str] = None,
+        egress_type: Optional[str] = None,
+        service: Optional[str] = None,
+        tier: Optional[str] = None,
+        tier_policy: Optional[str] = None
+    ):
+        self.account_id = account_id
+        self.region = region
+        self.egress_type = egress_type
+        self.service = service
+        self.tier = tier
+        self.tier_policy = tier_policy
+
+    def __iter__(self):
+        yield self.account_id
+        yield self.region
+        yield self.egress_type
+        yield self.service
+
+    def __getitem__(self, idx):
+        items = [self.account_id, self.region, self.egress_type, self.service]
+        return items[idx]
+
+    def __len__(self):
+        return 4
+
+
+def parse_proxy_credentials(raw_user: str) -> ParsedCredentials:
+    """
+    Parses parametric proxy username into (account_id, region, egress_type, service, tier, tier_policy).
     Supported formats:
     1. Plain account ID: 'bot_user_01'
-    2. Double-underscore tags: 'bot_01__type_warp_ipv6__region_tokyo__service_grok2api'
-    3. Query-string format: 'bot_01?region=tokyo&type=warp_ipv6&service=grok2api'
-    4. Key-value dash format: 'account=bot_01-region=tokyo-type=warp_ipv6-service=grok2api'
+    2. Double-underscore tags: 'bot_01__type_warp_ipv6__region_tokyo__tier_premium__service_grok2api'
+    3. Query-string format: 'bot_01?region=tokyo&type=warp_ipv6&tier=premium&service=grok2api'
+    4. Key-value dash format: 'account=bot_01-region=tokyo-type=warp_ipv6-tier=premium-service=grok2api'
     """
     if not raw_user:
-        return f"anon_{uuid.uuid4().hex[:8]}", None, None, None
+        return ParsedCredentials(f"anon_{uuid.uuid4().hex[:8]}")
 
     raw_user = raw_user.strip()
     account_id = raw_user
     region = None
     egress_type = None
     service = None
+    tier = None
+    tier_policy = None
 
     # Format 3: Query-string format
     if "?" in raw_user:
@@ -279,8 +356,12 @@ def parse_proxy_credentials(raw_user: str) -> Tuple[str, Optional[str], Optional
                     egress_type = v
                 elif k in ("service", "app", "target"):
                     service = v
+                elif k in ("tier", "pool", "quality"):
+                    tier = v.lower()
+                elif k in ("tier_policy", "policy", "routing_policy"):
+                    tier_policy = v.lower()
 
-    # Format 2: Double-underscore format (e.g. acc_001__type_warp_ipv6__region_tokyo__service_grok2api)
+    # Format 2: Double-underscore format (e.g. acc_001__type_warp_ipv6__region_tokyo__tier_premium)
     elif "__" in raw_user:
         parts = raw_user.split("__")
         account_id = parts[0]
@@ -298,9 +379,15 @@ def parse_proxy_credentials(raw_user: str) -> Tuple[str, Optional[str], Optional
                 service = p[8:]
             elif p_lower.startswith("app_"):
                 service = p[4:]
+            elif p_lower.startswith("tier_"):
+                tier = p_lower[5:]
+            elif p_lower.startswith("policy_"):
+                tier_policy = p_lower[7:]
+            elif p_lower.startswith("tierpolicy_"):
+                tier_policy = p_lower[11:]
 
-    # Format 4: Dash-separated key-value (e.g. account=bot_01-region=tokyo-service=grok2api)
-    elif "account=" in raw_user.lower() or "region=" in raw_user.lower() or "type=" in raw_user.lower() or "service=" in raw_user.lower():
+    # Format 4: Dash-separated key-value (e.g. account=bot_01-region=tokyo-tier=premium)
+    elif "account=" in raw_user.lower() or "region=" in raw_user.lower() or "type=" in raw_user.lower() or "service=" in raw_user.lower() or "tier=" in raw_user.lower():
         parts = raw_user.split("-")
         for p in parts:
             if "=" in p:
@@ -315,14 +402,27 @@ def parse_proxy_credentials(raw_user: str) -> Tuple[str, Optional[str], Optional
                     egress_type = v
                 elif k in ("service", "app", "target"):
                     service = v
+                elif k in ("tier", "pool", "quality"):
+                    tier = v.lower()
+                elif k in ("policy", "tier_policy"):
+                    tier_policy = v.lower()
 
     # Sanitize and unquote account_id
     account_id = urllib.parse.unquote(account_id.strip()) if account_id else f"anon_{uuid.uuid4().hex[:8]}"
     region = region.strip() if region and region.strip() else None
     egress_type = egress_type.strip() if egress_type and egress_type.strip() else None
     service = service.strip() if service and service.strip() else None
+    tier = tier.strip() if tier and tier.strip() else None
+    tier_policy = tier_policy.strip() if tier_policy and tier_policy.strip() else None
 
-    return account_id, region, egress_type, service
+    return ParsedCredentials(
+        account_id=account_id,
+        region=region,
+        egress_type=egress_type,
+        service=service,
+        tier=tier,
+        tier_policy=tier_policy
+    )
 
 
 class ForwardProxyGateway:
@@ -333,20 +433,24 @@ class ForwardProxyGateway:
         self.port = port
         self.server = None
 
-    def _extract_routing_headers(self, headers_dict: Dict[str, str], client_ip: str) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
+    def _extract_routing_headers(self, headers_dict: Dict[str, str], client_ip: str) -> RoutingContext:
         """
-        Extracts account_id, region, egress_type, and service from headers or Proxy-Authorization.
+        Extracts account_id, region, egress_type, service, tier, and tier_policy from headers or Proxy-Authorization.
         Supports:
         - X-Account-Id
         - Proxy-Authorization: Basic <base64(parametric_user:password)>
         - X-Region
         - X-Egress-Type
+        - X-Tier: premium / standard
+        - X-Tier-Policy: standard_first / premium_first / premium_only / standard_only
         - X-Service / X-Target-Service
         """
         account_id = headers_dict.get("x-account-id")
         auth_region = None
         auth_egress = None
         auth_service = None
+        auth_tier = None
+        auth_policy = None
 
         if not account_id and "proxy-authorization" in headers_dict:
             auth_val = headers_dict["proxy-authorization"].strip()
@@ -354,7 +458,13 @@ class ForwardProxyGateway:
                 try:
                     decoded = base64.b64decode(auth_val[6:].strip()).decode("utf-8")
                     user_part = decoded.split(":", 1)[0] if ":" in decoded else decoded
-                    account_id, auth_region, auth_egress, auth_service = parse_proxy_credentials(user_part)
+                    parsed = parse_proxy_credentials(user_part)
+                    account_id = parsed.account_id
+                    auth_region = parsed.region
+                    auth_egress = parsed.egress_type
+                    auth_service = parsed.service
+                    auth_tier = parsed.tier
+                    auth_policy = parsed.tier_policy
                 except Exception:
                     pass
 
@@ -363,12 +473,23 @@ class ForwardProxyGateway:
             account_id = f"anon_{uuid.uuid4().hex[:8]}"
 
         region = headers_dict.get("x-region") or auth_region
-        # No implicit egress filter: an unspecified type must not re-point an account
-        # that is already bound to a non-WARP exit. Callers that need WARP ask for it.
         egress_type = headers_dict.get("x-egress-type") or auth_egress
         service = headers_dict.get("x-service") or headers_dict.get("x-target-service") or auth_service
+        tier = headers_dict.get("x-tier") or auth_tier
+        if tier:
+            tier = tier.strip().lower()
+        tier_policy = headers_dict.get("x-tier-policy") or auth_policy
+        if tier_policy:
+            tier_policy = tier_policy.strip().lower()
 
-        return account_id, region, egress_type, service
+        return RoutingContext(
+            account_id=account_id,
+            region=region,
+            egress_type=egress_type,
+            service=service,
+            tier=tier,
+            tier_policy=tier_policy
+        )
 
     async def connect_upstream_adaptive(
         self,
@@ -431,6 +552,8 @@ class ForwardProxyGateway:
         service: Optional[str],
         target_host: str,
         target_port: int,
+        tier: Optional[str] = None,
+        tier_policy: Optional[str] = None,
     ):
         """
         Opens the upstream SOCKS5 tunnel for an account, retrying once on a different exit.
@@ -448,6 +571,8 @@ class ForwardProxyGateway:
                 account_id=account_id,
                 region=region,
                 egress_type=egress_type,
+                tier=tier,
+                tier_policy=tier_policy,
                 service=service,
                 force_rebind=attempt > 0,
                 exclude_node=excluded,
@@ -503,7 +628,7 @@ class ForwardProxyGateway:
                     headers_dict[k.strip().lower()] = v.strip()
 
             # 2. Extract routing constraints
-            account_id, region, egress_type, service = self._extract_routing_headers(headers_dict, client_ip)
+            route_ctx = self._extract_routing_headers(headers_dict, client_ip)
 
             # 3. Handle HTTP CONNECT (HTTPS)
             if method.upper() == "CONNECT":
@@ -518,7 +643,14 @@ class ForwardProxyGateway:
 
                 try:
                     remote_reader, remote_writer = await self._open_upstream(
-                        account_id, region, egress_type, service, target_host, target_port
+                        account_id=route_ctx.account_id,
+                        region=route_ctx.region,
+                        egress_type=route_ctx.egress_type,
+                        service=route_ctx.service,
+                        target_host=target_host,
+                        target_port=target_port,
+                        tier=route_ctx.tier,
+                        tier_policy=route_ctx.tier_policy
                     )
                 except NoPoolNodesError as pool_err:
                     err_resp = f"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\r\n{pool_err}\r\n".encode()
@@ -562,7 +694,14 @@ class ForwardProxyGateway:
 
                 try:
                     remote_reader, remote_writer = await self._open_upstream(
-                        account_id, region, egress_type, service, target_host, target_port
+                        account_id=route_ctx.account_id,
+                        region=route_ctx.region,
+                        egress_type=route_ctx.egress_type,
+                        service=route_ctx.service,
+                        target_host=target_host,
+                        target_port=target_port,
+                        tier=route_ctx.tier,
+                        tier_policy=route_ctx.tier_policy
                     )
                 except NoPoolNodesError as pool_err:
                     err_resp = f"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\r\n{pool_err}\r\n".encode()

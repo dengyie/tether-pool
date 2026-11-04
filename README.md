@@ -5,7 +5,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-84%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-106%20passed-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 [中文文档 (README.zh-CN.md)](README.zh-CN.md)
@@ -63,6 +63,11 @@
 - **Dual-Mode Serving**:
   - **Control Plane (`:9100`)**: REST API for programmatic leasing, visual dashboard (`/dashboard`), Prometheus OpenMetrics (`/metrics`), and circuit breaker administration.
   - **Unified Forward Proxy Gateway (`:9101`)**: High-performance local forward proxy supporting HTTP CONNECT (HTTPS) and standard HTTP GET/POST, with header-directed routing via `X-Account-Id`, `X-Region`, `X-Egress-Type`, and `Proxy-Authorization`.
+- **Quality Pool Separation (优质/劣质代理分池)**:
+  - 🌟 **优质代理池 (`premium`)**: 准入限制高，专纳自建原生节点、低延迟 (<350ms)、纯净独享 IP、零熔断的优质出口。
+  - 📦 **普通/劣质代理池 (`standard`)**: 容纳第三方聚合代理、WARP 大批量出口、高延迟或通用出口。
+  - **默认策略为「普通优先 (`standard_first`)」**：普通无标记请求优先消耗标准/劣质池，保护高成本自建优质 IP；敏感业务（注册、高权重 AI 账号）显式传入 `tier=premium` 享受优质通道。
+  - **轻量内置质量评分模型 (`core/quality.py`)**：结合节点来源 (Provenance)、实时 RTT 延迟、断路器历史与公网真实 Egress，支持外部风控情报 API (Scamalytics / IPQS) 扣分集成。
 - **4-State Circuit Breaker & Automatic Self-Healing**:
   - Nodes transit through `HEALTHY` (Closed) -> `DEGRADED` (1 failure) -> `DEAD` (2+ failures, Exponential backoff cooldown) -> `HALF_OPEN` (Trial canary probe).
   - When a node trips to `DEAD`, all attached active account leases automatically migrate to healthy backup nodes within the same region and egress protocol.
@@ -88,7 +93,7 @@ pip install -r requirements.txt
 ```
 Verifies pool topology, multi-region probing, circuit breaker self-healing, forward proxy gateway tunneling, and adapter exports in ~10 seconds.
 
-### 3. Run Unit Tests (99 Tests Passing)
+### 3. Run Unit Tests (106 Tests Passing)
 ```bash
 .venv/bin/pytest -v
 ```

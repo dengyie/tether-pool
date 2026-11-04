@@ -13,7 +13,7 @@ from typing import List, Dict, Optional, Any, Tuple
 from urllib.parse import urlparse, quote
 
 from core.models import (
-    ProxyNode, HealthStatus,
+    ProxyNode, HealthStatus, Tier, TierPolicy,
     BatchAllocationRequest, BatchAllocationResponse,
     AccountAllocationItem, AllocationStrategy
 )
@@ -64,29 +64,63 @@ class AllocationEngine:
     def _get_eligible_nodes(
         self,
         egress_preference: Optional[str] = None,
-        region: Optional[str] = None
+        region: Optional[str] = None,
+        tier: Optional[str] = None,
+        tier_policy: Optional[str] = None
     ) -> List[ProxyNode]:
         """
         Retrieves healthy eligible proxy nodes.
-        Prioritizes specified egress type and region, with graceful fallback ladders.
+        Prioritizes specified egress type, region, and tier policy, with graceful fallback ladders.
         """
-        # 1. Strict healthy match
-        nodes = self.storage.list_nodes(
-            region=region,
-            egress_type=egress_preference,
-            status=HealthStatus.HEALTHY.value
-        )
-        if not nodes and region:
-            nodes = self.storage.list_nodes(region=region, status=HealthStatus.HEALTHY.value)
-        if not nodes and egress_preference:
-            nodes = self.storage.list_nodes(egress_type=egress_preference, status=HealthStatus.HEALTHY.value)
+        policy = tier_policy.lower() if tier_policy else (TierPolicy.PREMIUM_FIRST.value if tier == Tier.PREMIUM.value else TierPolicy.STANDARD_FIRST.value)
+
+        def find_nodes(p_tier: Optional[str], p_status: str) -> List[ProxyNode]:
+            if region and egress_preference:
+                n = self.storage.list_nodes(region=region, egress_type=egress_preference, status=p_status, tier=p_tier)
+                if n:
+                    return n
+            if region:
+                n = self.storage.list_nodes(region=region, status=p_status, tier=p_tier)
+                if n:
+                    return n
+            if egress_preference:
+                n = self.storage.list_nodes(egress_type=egress_preference, status=p_status, tier=p_tier)
+                if n:
+                    return n
+            return self.storage.list_nodes(status=p_status, tier=p_tier)
+
+        if policy == TierPolicy.PREMIUM_ONLY.value:
+            tiers_order = [Tier.PREMIUM.value]
+            allow_cross_tier = False
+        elif policy == TierPolicy.STANDARD_ONLY.value:
+            tiers_order = [Tier.STANDARD.value]
+            allow_cross_tier = False
+        elif policy == TierPolicy.PREMIUM_FIRST.value:
+            tiers_order = [Tier.PREMIUM.value, Tier.STANDARD.value]
+            allow_cross_tier = True
+        else:  # STANDARD_FIRST (default)
+            tiers_order = [Tier.STANDARD.value, Tier.PREMIUM.value]
+            allow_cross_tier = True
+
+        nodes: List[ProxyNode] = []
+        # 1. Healthy search
+        for t in tiers_order:
+            nodes = find_nodes(t, HealthStatus.HEALTHY.value)
+            if nodes or not allow_cross_tier:
+                break
+
+        # 2. Degraded emergency search
         if not nodes:
-            nodes = self.storage.list_nodes(status=HealthStatus.HEALTHY.value)
-        if not nodes:
-            # Emergency fallback: degraded nodes
-            nodes = self.storage.list_nodes(status=HealthStatus.DEGRADED.value)
-        if not nodes:
-            nodes = self.storage.list_nodes()
+            for t in tiers_order:
+                nodes = find_nodes(t, HealthStatus.DEGRADED.value)
+                if nodes or not allow_cross_tier:
+                    break
+
+        # 3. Last fallback
+        if not nodes and allow_cross_tier:
+            nodes = self.storage.list_nodes(region=region, egress_type=egress_preference)
+            if not nodes:
+                nodes = self.storage.list_nodes()
 
         # Interleave nodes across regions for maximum geographical diversity
         region_buckets: Dict[str, List[ProxyNode]] = {}
@@ -114,19 +148,22 @@ class AllocationEngine:
         gateway_base: str,
         egress_type: Optional[str] = None,
         region: Optional[str] = None,
-        service: Optional[str] = None
+        service: Optional[str] = None,
+        tier: Optional[str] = None
     ) -> str:
         parsed = urlparse(gateway_base)
         netloc = parsed.netloc or f"{parsed.hostname or '127.0.0.1'}:{parsed.port or 9101}"
         scheme = parsed.scheme or "http"
 
         # Build parametric proxy auth user
-        # Format: account_id__type_<egress>__region_<region>__service_<service>
+        # Format: account_id__type_<egress>__region_<region>__tier_<tier>__service_<service>
         parts = [quote(account_id, safe="")]
         if egress_type:
             parts.append(f"type_{egress_type}")
         if region:
             parts.append(f"region_{region}")
+        if tier:
+            parts.append(f"tier_{tier}")
         if service and service != "default":
             parts.append(f"service_{service}")
         auth_user = "__".join(parts)
@@ -168,7 +205,9 @@ class AllocationEngine:
 
         nodes = self._get_eligible_nodes(
             egress_preference=request.egress_preference,
-            region=request.region
+            region=request.region,
+            tier=request.tier,
+            tier_policy=request.tier_policy
         )
         if not nodes:
             raise RuntimeError("No egress nodes available in pool for allocation")
@@ -204,7 +243,9 @@ class AllocationEngine:
         accounts_to_assign: List[str] = []
 
         def _assign(acc: str, chosen_node: ProxyNode):
-            gw_url = self._build_gateway_proxy_url(acc, gateway_base, chosen_node.egress_type, chosen_node.region, request.service)
+            gw_url = self._build_gateway_proxy_url(
+                acc, gateway_base, chosen_node.egress_type, chosen_node.region, request.service, chosen_node.tier
+            )
             allocations[acc] = AccountAllocationItem(
                 account_id=acc,
                 node_name=chosen_node.name,
@@ -214,7 +255,8 @@ class AllocationEngine:
                 region=chosen_node.region,
                 egress_type=chosen_node.egress_type,
                 service=request.service,
-                allocated_at=now_str
+                allocated_at=now_str,
+                tier=chosen_node.tier
             )
             records_to_save.append((request.service, acc, chosen_node.name, now_str))
 
@@ -230,7 +272,9 @@ class AllocationEngine:
             if existing and existing["node_name"] in node_by_name:
                 n = node_by_name[existing["node_name"]]
                 if n.status == HealthStatus.HEALTHY.value:
-                    gw_url = self._build_gateway_proxy_url(acc, gateway_base, n.egress_type, n.region, request.service)
+                    gw_url = self._build_gateway_proxy_url(
+                        acc, gateway_base, n.egress_type, n.region, request.service, n.tier
+                    )
                     item = AccountAllocationItem(
                         account_id=acc,
                         node_name=n.name,
@@ -240,7 +284,8 @@ class AllocationEngine:
                         region=n.region,
                         egress_type=n.egress_type,
                         service=request.service,
-                        allocated_at=existing["allocated_at"]
+                        allocated_at=existing["allocated_at"],
+                        tier=n.tier
                     )
                     allocations[acc] = item
                     continue

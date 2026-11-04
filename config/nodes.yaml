@@ -18,6 +18,7 @@ nodes:
   - aws
   - tokyo
   weight: 100
+  tier: premium
 - name: aws-tokyo-native-v6
   host: 10.144.144.3
   port: 10802
@@ -30,6 +31,7 @@ nodes:
   - aws
   - tokyo
   weight: 100
+  tier: premium
 - name: aws-tokyo-warp-01
   host: 10.144.144.3
   port: 10881
@@ -41,6 +43,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-02
   host: 10.144.144.3
   port: 10882
@@ -52,6 +55,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-03
   host: 10.144.144.3
   port: 10883
@@ -63,6 +67,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-04
   host: 10.144.144.3
   port: 10884
@@ -74,6 +79,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-05
   host: 10.144.144.3
   port: 10885
@@ -85,6 +91,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-06
   host: 10.144.144.3
   port: 10886
@@ -96,6 +103,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-07
   host: 10.144.144.3
   port: 10887
@@ -107,6 +115,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-08
   host: 10.144.144.3
   port: 10888
@@ -118,6 +127,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-09
   host: 10.144.144.3
   port: 10889
@@ -129,6 +139,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-10
   host: 10.144.144.3
   port: 10890
@@ -140,6 +151,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-11
   host: 10.144.144.3
   port: 10891
@@ -151,6 +163,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-12
   host: 10.144.144.3
   port: 10892
@@ -162,6 +175,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-13
   host: 10.144.144.3
   port: 10893
@@ -173,6 +187,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-14
   host: 10.144.144.3
   port: 10894
@@ -184,6 +199,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-15
   host: 10.144.144.3
   port: 10895
@@ -195,6 +211,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-16
   host: 10.144.144.3
   port: 10896
@@ -206,6 +223,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-17
   host: 10.144.144.3
   port: 10897
@@ -217,6 +235,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-18
   host: 10.144.144.3
   port: 10898
@@ -228,6 +247,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-19
   host: 10.144.144.3
   port: 10899
@@ -239,6 +259,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-20
   host: 10.144.144.3
   port: 10900
@@ -250,6 +271,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-21
   host: 10.144.144.3
   port: 10901
@@ -261,6 +283,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-22
   host: 10.144.144.3
   port: 10902
@@ -272,6 +295,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-23
   host: 10.144.144.3
   port: 10903
@@ -283,6 +307,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-24
   host: 10.144.144.3
   port: 10904
@@ -294,6 +319,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: aws-tokyo-warp-25
   host: 10.144.144.3
   port: 10905
@@ -305,6 +331,7 @@ nodes:
   - ipv6
   - tokyo
   weight: 100
+  tier: standard
 - name: mesh-nl-native-v4
   host: 10.144.144.12
   port: 10801
@@ -317,6 +344,7 @@ nodes:
   - leaseweb
   - netherlands
   weight: 100
+  tier: premium
 - name: mesh-nl-native-v6
   host: 10.144.144.12
   port: 10802
@@ -329,6 +357,7 @@ nodes:
   - leaseweb
   - netherlands
   weight: 100
+  tier: premium
 - name: mesh-nl-warp-01
   host: 10.144.144.12
   port: 10881
@@ -340,6 +369,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-02
   host: 10.144.144.12
   port: 10882
@@ -351,6 +381,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-03
   host: 10.144.144.12
   port: 10883
@@ -362,6 +393,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-04
   host: 10.144.144.12
   port: 10884
@@ -373,6 +405,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-05
   host: 10.144.144.12
   port: 10885
@@ -384,6 +417,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-06
   host: 10.144.144.12
   port: 10886
@@ -395,6 +429,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-07
   host: 10.144.144.12
   port: 10887
@@ -406,6 +441,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-08
   host: 10.144.144.12
   port: 10888
@@ -417,6 +453,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-09
   host: 10.144.144.12
   port: 10889
@@ -428,6 +465,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-10
   host: 10.144.144.12
   port: 10890
@@ -439,6 +477,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-11
   host: 10.144.144.12
   port: 10891
@@ -450,6 +489,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-12
   host: 10.144.144.12
   port: 10892
@@ -461,6 +501,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-13
   host: 10.144.144.12
   port: 10893
@@ -472,6 +513,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-14
   host: 10.144.144.12
   port: 10894
@@ -483,6 +525,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-15
   host: 10.144.144.12
   port: 10895
@@ -494,6 +537,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-16
   host: 10.144.144.12
   port: 10896
@@ -505,6 +549,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-17
   host: 10.144.144.12
   port: 10897
@@ -516,6 +561,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-18
   host: 10.144.144.12
   port: 10898
@@ -527,6 +573,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-19
   host: 10.144.144.12
   port: 10899
@@ -538,6 +585,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-20
   host: 10.144.144.12
   port: 10900
@@ -549,6 +597,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-21
   host: 10.144.144.12
   port: 10901
@@ -560,6 +609,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-22
   host: 10.144.144.12
   port: 10902
@@ -571,6 +621,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-23
   host: 10.144.144.12
   port: 10903
@@ -582,6 +633,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-24
   host: 10.144.144.12
   port: 10904
@@ -593,6 +645,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: mesh-nl-warp-25
   host: 10.144.144.12
   port: 10905
@@ -604,6 +657,7 @@ nodes:
   - ipv6
   - netherlands
   weight: 100
+  tier: standard
 - name: huawei-sg-native-v4
   host: 10.144.144.13
   port: 10801
@@ -616,6 +670,7 @@ nodes:
   - huawei
   - singapore
   weight: 100
+  tier: premium
 - name: huawei-sg-warp-01
   host: 10.144.144.13
   port: 10881
@@ -627,6 +682,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-02
   host: 10.144.144.13
   port: 10882
@@ -638,6 +694,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-03
   host: 10.144.144.13
   port: 10883
@@ -649,6 +706,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-04
   host: 10.144.144.13
   port: 10884
@@ -660,6 +718,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-05
   host: 10.144.144.13
   port: 10885
@@ -671,6 +730,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-06
   host: 10.144.144.13
   port: 10886
@@ -682,6 +742,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-07
   host: 10.144.144.13
   port: 10887
@@ -693,6 +754,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-08
   host: 10.144.144.13
   port: 10888
@@ -704,6 +766,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-09
   host: 10.144.144.13
   port: 10889
@@ -715,6 +778,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-10
   host: 10.144.144.13
   port: 10890
@@ -726,6 +790,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-11
   host: 10.144.144.13
   port: 10891
@@ -737,6 +802,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-12
   host: 10.144.144.13
   port: 10892
@@ -748,6 +814,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-13
   host: 10.144.144.13
   port: 10893
@@ -759,6 +826,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-14
   host: 10.144.144.13
   port: 10894
@@ -770,6 +838,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-15
   host: 10.144.144.13
   port: 10895
@@ -781,6 +850,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-16
   host: 10.144.144.13
   port: 10896
@@ -792,6 +862,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-17
   host: 10.144.144.13
   port: 10897
@@ -803,6 +874,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-18
   host: 10.144.144.13
   port: 10898
@@ -814,6 +886,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-19
   host: 10.144.144.13
   port: 10899
@@ -825,6 +898,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-20
   host: 10.144.144.13
   port: 10900
@@ -836,6 +910,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-21
   host: 10.144.144.13
   port: 10901
@@ -847,6 +922,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-22
   host: 10.144.144.13
   port: 10902
@@ -858,6 +934,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-23
   host: 10.144.144.13
   port: 10903
@@ -869,6 +946,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-24
   host: 10.144.144.13
   port: 10904
@@ -880,6 +958,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: huawei-sg-warp-25
   host: 10.144.144.13
   port: 10905
@@ -891,6 +970,7 @@ nodes:
   - ipv6
   - singapore
   weight: 100
+  tier: standard
 - name: india-native-v4
   host: 10.144.144.5
   port: 10801
@@ -903,6 +983,7 @@ nodes:
   - azure
   - india
   weight: 100
+  tier: premium
 - name: india-warp-01
   host: 10.144.144.5
   port: 10881
@@ -914,6 +995,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-02
   host: 10.144.144.5
   port: 10882
@@ -925,6 +1007,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-03
   host: 10.144.144.5
   port: 10883
@@ -936,6 +1019,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-04
   host: 10.144.144.5
   port: 10884
@@ -947,6 +1031,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-05
   host: 10.144.144.5
   port: 10885
@@ -958,6 +1043,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-06
   host: 10.144.144.5
   port: 10886
@@ -969,6 +1055,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-07
   host: 10.144.144.5
   port: 10887
@@ -980,6 +1067,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-08
   host: 10.144.144.5
   port: 10888
@@ -991,6 +1079,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-09
   host: 10.144.144.5
   port: 10889
@@ -1002,6 +1091,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-10
   host: 10.144.144.5
   port: 10890
@@ -1013,6 +1103,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-11
   host: 10.144.144.5
   port: 10891
@@ -1024,6 +1115,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-12
   host: 10.144.144.5
   port: 10892
@@ -1035,6 +1127,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-13
   host: 10.144.144.5
   port: 10893
@@ -1046,6 +1139,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-14
   host: 10.144.144.5
   port: 10894
@@ -1057,6 +1151,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-15
   host: 10.144.144.5
   port: 10895
@@ -1068,6 +1163,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-16
   host: 10.144.144.5
   port: 10896
@@ -1079,6 +1175,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-17
   host: 10.144.144.5
   port: 10897
@@ -1090,6 +1187,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-18
   host: 10.144.144.5
   port: 10898
@@ -1101,6 +1199,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-19
   host: 10.144.144.5
   port: 10899
@@ -1112,6 +1211,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-20
   host: 10.144.144.5
   port: 10900
@@ -1123,6 +1223,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-21
   host: 10.144.144.5
   port: 10901
@@ -1134,6 +1235,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-22
   host: 10.144.144.5
   port: 10902
@@ -1145,6 +1247,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-23
   host: 10.144.144.5
   port: 10903
@@ -1156,6 +1259,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-24
   host: 10.144.144.5
   port: 10904
@@ -1167,6 +1271,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: india-warp-25
   host: 10.144.144.5
   port: 10905
@@ -1178,6 +1283,7 @@ nodes:
   - ipv6
   - india
   weight: 100
+  tier: standard
 - name: hk-native-v4
   host: 10.144.144.2
   port: 10801
@@ -1190,6 +1296,7 @@ nodes:
   - azure
   - hongkong
   weight: 100
+  tier: premium
 - name: google-native-v4
   host: 10.144.144.4
   port: 10801
@@ -1202,6 +1309,7 @@ nodes:
   - gcp
   - us-west
   weight: 100
+  tier: premium
 - name: clash-001-home-win-mesh
   host: 127.0.0.1
   port: 11001
@@ -1213,6 +1321,7 @@ nodes:
   - bridge
   - vless
   weight: 100
+  tier: standard
 - name: clash-002-tuic-googlevps
   host: 127.0.0.1
   port: 11002
@@ -1225,6 +1334,7 @@ nodes:
   - tuic
   - self_hosted
   weight: 100
+  tier: premium
 - name: clash-003-anytls-googlevps
   host: 127.0.0.1
   port: 11003
@@ -1237,6 +1347,7 @@ nodes:
   - anytls
   - self_hosted
   weight: 100
+  tier: premium
 - name: clash-004-vless-azure-reality
   host: 127.0.0.1
   port: 11004
@@ -1249,6 +1360,7 @@ nodes:
   - vless
   - self_hosted
   weight: 100
+  tier: premium
 - name: clash-005-vless-india-reality
   host: 127.0.0.1
   port: 11005
@@ -1261,6 +1373,7 @@ nodes:
   - vless
   - self_hosted
   weight: 100
+  tier: premium
 - name: clash-006-tuic-azure
   host: 127.0.0.1
   port: 11006
@@ -1273,6 +1386,7 @@ nodes:
   - tuic
   - self_hosted
   weight: 100
+  tier: premium
 - name: clash-007-anytls-azure
   host: 127.0.0.1
   port: 11007
@@ -1285,6 +1399,7 @@ nodes:
   - anytls
   - self_hosted
   weight: 100
+  tier: premium
 - name: clash-008-katabump-reality
   host: 127.0.0.1
   port: 11008
@@ -1297,6 +1412,7 @@ nodes:
   - vless
   - self_hosted
   weight: 100
+  tier: premium
 - name: clash-009-hkg-dgn-reality
   host: 127.0.0.1
   port: 11009
@@ -1309,6 +1425,7 @@ nodes:
   - vless
   - self_hosted
   weight: 100
+  tier: premium
 - name: clash-010-03
   host: 127.0.0.1
   port: 11010
@@ -1320,6 +1437,7 @@ nodes:
   - bridge
   - hysteria2
   weight: 100
+  tier: standard
 - name: clash-011-01-2x
   host: 127.0.0.1
   port: 11011
@@ -1331,6 +1449,7 @@ nodes:
   - bridge
   - hysteria2
   weight: 100
+  tier: standard
 - name: clash-012-03-2x
   host: 127.0.0.1
   port: 11012
@@ -1342,6 +1461,7 @@ nodes:
   - bridge
   - hysteria2
   weight: 100
+  tier: standard
 - name: clash-013-bk-01-2x
   host: 127.0.0.1
   port: 11013
@@ -1353,6 +1473,7 @@ nodes:
   - bridge
   - hysteria2
   weight: 100
+  tier: standard
 - name: clash-014-bk-02-2x
   host: 127.0.0.1
   port: 11014
@@ -1364,6 +1485,7 @@ nodes:
   - bridge
   - hysteria2
   weight: 100
+  tier: standard
 - name: clash-015-bk-03-2x
   host: 127.0.0.1
   port: 11015
@@ -1375,6 +1497,7 @@ nodes:
   - bridge
   - hysteria2
   weight: 100
+  tier: standard
 - name: clash-016-bk-04-2x
   host: 127.0.0.1
   port: 11016
@@ -1386,6 +1509,7 @@ nodes:
   - bridge
   - hysteria2
   weight: 100
+  tier: standard
 - name: clash-017-home-win-cf
   host: 127.0.0.1
   port: 11017
@@ -1398,6 +1522,7 @@ nodes:
   - vless
   - self_hosted
   weight: 100
+  tier: premium
 - name: clash-018-jp-a-mieru-tcp
   host: 127.0.0.1
   port: 11018
@@ -1410,6 +1535,7 @@ nodes:
   - mieru
   - tomorin
   weight: 100
+  tier: standard
 - name: clash-019-jp-a-anytls
   host: 127.0.0.1
   port: 11019
@@ -1422,6 +1548,7 @@ nodes:
   - anytls
   - tomorin
   weight: 100
+  tier: standard
 - name: clash-020-hk-lucid-tcp
   host: 127.0.0.1
   port: 11020
@@ -1434,6 +1561,7 @@ nodes:
   - mieru
   - tomorin
   weight: 100
+  tier: standard
 - name: clash-021-us-las-buyvm
   host: 127.0.0.1
   port: 11021
@@ -1446,6 +1574,7 @@ nodes:
   - mieru
   - tomorin
   weight: 100
+  tier: standard
 - name: clash-022-us-nyc-buyvm
   host: 127.0.0.1
   port: 11022
@@ -1458,6 +1587,7 @@ nodes:
   - mieru
   - tomorin
   weight: 100
+  tier: standard
 - name: clash-023-us-nyc-buyvm-anytls
   host: 127.0.0.1
   port: 11023
@@ -1470,6 +1600,7 @@ nodes:
   - anytls
   - tomorin
   weight: 100
+  tier: standard
 - name: clash-024-ru-novosibirsk-justhost
   host: 127.0.0.1
   port: 11024
@@ -1482,6 +1613,7 @@ nodes:
   - mieru
   - tomorin
   weight: 100
+  tier: standard
 - name: clash-025-nl-kerkrade-deluxhost
   host: 127.0.0.1
   port: 11025
@@ -1494,6 +1626,7 @@ nodes:
   - mieru
   - tomorin
   weight: 100
+  tier: standard
 - name: clash-026-ch-brn-buyvm
   host: 127.0.0.1
   port: 11026
@@ -1506,6 +1639,7 @@ nodes:
   - mieru
   - tomorin
   weight: 100
+  tier: standard
 - name: clash-027-ch-brn-buyvm-ipv6
   host: 127.0.0.1
   port: 11027
@@ -1518,6 +1652,7 @@ nodes:
   - mieru
   - tomorin
   weight: 100
+  tier: standard
 - name: clash-028-hk-lucid-tcp-ipv6
   host: 127.0.0.1
   port: 11028
@@ -1530,6 +1665,7 @@ nodes:
   - mieru
   - tomorin
   weight: 100
+  tier: standard
 - name: clash-029-jp-osaka-oracle-ipv6
   host: 127.0.0.1
   port: 11029
@@ -1542,6 +1678,7 @@ nodes:
   - anytls
   - tomorin
   weight: 100
+  tier: standard
 - name: clash-030-us-las-buyvm-ipv6
   host: 127.0.0.1
   port: 11030
@@ -1554,6 +1691,7 @@ nodes:
   - mieru
   - tomorin
   weight: 100
+  tier: standard
 - name: clash-031-us-nyc-buyvm-ipv6
   host: 127.0.0.1
   port: 11031
@@ -1566,6 +1704,7 @@ nodes:
   - mieru
   - tomorin
   weight: 100
+  tier: standard
 - name: clash-032-us-nyc-buyvm-ipv6-anytls
   host: 127.0.0.1
   port: 11032
@@ -1578,6 +1717,7 @@ nodes:
   - anytls
   - tomorin
   weight: 100
+  tier: standard
 - name: clash-033-ru-novosibirsk-justhost-ipv6
   host: 127.0.0.1
   port: 11033
@@ -1590,6 +1730,7 @@ nodes:
   - mieru
   - tomorin
   weight: 100
+  tier: standard
 - name: clash-034-nl-kerkrade-deluxhost-ipv6
   host: 127.0.0.1
   port: 11034
@@ -1602,6 +1743,7 @@ nodes:
   - mieru
   - tomorin
   weight: 100
+  tier: standard
 - name: clash-035-ch-brn-buyvm-anytls-ipv6
   host: 127.0.0.1
   port: 11035
@@ -1614,6 +1756,7 @@ nodes:
   - anytls
   - tomorin
   weight: 100
+  tier: standard
 - name: clash-036-jp-vmess2-bwh
   host: 127.0.0.1
   port: 11036
@@ -1626,6 +1769,7 @@ nodes:
   - vmess
   - share
   weight: 100
+  tier: standard
 - name: clash-037-us-vmess1-zo
   host: 127.0.0.1
   port: 11037
@@ -1638,6 +1782,7 @@ nodes:
   - vmess
   - share
   weight: 100
+  tier: standard
 - name: clash-038-us-vmess2-bwh
   host: 127.0.0.1
   port: 11038
@@ -1650,6 +1795,7 @@ nodes:
   - vmess
   - share
   weight: 100
+  tier: standard
 - name: clash-039-tw-isp-evo
   host: 127.0.0.1
   port: 11039
@@ -1662,6 +1808,7 @@ nodes:
   - vmess
   - share
   weight: 100
+  tier: standard
 - name: clash-040-muse-vm-reality
   host: 127.0.0.1
   port: 11040
@@ -1674,6 +1821,7 @@ nodes:
   - vless
   - self_hosted
   weight: 100
+  tier: premium
 - name: clash-041-vless-aws-tokyo-reality
   host: 127.0.0.1
   port: 11041
@@ -1686,6 +1834,7 @@ nodes:
   - vless
   - self_hosted
   weight: 100
+  tier: premium
 - name: clash-042-vn-hanoi-vnpt
   host: 127.0.0.1
   port: 11042
@@ -1698,6 +1847,7 @@ nodes:
   - anytls
   - tomorin
   weight: 100
+  tier: standard
 - name: clash-043-vn-hanoi-vnpt-ipv6
   host: 127.0.0.1
   port: 11043
@@ -1710,6 +1860,7 @@ nodes:
   - anytls
   - tomorin
   weight: 100
+  tier: standard
 - name: clash-044-hk-warp1-sak
   host: 127.0.0.1
   port: 11044
@@ -1722,6 +1873,7 @@ nodes:
   - vmess
   - share
   weight: 100
+  tier: standard
 - name: clash-045-render-engine-vless
   host: 127.0.0.1
   port: 11045
@@ -1734,6 +1886,7 @@ nodes:
   - vless
   - self_hosted
   weight: 100
+  tier: premium
 - name: clash-046-vless-huawei-sh-reality
   host: 127.0.0.1
   port: 11046
@@ -1746,6 +1899,7 @@ nodes:
   - vless
   - self_hosted
   weight: 100
+  tier: premium
 - name: clash-047-vless-tencent-sh-reality
   host: 127.0.0.1
   port: 11047
@@ -1758,6 +1912,7 @@ nodes:
   - vless
   - self_hosted
   weight: 100
+  tier: premium
 - name: clash-048-vless-tencent-gz-reality
   host: 127.0.0.1
   port: 11048
@@ -1770,6 +1925,7 @@ nodes:
   - vless
   - self_hosted
   weight: 100
+  tier: premium
 - name: clash-049-vless-tebi-hz-reality
   host: 127.0.0.1
   port: 11049
@@ -1782,6 +1938,7 @@ nodes:
   - vless
   - self_hosted
   weight: 100
+  tier: premium
 - name: clash-050-vless-pxed-hz-reality
   host: 127.0.0.1
   port: 11050
@@ -1794,6 +1951,7 @@ nodes:
   - vless
   - self_hosted
   weight: 100
+  tier: premium
 - name: clash-051-botkeep-vless
   host: 127.0.0.1
   port: 11051
@@ -1806,3 +1964,4 @@ nodes:
   - vless
   - self_hosted
   weight: 100
+  tier: premium

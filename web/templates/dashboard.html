@@ -93,9 +93,10 @@
                     <span id="stat-total-nodes" class="text-2xl font-bold text-white">--</span>
                     <span class="text-xs text-slate-400">个节点</span>
                 </div>
-                <div class="mt-2 text-xs text-slate-400 flex justify-between">
-                    <span>100 WARP IPv6</span>
-                    <span>8 原生出口</span>
+                <div class="mt-2 text-xs text-slate-400 flex justify-between items-center">
+                    <span class="text-amber-300 font-medium">🌟 优质: <span id="stat-premium-count">--</span></span>
+                    <span class="text-slate-300">📦 普通: <span id="stat-standard-count">--</span></span>
+                    <span class="text-cyan-400 font-medium">均分: <span id="stat-avg-score">--</span></span>
                 </div>
             </div>
 
@@ -179,6 +180,13 @@
                     </select>
                 </div>
 
+                <!-- Tier Pool Filter Pills -->
+                <div class="flex items-center bg-dark-700/80 p-1 rounded-lg border border-slate-700 text-xs">
+                    <button class="filter-tier-btn px-2.5 py-1 rounded-md bg-cyan-600 text-white font-medium" data-tier="" onclick="setTierFilter('')">全部分池</button>
+                    <button class="filter-tier-btn px-2.5 py-1 rounded-md text-amber-300 hover:text-white" data-tier="premium" onclick="setTierFilter('premium')">🌟 优质池</button>
+                    <button class="filter-tier-btn px-2.5 py-1 rounded-md text-slate-300 hover:text-white" data-tier="standard" onclick="setTierFilter('standard')">📦 普通池</button>
+                </div>
+
                 <div class="flex items-center bg-dark-700/80 p-1 rounded-lg border border-slate-700 text-xs">
                     <button class="filter-status-btn px-2.5 py-1 rounded-md bg-cyan-600 text-white font-medium" data-status="" onclick="setStatusFilter('')">全状态</button>
                     <button class="filter-status-btn px-2.5 py-1 rounded-md text-emerald-400 hover:text-white" data-status="healthy" onclick="setStatusFilter('healthy')">健康</button>
@@ -228,6 +236,18 @@
                         <option value="native_ipv6">🌐 原生 IPv6</option>
                         <option value="clash_proxy">🧩 Clash / 3X-UI</option>
                     </select>
+                    <select id="sim-tier" class="px-2.5 py-1.5 bg-dark-700 border border-slate-700 rounded-lg text-xs text-amber-300 focus:outline-none">
+                        <option value="">默认分池 (普通优先)</option>
+                        <option value="premium">🌟 优质池 (Premium)</option>
+                        <option value="standard">📦 普通池 (Standard)</option>
+                    </select>
+                    <select id="sim-tier-policy" class="px-2.5 py-1.5 bg-dark-700 border border-slate-700 rounded-lg text-xs text-slate-200 focus:outline-none">
+                        <option value="">默认策略 (standard_first)</option>
+                        <option value="standard_first">普通优先 (可降级)</option>
+                        <option value="premium_first">优质优先 (可降级)</option>
+                        <option value="premium_only">严选优质 (禁止降级)</option>
+                        <option value="standard_only">仅普通池 (禁止越界)</option>
+                    </select>
                     <input type="text" id="sim-service" placeholder="服务名 (默认 default)"
                         class="px-3 py-1.5 bg-dark-700 border border-slate-700 rounded-lg text-xs text-slate-200 placeholder-slate-500 focus:outline-none w-full sm:w-36">
                     <button onclick="simulateAcquire()" class="px-3.5 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-medium rounded-lg transition shadow">
@@ -245,6 +265,7 @@
                         <span class="text-slate-500">→</span>
                         <span class="text-slate-400">已分配节点:</span>
                         <span id="sim-res-node" class="font-mono font-bold text-emerald-400"></span>
+                        <span id="sim-res-tier-badge"></span>
                     </div>
                     <div class="flex items-center space-x-4 text-slate-400">
                         <span>Mesh 代理: <span id="sim-res-url" class="font-mono text-slate-200"></span></span>
@@ -325,6 +346,7 @@
 
         let allNodes = [];
         let currentRegionFilter = '';
+        let currentTierFilter = '';
         let currentStatusFilter = '';
         let currentLease = null;
 
@@ -376,6 +398,29 @@
             document.getElementById('stat-healthy-bar').style.width = ratio + '%';
             document.getElementById('stat-degraded-count').innerText = `降级: ${stats.degraded_nodes}`;
             document.getElementById('stat-dead-count').innerText = `熔断: ${stats.dead_nodes}`;
+            if (document.getElementById('stat-premium-count')) {
+                const pCount = (stats.tier_distribution && stats.tier_distribution.premium) || 0;
+                const sCount = (stats.tier_distribution && stats.tier_distribution.standard) || 0;
+                document.getElementById('stat-premium-count').innerText = pCount;
+                document.getElementById('stat-standard-count').innerText = sCount;
+                document.getElementById('stat-avg-score').innerText = stats.average_quality_score != null ? stats.average_quality_score : '--';
+            }
+        }
+
+        function setTierFilter(tier) {
+            currentTierFilter = tier;
+            document.querySelectorAll('.filter-tier-btn').forEach(btn => {
+                if (btn.getAttribute('data-tier') === tier) {
+                    btn.classList.add('bg-cyan-600', 'text-white', 'font-medium');
+                    btn.classList.remove('text-amber-300', 'text-slate-300', 'text-slate-400');
+                } else {
+                    btn.classList.remove('bg-cyan-600', 'text-white', 'font-medium');
+                    const btnTier = btn.getAttribute('data-tier');
+                    if (btnTier === 'premium') btn.classList.add('text-amber-300');
+                    else btn.classList.add('text-slate-300');
+                }
+            });
+            applyFilters();
         }
 
         function setRegionFilter(region) {
@@ -415,6 +460,7 @@
             const search = document.getElementById('filter-search').value.toLowerCase().trim();
             const filtered = allNodes.filter(n => {
                 if (currentRegionFilter && n.region !== currentRegionFilter) return false;
+                if (currentTierFilter && (n.tier || 'standard') !== currentTierFilter) return false;
                 if (currentStatusFilter && n.status !== currentStatusFilter) return false;
                 if (search) {
                     const matchName = n.name.toLowerCase().includes(search);
@@ -480,6 +526,11 @@
                 statusBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-rose-500/10 text-rose-400 border border-rose-500/20">🔴 熔断</span>';
             }
 
+            const isPremium = node.tier === 'premium';
+            const tierBadge = isPremium
+                ? '<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-500/15 text-amber-300 border border-amber-500/30">🌟 优质</span>'
+                : '<span class="px-1.5 py-0.5 rounded text-[10px] bg-slate-800 text-slate-400 border border-slate-700">📦 普通</span>';
+
             let typeBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/10 text-cyan-300">WARP v6</span>';
             if (node.egress_type === 'native_ipv4') {
                 typeBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] bg-purple-500/10 text-purple-300">原生 v4</span>';
@@ -494,6 +545,9 @@
             if (node.latency_ms > 3000) latencyColor = 'text-amber-400';
             if (node.latency_ms > 8000) latencyColor = 'text-rose-400';
 
+            const score = node.quality_score != null ? node.quality_score : 50;
+            let scoreColor = score >= 75 ? 'text-amber-300 font-bold' : (score >= 50 ? 'text-cyan-400' : 'text-slate-400');
+
             const exitIp = node.exit_ip ? node.exit_ip : '未探活';
             const safeName = escapeHtml(node.name);
             const safeExitIp = escapeHtml(exitIp);
@@ -503,11 +557,17 @@
                 <div class="glass-card p-3 rounded-lg space-y-2 text-xs">
                     <div class="flex justify-between items-center">
                         <span class="font-mono font-bold text-slate-200 truncate pr-1" title="${safeName}">${safeName}</span>
-                        ${statusBadge}
+                        <div class="flex items-center space-x-1">
+                            ${tierBadge}
+                            ${statusBadge}
+                        </div>
                     </div>
                     <div class="flex justify-between items-center text-slate-400">
                         <span>${typeBadge}</span>
-                        <span class="font-mono ${latencyColor}">${latency}</span>
+                        <div class="flex items-center space-x-2">
+                            <span class="${scoreColor}" title="IP 质量综合得分">${score}分</span>
+                            <span class="font-mono ${latencyColor}">${latency}</span>
+                        </div>
                     </div>
                     <div class="p-1.5 rounded bg-black/40 border border-slate-800/80 font-mono text-[11px] text-slate-300 truncate" title="${safeExitIp}">
                         ${safeExitIp}
@@ -556,6 +616,8 @@
             const account = document.getElementById('sim-account').value.trim();
             const region = document.getElementById('sim-region').value;
             const egress = document.getElementById('sim-egress').value;
+            const tier = document.getElementById('sim-tier') ? document.getElementById('sim-tier').value : '';
+            const tierPolicy = document.getElementById('sim-tier-policy') ? document.getElementById('sim-tier-policy').value : '';
             const service = document.getElementById('sim-service').value.trim();
             if (!account) return alert('请输入 Account ID');
 
@@ -563,6 +625,8 @@
             let url = `/v1/acquire?account_id=${encodeURIComponent(account)}`;
             if (region) url += `&region=${encodeURIComponent(region)}`;
             if (egress) url += `&egress_type=${encodeURIComponent(egress)}`;
+            if (tier) url += `&tier=${encodeURIComponent(tier)}`;
+            if (tierPolicy) url += `&tier_policy=${encodeURIComponent(tierPolicy)}`;
             if (service) url += `&service=${encodeURIComponent(service)}`;
 
             try {
@@ -574,6 +638,14 @@
                 document.getElementById('sim-result').classList.remove('hidden');
                 document.getElementById('sim-res-account').innerText = lease.account_id;
                 document.getElementById('sim-res-node').innerText = lease.node_name;
+                const tierBadgeElem = document.getElementById('sim-res-tier-badge');
+                if (tierBadgeElem) {
+                    if (lease.tier === 'premium') {
+                        tierBadgeElem.innerHTML = '<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-500/15 text-amber-300 border border-amber-500/30">🌟 优质</span>';
+                    } else {
+                        tierBadgeElem.innerHTML = '<span class="px-1.5 py-0.5 rounded text-[10px] bg-slate-800 text-slate-400 border border-slate-700">📦 普通</span>';
+                    }
+                }
                 document.getElementById('sim-res-url').innerText = lease.proxy_url;
                 document.getElementById('sim-res-region').innerText = lease.region;
                 document.getElementById('sim-res-type').innerText = lease.egress_type;
