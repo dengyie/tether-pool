@@ -165,6 +165,23 @@ class AllocationEngine:
         allocations: Dict[str, AccountAllocationItem] = {}
         records_to_save: List[Tuple[str, str, str, str]] = []
 
+        max_cap = request.max_accounts_per_ip
+
+        def _exit_key(n: ProxyNode) -> str:
+            # Capacity is bounded per real exit IP, not per listener/port:
+            # several nodes may share one upstream egress.
+            return n.exit_ip or f"node:{n.name}"
+
+        def _has_room(n: ProxyNode) -> bool:
+            return max_cap <= 0 or exit_counts.get(_exit_key(n), 0) < max_cap
+
+        # Seed occupancy from ALL existing bindings of this service, so incremental
+        # batches cannot silently overfill exits that are already in use.
+        occupied_by_node = self.storage.count_allocations_per_node(request.service)
+        occupied_by_exit = self.storage.count_allocations_per_exit(request.service)
+        node_counts: Dict[str, int] = {n.name: occupied_by_node.get(n.name, 0) for n in nodes}
+        exit_counts: Dict[str, int] = dict(occupied_by_exit)
+
         # 1. Reuse existing healthy allocations if force_rebalance is False
         existing_allocations: Dict[str, Dict[str, Any]] = {}
         if not request.force_rebalance:
@@ -172,7 +189,28 @@ class AllocationEngine:
             existing_allocations = {r["account_id"]: r for r in all_existing}
 
         accounts_to_assign: List[str] = []
-        node_counts: Dict[str, int] = {n.name: 0 for n in nodes}
+
+        def _assign(acc: str, chosen_node: ProxyNode):
+            gw_url = self._build_gateway_proxy_url(acc, gateway_base, chosen_node.egress_type, chosen_node.region, request.service)
+            allocations[acc] = AccountAllocationItem(
+                account_id=acc,
+                node_name=chosen_node.name,
+                proxy_url=chosen_node.proxy_url,
+                gateway_proxy_url=gw_url,
+                exit_ip=chosen_node.exit_ip,
+                region=chosen_node.region,
+                egress_type=chosen_node.egress_type,
+                service=request.service,
+                allocated_at=now_str
+            )
+            records_to_save.append((request.service, acc, chosen_node.name, now_str))
+
+        def _capacity_error(pending: int) -> ValueError:
+            return ValueError(
+                f"Pool capacity exceeded: unable to place {pending} remaining account(s) "
+                f"for service '{request.service}' (max_accounts_per_ip={max_cap}, "
+                f"nodes={len(nodes)}, occupied={sum(node_counts.values())})"
+            )
 
         for acc in request.accounts:
             existing = existing_allocations.get(acc)
@@ -192,78 +230,65 @@ class AllocationEngine:
                         allocated_at=existing["allocated_at"]
                     )
                     allocations[acc] = item
-                    node_counts[n.name] += 1
                     continue
             accounts_to_assign.append(acc)
 
-        # 2. Enforce pool capacity against max_accounts_per_ip safety limit
-        max_cap = request.max_accounts_per_ip
-        if max_cap > 0 and accounts_to_assign:
-            total_capacity = len(nodes) * max_cap
-            current_occupied = sum(node_counts.values())
-            remaining_slots = total_capacity - current_occupied
-            if len(accounts_to_assign) > remaining_slots:
-                raise ValueError(
-                    f"Pool capacity exceeded: requested {len(accounts_to_assign)} new assignments, "
-                    f"but only {remaining_slots} slots available across {len(nodes)} nodes "
-                    f"(max_accounts_per_ip={max_cap}, currently occupied={current_occupied})"
-                )
-
-        # 3. Allocate remaining accounts
+        # 2. Allocate remaining accounts, honouring per-exit capacity for both strategies
         if accounts_to_assign:
             if request.strategy == AllocationStrategy.CONSISTENT_HASH.value:
                 ring = ConsistentHashRing(nodes)
                 for acc in accounts_to_assign:
-                    chosen_node = ring.get_node(f"{request.service}:{acc}") or nodes[0]
-                    gw_url = self._build_gateway_proxy_url(acc, gateway_base, chosen_node.egress_type, chosen_node.region, request.service)
-                    item = AccountAllocationItem(
-                        account_id=acc,
-                        node_name=chosen_node.name,
-                        proxy_url=chosen_node.proxy_url,
-                        gateway_proxy_url=gw_url,
-                        exit_ip=chosen_node.exit_ip,
-                        region=chosen_node.region,
-                        egress_type=chosen_node.egress_type,
-                        service=request.service,
-                        allocated_at=now_str
-                    )
-                    allocations[acc] = item
-                    node_counts[chosen_node.name] += 1
-                    records_to_save.append((request.service, acc, chosen_node.name, now_str))
+                    chosen_node = ring.get_node(f"{request.service}:{acc}")
+                    if chosen_node is None or not _has_room(chosen_node):
+                        # Ring pick saturated: overflow to least-loaded exit with room
+                        alternatives = sorted(
+                            (n for n in nodes if _has_room(n)),
+                            key=lambda n: (node_counts[n.name], n.name)
+                        )
+                        if not alternatives:
+                            raise _capacity_error(len(accounts_to_assign))
+                        chosen_node = alternatives[0]
+                    _assign(acc, chosen_node)
+                    node_counts[chosen_node.name] = node_counts.get(chosen_node.name, 0) + 1
+                    key = _exit_key(chosen_node)
+                    exit_counts[key] = exit_counts.get(key, 0) + 1
             else:
                 # Default: Balanced Round-Robin (Interleaved)
-                # Use min-heap to fill lowest loaded nodes first, guaranteeing minimal variance
-                heap = []
-                for idx, node in enumerate(nodes):
-                    heapq.heappush(heap, (node_counts[node.name], idx, node))
+                # Min-heap over real occupancy; skip exits that are already saturated.
+                heap = [(node_counts[n.name], idx, n) for idx, n in enumerate(nodes)]
+                heapq.heapify(heap)
 
                 for acc in accounts_to_assign:
-                    cur_count, idx, chosen_node = heapq.heappop(heap)
-                    gw_url = self._build_gateway_proxy_url(acc, gateway_base, chosen_node.egress_type, chosen_node.region, request.service)
-                    item = AccountAllocationItem(
-                        account_id=acc,
-                        node_name=chosen_node.name,
-                        proxy_url=chosen_node.proxy_url,
-                        gateway_proxy_url=gw_url,
-                        exit_ip=chosen_node.exit_ip,
-                        region=chosen_node.region,
-                        egress_type=chosen_node.egress_type,
-                        service=request.service,
-                        allocated_at=now_str
-                    )
-                    allocations[acc] = item
-                    node_counts[chosen_node.name] += 1
-                    records_to_save.append((request.service, acc, chosen_node.name, now_str))
+                    skipped = []
+                    chosen = None
+                    while heap:
+                        item = heapq.heappop(heap)
+                        if _has_room(item[2]):
+                            chosen = item
+                            break
+                        skipped.append(item)
+                    for item in skipped:
+                        heapq.heappush(heap, item)
+                    if chosen is None:
+                        raise _capacity_error(len(accounts_to_assign))
+
+                    cur_count, idx, chosen_node = chosen
+                    _assign(acc, chosen_node)
+                    node_counts[chosen_node.name] = cur_count + 1
+                    key = _exit_key(chosen_node)
+                    exit_counts[key] = exit_counts.get(key, 0) + 1
                     heapq.heappush(heap, (cur_count + 1, idx, chosen_node))
 
-        # 4. Persist to SQLite
+        # 3. Persist to SQLite
         if records_to_save:
             self.storage.batch_save_allocations(records_to_save)
 
-        # 4. Compute statistics
-        used_counts = [count for count in node_counts.values() if count > 0]
-        min_c = min(used_counts) if used_counts else 0
-        max_c = max(used_counts) if used_counts else 0
+        # 4. Compute statistics over the accounts covered by this call
+        used_counts: Dict[str, int] = {}
+        for item in allocations.values():
+            used_counts[item.node_name] = used_counts.get(item.node_name, 0) + 1
+        min_c = min(used_counts.values()) if used_counts else 0
+        max_c = max(used_counts.values()) if used_counts else 0
         avg_c = round(len(allocations) / len(used_counts), 2) if used_counts else 0.0
 
         return BatchAllocationResponse(
@@ -311,14 +336,16 @@ class AllocationEngine:
         if not nodes:
             raise RuntimeError("No eligible nodes available for allocation")
 
-        # Pick node with least existing allocations in this service
-        all_allocations = self.storage.list_allocations_by_service(service)
-        load_counts: Dict[str, int] = {n.name: 0 for n in nodes}
-        for a in all_allocations:
-            if a["node_name"] in load_counts:
-                load_counts[a["node_name"]] += 1
+        # Pick node with least existing allocations in this service (single GROUP BY query)
+        load_counts: Dict[str, int] = self.storage.count_allocations_per_node(service)
 
-        least_loaded_node = min(nodes, key=lambda n: (load_counts[n.name], zlib.crc32(f"{service}:{account_id}:{n.name}".encode()) & 0xFFFFFFFF))
+        least_loaded_node = min(
+            nodes,
+            key=lambda n: (
+                load_counts.get(n.name, 0),
+                zlib.crc32(f"{service}:{account_id}:{n.name}".encode()) & 0xFFFFFFFF,
+            ),
+        )
 
         now_str = datetime.now().isoformat()
         self.storage.batch_save_allocations([(service, account_id, least_loaded_node.name, now_str)])

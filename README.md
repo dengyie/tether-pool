@@ -5,7 +5,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-36%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-83%20passed-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 [中文文档 (README.zh-CN.md)](README.zh-CN.md)
@@ -88,7 +88,7 @@ pip install -r requirements.txt
 ```
 Verifies pool topology, multi-region probing, circuit breaker self-healing, forward proxy gateway tunneling, and adapter exports in ~10 seconds.
 
-### 3. Run Unit Tests (36 Tests Passing)
+### 3. Run Unit Tests (83 Tests Passing)
 ```bash
 .venv/bin/pytest -v
 ```
@@ -101,6 +101,11 @@ Verifies pool topology, multi-region probing, circuit breaker self-healing, forw
 ```
 - Web Dashboard: `http://127.0.0.1:9100/dashboard`
 - Prometheus Metrics: `http://127.0.0.1:9100/metrics`
+
+> **Network exposure:** both listeners bind to `127.0.0.1` by default and the control plane
+> has no built-in user auth. To expose it beyond loopback, set `HOST=0.0.0.0` **and**
+> `IP_POOL_API_TOKEN=<secret>` — every `/v1/*` endpoint then requires
+> `Authorization: Bearer <secret>`.
 - Forward Proxy Gateway: `http://127.0.0.1:9101`
 
 ---
@@ -154,6 +159,7 @@ ip-pool/
 │   ├── clash_importer.py       # Clash / 3X-UI proxy importer & Mihomo SOCKS5 bridge
 │   ├── metrics.py              # Low-cardinality Prometheus exporter
 │   ├── models.py               # Pydantic data schemas
+│   ├── allocator.py            # Capacity-aware batch/single account allocation engine
 │   ├── prober.py               # Asynchronous dual-stack health prober
 │   ├── router.py               # Sticky hash & self-healing lease re-homer
 │   └── storage.py              # SQLite persistence engine (WAL mode)
@@ -168,8 +174,8 @@ ip-pool/
 │   ├── cpa_adapter.py          # Claude/OpenAI Proxy configuration exporter
 │   ├── gemini_adapter.py       # Gemini Web reverse routing adapter
 │   ├── playwright_pool.py      # Python crawler & Playwright pool SDK
-│   └── grok2api_adapter.py     # Database synchronizer & account sharder
-├── tests/                      # Pytest isolated unit test suite (36 passing tests)
+│   └── tetherpool_client.py    # Zero-dependency HTTP client for the control plane
+├── tests/                      # Pytest isolated unit test suite (83 passing tests)
 ├── demo.py                     # Interactive end-to-end verification showcase
 ├── requirements.txt            # Python dependencies
 └── start.sh                    # Dual-process background daemon manager

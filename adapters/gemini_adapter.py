@@ -6,6 +6,7 @@ Enforces regional affinity (Tokyo, Singapore, US-West) and session persistence f
 import os
 import sys
 from typing import Optional, Dict, Any, List
+from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.storage import Storage
@@ -63,13 +64,22 @@ class GeminiAdapter:
 
     def get_unified_gateway_config(self, account_id: str, preferred_region: str = "tokyo") -> Dict[str, Any]:
         """
-        Returns parameters for calling the local unified gateway (:9101).
+        Returns a ready-to-use local unified gateway (:9101) proxy config.
+
+        Credentials are exposed as proxy username/password because routing
+        headers are never sent inside an HTTPS CONNECT tunnel; only
+        Proxy-Authorization is, and the gateway decodes it into routing tags.
         """
+        username = (
+            f"{quote(account_id, safe='')}"
+            f"__type_{EgressType.WARP_IPV6.value}"
+            f"__region_{preferred_region}"
+        )
         return {
             "gateway_url": "http://127.0.0.1:9101",
-            "headers": {
-                "X-Account-Id": account_id,
-                "X-Region": preferred_region,
-                "X-Egress-Type": EgressType.WARP_IPV6.value
-            }
+            "proxy": {
+                "server": "http://127.0.0.1:9101",
+                "username": username,
+                "password": "tetherpool",
+            },
         }

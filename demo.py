@@ -7,6 +7,7 @@ Verifies: Topology, Live Probing, Sticky Routing, Circuit Breaker Self-Healing, 
 import sys
 import os
 import asyncio
+import tempfile
 import time
 import httpx
 from rich.console import Console
@@ -16,6 +17,12 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 # Ensure project root is in sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# The demo injects synthetic probe failures and re-homes leases, so it must run
+# against a throwaway database instead of the production pool registry.
+if not os.environ.get("IP_POOL_DEMO_USE_LIVE_DB"):
+    _DEMO_DB_DIR = tempfile.mkdtemp(prefix="ip-pool-demo-")
+    os.environ["IP_POOL_DB"] = os.path.join(_DEMO_DB_DIR, "demo.db")
 
 from core.storage import Storage
 from core.prober import Prober
@@ -136,7 +143,9 @@ async def run_demo():
     # 4. Persistence Test
     console.print(f"\n[bold yellow]Step 4: Sticky Lease Consistency Verification[/bold yellow]")
     alice_first = allocated_leases[0][1]
-    alice_second = router.acquire_for_account("alice@mango.com")
+    # Same constraints as Step 3: passing the default egress_type here would
+    # legitimately rebind a lease that was acquired without an egress filter.
+    alice_second = router.acquire_for_account("alice@mango.com", egress_type=None)
     if alice_first.node_name == alice_second.node_name:
         console.print(f"  [green]✔ PASSED:[/green] 'alice@mango.com' stably re-acquired the exact same node [bold cyan]{alice_first.node_name}[/bold cyan] ({alice_first.proxy_url}).")
     else:

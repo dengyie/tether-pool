@@ -21,7 +21,8 @@ DB_PATH = os.environ.get("IP_POOL_DB", os.path.join(os.path.dirname(os.path.dirn
 class Storage:
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        # abspath() keeps bare filenames ("pool.db") from yielding an empty dirname
+        os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
         self._init_db()
 
     @contextmanager
@@ -523,6 +524,11 @@ class Storage:
         cooled_until = (now + timedelta(seconds=cooldown_seconds)).isoformat()
         now_str = now.isoformat()
         with self._get_conn() as conn:
+            # Keep one live row per (exit_ip, target_service) instead of appending duplicates
+            conn.execute(
+                "DELETE FROM ip_cooldowns WHERE exit_ip = ? AND target_service = ?",
+                (exit_ip, target_service)
+            )
             cur = conn.execute("""
                 INSERT INTO ip_cooldowns (exit_ip, target_service, node_name, cooled_until, created_at)
                 VALUES (?, ?, ?, ?, ?)
@@ -720,5 +726,63 @@ class Storage:
                 "node_stats": [dict(r) for r in node_rows]
             }
 
+    def count_allocations_per_node(self, service: str) -> Dict[str, int]:
+        """O(1)-query occupancy map: {node_name: account_count} for a service."""
+        with self._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT node_name, COUNT(*) AS cnt
+                FROM account_allocations
+                WHERE service = ?
+                GROUP BY node_name
+            """, (service,)).fetchall()
+            return {r["node_name"]: r["cnt"] for r in rows}
 
+    def count_allocations_per_exit(self, service: str) -> Dict[str, int]:
+        """
+        Occupancy keyed by real exit identity: exit_ip when probed, else 'node:<name>'.
+        Nodes that have not been probed yet cannot be proven to share an exit, so they
+        fall back to their node name.
+        """
+        with self._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT COALESCE(NULLIF(n.exit_ip, ''), 'node:' || n.name) AS exit_key,
+                       COUNT(*) AS cnt
+                FROM account_allocations a
+                JOIN nodes n ON a.node_name = n.name
+                WHERE a.service = ?
+                GROUP BY exit_key
+            """, (service,)).fetchall()
+            return {r["exit_key"]: r["cnt"] for r in rows}
+
+    def get_allocations_for_node(self, node_name: str) -> List[Dict[str, Any]]:
+        """All service/account bindings currently pointing at a node."""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT service, account_id, node_name FROM account_allocations WHERE node_name = ?",
+                (node_name,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def prune_probe_history(self, keep_days: int = 7) -> int:
+        """Deletes probe_history rows older than keep_days to bound table growth."""
+        cutoff = (datetime.now() - timedelta(days=keep_days)).isoformat()
+        with self._get_conn() as conn:
+            cur = conn.execute("DELETE FROM probe_history WHERE probed_at < ?", (cutoff,))
+            return cur.rowcount
+
+    def prune_nodes_except(self, keep_names: List[str]) -> List[str]:
+        """
+        Removes nodes absent from the authoritative inventory along with their bindings.
+        Returns the pruned node names. Callers must validate `keep_names` first.
+        """
+        with self._get_conn() as conn:
+            existing = [r["name"] for r in conn.execute("SELECT name FROM nodes").fetchall()]
+            stale = [n for n in existing if n not in set(keep_names)]
+            if not stale:
+                return []
+            placeholders = ",".join("?" * len(stale))
+            conn.execute(f"DELETE FROM leases WHERE node_name IN ({placeholders})", stale)
+            conn.execute(f"DELETE FROM account_allocations WHERE node_name IN ({placeholders})", stale)
+            conn.execute(f"DELETE FROM nodes WHERE name IN ({placeholders})", stale)
+            return stale
 

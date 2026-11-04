@@ -25,6 +25,25 @@ DEFAULT_GATEWAY_HOST = os.environ.get("GATEWAY_HOST", "127.0.0.1")
 DEFAULT_GATEWAY_PORT = int(os.environ.get("GATEWAY_PORT", "9101"))
 BUFFER_SIZE = 65536
 CONNECT_TIMEOUT = 10.0
+# How long the surviving direction may keep draining after the opposite side EOFs.
+HALF_CLOSE_GRACE_SECONDS = 5.0
+
+# Routing metadata consumed by the gateway itself; never forwarded to origins.
+INTERNAL_ROUTING_HEADERS = frozenset({
+    "x-account-id",
+    "x-region",
+    "x-egress-type",
+    "x-service",
+    "x-target-service",
+    "proxy-authorization",
+    "proxy-connection",
+    "connection",
+})
+
+
+def _is_internal_header(name: str) -> bool:
+    lowered = name.strip().lower()
+    return lowered in INTERNAL_ROUTING_HEADERS or lowered.startswith("x-tetherpool-")
 
 
 async def socks5_handshake_on_stream(
@@ -171,28 +190,51 @@ def parse_host_port(raw_target: str, default_port: int = 80) -> Tuple[str, int]:
 
 
 async def pump_streams(r1: asyncio.StreamReader, w1: asyncio.StreamWriter, r2: asyncio.StreamReader, w2: asyncio.StreamWriter):
-    """Bidirectionally pumps data between client and upstream proxy with cooperative task cancellation."""
+    """
+    Bidirectionally pumps data between client and upstream proxy.
+
+    Uses half-close semantics: when one direction reaches EOF the peer is signalled
+    with write_eof() and the opposite direction gets a bounded grace period to
+    finish. Cancelling both directions on first completion truncated HTTP CONNECT
+    responses whenever the client half-closed early.
+    """
     async def _forward(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
-            while not reader.at_eof():
+            while True:
                 data = await reader.read(BUFFER_SIZE)
                 if not data:
                     break
                 writer.write(data)
                 await writer.drain()
-        except (asyncio.CancelledError, ConnectionError, OSError):
+        except (asyncio.IncompleteReadError, ConnectionError, OSError):
             pass
+        except asyncio.CancelledError:
+            raise
         except Exception:
             pass
+        finally:
+            try:
+                if writer.can_write_eof():
+                    writer.write_eof()
+            except (NotImplementedError, RuntimeError, OSError):
+                pass
 
     t1 = asyncio.create_task(_forward(r1, w2))
     t2 = asyncio.create_task(_forward(r2, w1))
     try:
-        done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+        _, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=HALF_CLOSE_GRACE_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+            except Exception:
+                pass
     finally:
+        for task in (t1, t2):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(t1, t2, return_exceptions=True)
         for w in (w1, w2):
             try:
                 w.close()
@@ -493,11 +535,10 @@ class ForwardProxyGateway:
 
                 # Reconstruct clean HTTP request without internal headers
                 new_req_lines = [f"{method} {path_and_query} {version}"]
-                internal_headers = {"x-account-id", "x-region", "x-egress-type", "proxy-authorization", "proxy-connection", "connection"}
                 for line in lines[1:]:
                     if ":" in line:
                         k, _ = line.split(":", 1)
-                        if k.strip().lower() not in internal_headers:
+                        if not _is_internal_header(k):
                             new_req_lines.append(line)
                 new_req_lines.append("Connection: close")
                 new_req_payload = "\r\n".join(new_req_lines) + "\r\n\r\n"
@@ -509,8 +550,13 @@ class ForwardProxyGateway:
                 await pump_streams(client_reader, client_writer, remote_reader, remote_writer)
 
         except Exception:
+            pass
+        finally:
+            # Every exit path (early returns included) must release the client socket.
             try:
-                client_writer.close()
+                if not client_writer.is_closing():
+                    client_writer.close()
+                await client_writer.wait_closed()
             except Exception:
                 pass
 

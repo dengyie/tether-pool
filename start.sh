@@ -15,7 +15,10 @@ fi
 
 PORT=${PORT:-9100}
 GATEWAY_PORT=${GATEWAY_PORT:-9101}
-HOST=${HOST:-"0.0.0.0"}
+# Control plane is unauthenticated by default; keep it loopback-only unless the
+# operator explicitly opts into exposing it (and sets IP_POOL_API_TOKEN).
+HOST=${HOST:-"127.0.0.1"}
+GATEWAY_HOST=${GATEWAY_HOST:-"127.0.0.1"}
 LOG_DIR="$DIR/logs"
 DATA_DIR="$DIR/data"
 
@@ -77,8 +80,9 @@ start_services() {
     if [ -f "$PID_GW" ] && ps -p "$(cat "$PID_GW")" > /dev/null 2>&1; then
         echo "[*] Forward Gateway already running with PID $(cat "$PID_GW")"
     else
-        echo "[*] Starting Unified Forward Gateway on 127.0.0.1:$GATEWAY_PORT..."
-        nohup "$VENV_PYTHON" gateway/server.py > "$LOG_GW" 2>&1 &
+        echo "[*] Starting Unified Forward Gateway on $GATEWAY_HOST:$GATEWAY_PORT..."
+        GATEWAY_HOST="$GATEWAY_HOST" GATEWAY_PORT="$GATEWAY_PORT" \
+            nohup "$VENV_PYTHON" gateway/server.py > "$LOG_GW" 2>&1 &
         echo $! > "$PID_GW"
         sleep 1
     fi

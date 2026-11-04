@@ -7,9 +7,9 @@ import yaml
 import asyncio
 from contextlib import asynccontextmanager
 from typing import Optional, List
-from fastapi import FastAPI, Query, BackgroundTasks, HTTPException, Body
+from fastapi import FastAPI, Query, BackgroundTasks, HTTPException, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import PlainTextResponse, HTMLResponse, RedirectResponse, JSONResponse
 
 from core.models import (
     ProxyNode, PoolStats, LeaseInfo, ProbeResult, CircuitEvent,
@@ -27,6 +27,15 @@ from adapters.cpa_adapter import CpaAdapter
 CONFIG_FILE = os.environ.get("IP_POOL_CONFIG", os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "nodes.yaml"))
 DASHBOARD_HTML = os.path.join(os.path.dirname(os.path.dirname(__file__)), "web", "templates", "dashboard.html")
 
+# Optional bearer-token auth for the control plane. When set, every endpoint
+# except /health, /dashboard and / requires "Authorization: Bearer <token>".
+API_TOKEN = os.environ.get("IP_POOL_API_TOKEN", "").strip()
+PROBE_INTERVAL_SECONDS = int(os.environ.get("IP_POOL_PROBE_INTERVAL", "300"))
+PROBE_HISTORY_KEEP_DAYS = int(os.environ.get("IP_POOL_PROBE_HISTORY_KEEP_DAYS", "7"))
+# Config files below this node count are treated as incomplete (e.g. a scratch
+# override), so startup never prunes the live registry against them.
+MIN_CONFIG_NODES_FOR_PRUNE = 10
+
 storage = Storage()
 router = Router(storage)
 prober = Prober(storage, router=router)
@@ -34,39 +43,64 @@ allocator = AllocationEngine(storage)
 metrics_collector = MetricsCollector(storage)
 cpa_adapter = CpaAdapter(storage)
 
+# Single-flight guard so overlapping sweeps (startup + manual trigger) cannot
+# both hammer the pool at once.
+_probe_lock = asyncio.Lock()
+
 
 def load_initial_nodes():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
-            nodes_data = data.get("nodes", [])
-            for item in nodes_data:
-                node = ProxyNode(
-                    name=item["name"],
-                    host=item["host"],
-                    port=item["port"],
-                    protocol=item.get("protocol", "socks5h"),
-                    region=item["region"],
-                    egress_type=item["egress_type"],
-                    tags=item.get("tags", []),
-                    weight=item.get("weight", 100),
-                    relay_mode=item.get("relay_mode", "relay_fallback"),
-                    relay_hop_node=item.get("relay_hop_node")
-                )
-                storage.upsert_node(node)
-        print(f"[+] Loaded/upserted {len(nodes_data)} nodes into storage.")
+    if not os.path.exists(CONFIG_FILE):
+        print(f"[-] Config file not found: {CONFIG_FILE}")
+        return 0
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+        if not data or not isinstance(data, dict):
+            print(f"[-] Config file {CONFIG_FILE} parsed empty; skipping node load")
+            return 0
+        nodes_data = data.get("nodes", []) or []
+        for item in nodes_data:
+            node = ProxyNode(
+                name=item["name"],
+                host=item["host"],
+                port=item["port"],
+                protocol=item.get("protocol", "socks5h"),
+                region=item["region"],
+                egress_type=item["egress_type"],
+                tags=item.get("tags", []),
+                weight=item.get("weight", 100),
+                relay_mode=item.get("relay_mode", "relay_fallback"),
+                relay_hop_node=item.get("relay_hop_node")
+            )
+            storage.upsert_node(node)
+    print(f"[+] Loaded/upserted {len(nodes_data)} nodes into storage.")
+
+    # Remove nodes that vanished from the authority config, but only when the
+    # config plausibly reflects the full pool (prevents wiping the registry on
+    # a truncated scratch file).
+    if len(nodes_data) >= MIN_CONFIG_NODES_FOR_PRUNE:
+        kept = storage.prune_nodes_except([item["name"] for item in nodes_data])
+        if kept:
+            print(f"[+] Pruned {len(kept)} nodes absent from {os.path.basename(CONFIG_FILE)}")
+    return len(nodes_data)
 
 
 async def background_probe_loop():
     while True:
         try:
-            print("[*] Starting scheduled full pool probe...")
-            results = await prober.probe_all(concurrency=25)
-            healthy = sum(1 for r in results if r.success)
-            print(f"[+] Scheduled probe finished: {healthy}/{len(results)} nodes healthy.")
+            if _probe_lock.locked():
+                print("[*] Probe sweep already in progress; skipping this tick.")
+            else:
+                async with _probe_lock:
+                    print("[*] Starting scheduled full pool probe...")
+                    results = await prober.probe_all(concurrency=25)
+                    healthy = sum(1 for r in results if r.success)
+                    print(f"[+] Scheduled probe finished: {healthy}/{len(results)} nodes healthy.")
+                    pruned = storage.prune_probe_history(keep_days=PROBE_HISTORY_KEEP_DAYS)
+                    if pruned:
+                        print(f"[+] Pruned {pruned} stale probe_history rows (>{PROBE_HISTORY_KEEP_DAYS}d).")
         except Exception as e:
             print(f"[-] Scheduled probe error: {e}")
-        await asyncio.sleep(300)  # Every 5 minutes
+        await asyncio.sleep(PROBE_INTERVAL_SECONDS)
 
 
 @asynccontextmanager
@@ -85,10 +119,22 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+
+@app.middleware("http")
+async def bearer_auth_middleware(request: Request, call_next):
+    if API_TOKEN:
+        path = request.url.path
+        if path not in ("/health", "/dashboard", "/"):
+            auth_header = request.headers.get("authorization", "")
+            if auth_header != f"Bearer {API_TOKEN}":
+                return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    return await call_next(request)
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -147,7 +193,10 @@ def acquire_node(
 @app.post("/v1/probe")
 async def trigger_probe(background_tasks: BackgroundTasks):
     async def _run_probe():
-        await prober.probe_all(concurrency=25)
+        if _probe_lock.locked():
+            return
+        async with _probe_lock:
+            await prober.probe_all(concurrency=25)
     background_tasks.add_task(_run_probe)
     return {"message": "Full pool probe triggered in background"}
 
@@ -333,6 +382,8 @@ def acquire_account_allocation(
             region=region,
             force_rebalance=force_rebalance
         )
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
 

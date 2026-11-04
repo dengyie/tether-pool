@@ -5,7 +5,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-36%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-83%20passed-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 [English Documentation (README.md)](README.md)
@@ -90,7 +90,7 @@ pip install -r requirements.txt
 ```
 10 秒内完整跑通全池拓扑校验、双栈实时探活、断路器熔断自愈演练与 `:9101` 正向网关转发验证。
 
-### 3. 执行自动化测试 (36 项全绿)
+### 3. 执行自动化测试 (83 项全绿)
 ```bash
 .venv/bin/pytest -v
 ```
@@ -103,6 +103,10 @@ pip install -r requirements.txt
 ```
 - 控制台界面：`http://127.0.0.1:9100/dashboard`
 - Prometheus 指标：`http://127.0.0.1:9100/metrics`
+
+> **网络暴露防护：** 两个监听器默认仅绑定 `127.0.0.1`，且控制面本身不含用户鉴权。
+> 如需对外暴露，必须同时设置 `HOST=0.0.0.0` 与 `IP_POOL_API_TOKEN=<密钥>`；
+> 设置后所有 `/v1/*` 接口都要求携带 `Authorization: Bearer <密钥>`。
 - 统一正向网关：`http://127.0.0.1:9101`
 
 ---
@@ -156,6 +160,7 @@ ip-pool/
 │   ├── clash_importer.py       # Clash / 3X-UI 节点导入与 Mihomo SOCKS5 桥接
 │   ├── metrics.py              # 低基数 Prometheus 监控导出器
 │   ├── models.py               # Pydantic 领域模型与数据契约
+│   ├── allocator.py            # 容量感知的批量/单账号分配引擎
 │   ├── prober.py               # 异步双栈探活器
 │   ├── router.py               # 确定性 CRC32 粘性路由与自愈重签
 │   └── storage.py              # SQLite 持久化引擎 (WAL 模式)
@@ -170,8 +175,8 @@ ip-pool/
 │   ├── cpa_adapter.py          # Claude/OpenAI Proxy (CPA) 导出适配器
 │   ├── gemini_adapter.py       # Gemini Web 逆向出站适配器
 │   ├── playwright_pool.py      # Python 爬虫与 Playwright 代理池 SDK
-│   └── grok2api_adapter.py     # Grok 2,103 账号增量同步与洗牌
-├── tests/                      # 隔离沙箱自动化单元测试 (36 项全绿)
+│   └── tetherpool_client.py    # 控制面零依赖 HTTP 客户端
+├── tests/                      # 隔离沙箱自动化单元测试 (83 项全绿)
 ├── demo.py                     # 端到端交互式全功能演练脚本
 ├── requirements.txt            # Python 依赖清单
 └── start.sh                    # 双进程后台守护启停脚本

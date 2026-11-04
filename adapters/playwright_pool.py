@@ -7,6 +7,7 @@ import os
 import sys
 import uuid
 from typing import Optional, Dict, Any
+from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.storage import Storage
@@ -57,13 +58,23 @@ class PlaywrightProxyManager:
     ) -> Dict[str, Any]:
         """
         Returns unified gateway (:9101) configuration for Playwright.
+
+        Routing tags MUST travel as proxy username/password: extra_http_headers
+        are not transmitted inside an HTTPS CONNECT tunnel, so a header-based
+        account id never reaches the gateway for https:// navigations.
         """
         acc_id = account_id or f"bot_{uuid.uuid4().hex[:8]}"
-        extra_headers = {"X-Account-Id": acc_id}
+
+        parts = [quote(acc_id, safe="")]
         if region:
-            extra_headers["X-Region"] = region
+            parts.append(f"region_{region}")
+        username = "__".join(parts)
 
         return {
-            "proxy": {"server": "http://127.0.0.1:9101"},
-            "extra_http_headers": extra_headers
+            "gateway_url": "http://127.0.0.1:9101",
+            "proxy": {
+                "server": "http://127.0.0.1:9101",
+                "username": username,
+                "password": "tetherpool",
+            },
         }

@@ -26,9 +26,12 @@ class CircuitBreaker:
         """
         Exponential backoff with jitter:
         min(BASE * 2^(failures - 2), MAX) + uniform(0, JITTER)
+
+        The exponent is clamped before exponentiation: 2**1024 overflows float
+        conversion and would crash the probe sweep after a multi-day outage.
         """
-        exponent = max(0, consecutive_failures - 2)
-        backoff = min(BASE_COOLDOWN_SECONDS * (2 ** exponent), MAX_COOLDOWN_SECONDS)
+        exponent = min(max(0, consecutive_failures - 2), 16)
+        backoff = min(BASE_COOLDOWN_SECONDS * float(2 ** exponent), MAX_COOLDOWN_SECONDS)
         jitter = random.uniform(0, JITTER_MAX_SECONDS)
         return round(backoff + jitter, 2)
 

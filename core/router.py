@@ -4,7 +4,7 @@ Anti-Sybil Cooldown for Registration Bots, and Relay Bridge Resolution
 """
 
 import zlib
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
 from core.models import (
     ProxyNode, LeaseInfo, EgressType, HealthStatus,
@@ -23,21 +23,28 @@ class Router:
         egress_type: Optional[str] = EgressType.WARP_IPV6.value,
         region: Optional[str] = None,
         force_rebind: bool = False,
-        service: Optional[str] = None
+        service: Optional[str] = None,
+        exclude_node: Optional[str] = None
     ) -> Optional[LeaseInfo]:
         """
         Sticky assignment for an account.
         Prioritizes universal account allocations, falling back to deterministic CRC32 mapping.
         Only returns nodes in HEALTHY (Closed) state unless forced to fallback.
         Ephemeral/anonymous requests bypass disk persistence to avoid storage leak.
+
+        `service` is normalized to "default" for both lookup and persistence so that a
+        caller omitting the service can never pick up another service's binding.
+        `exclude_node` prevents a forced rebind from landing back on the failing node.
         """
+        svc = service or "default"
+
         # 1. Check existing lease if not forcing rebind
         if not force_rebind:
             # 1a. Universal Allocation Engine bindings check first
-            alloc = self.storage.find_allocation_by_account(account_id, service=service)
+            alloc = self.storage.find_allocation_by_account(account_id, service=svc)
             if alloc:
                 node = self.storage.get_node(alloc["node_name"])
-                if node and node.status == HealthStatus.HEALTHY.value:
+                if node and node.status == HealthStatus.HEALTHY.value and node.name != exclude_node:
                     if (not egress_type or node.egress_type == egress_type) and (not region or node.region == region):
                         return LeaseInfo(
                             account_id=account_id,
@@ -54,7 +61,7 @@ class Router:
             if existing:
                 node = self.storage.get_node(existing.node_name)
                 # Ensure existing node is HEALTHY (Closed)
-                if node and node.status == HealthStatus.HEALTHY.value:
+                if node and node.status == HealthStatus.HEALTHY.value and node.name != exclude_node:
                     if (not egress_type or node.egress_type == egress_type) and (not region or node.region == region):
                         return existing
 
@@ -73,6 +80,12 @@ class Router:
         if not candidates:
             # Final fallback to all nodes
             candidates = self.storage.list_nodes()
+
+        if exclude_node:
+            filtered = [c for c in candidates if c.name != exclude_node]
+            # Only honour the exclusion if it leaves usable options
+            if filtered:
+                candidates = filtered
 
         if not candidates:
             return None
@@ -101,7 +114,6 @@ class Router:
 
         # 5. Persist lease and synchronize with account_allocations
         lease = self.storage.set_lease(account_id, selected_node.name)
-        svc = service or "default"
         self.storage.batch_save_allocations([(svc, account_id, selected_node.name, now_str)])
 
         return lease
@@ -113,8 +125,9 @@ class Router:
         all attached account leases to healthy backup nodes in the same region.
         """
         leases = self.storage.get_leases_for_node(broken_node_name)
-        if not leases:
-            return {"rehomed_count": 0, "details": []}
+        stale_allocations = self.storage.get_allocations_for_node(broken_node_name)
+        if not leases and not stale_allocations:
+            return {"rehomed_count": 0, "allocations_rehomed_count": 0, "details": []}
 
         broken_node = self.storage.get_node(broken_node_name)
         target_region = broken_node.region if broken_node else None
@@ -134,17 +147,29 @@ class Router:
         # Filter out the broken node just in case
         candidates = [c for c in candidates if c.name != broken_node_name]
         if not candidates:
-            return {"rehomed_count": 0, "details": [], "warning": "No healthy backup nodes available to rehome"}
+            return {"rehomed_count": 0, "allocations_rehomed_count": 0, "details": [], "warning": "No healthy backup nodes available to rehome"}
 
         candidates.sort(key=lambda x: x.name)
 
-        rehomed_details = []
-        for lease in leases:
-            hash_val = zlib.crc32(lease.account_id.encode("utf-8")) & 0xFFFFFFFF
-            idx = hash_val % len(candidates)
-            new_node = candidates[idx]
+        now_str = datetime.now().isoformat()
 
-            self.storage.set_lease(lease.account_id, new_node.name)
+        # Both the legacy lease table and the universal allocation table can point at
+        # the dead node; collect the union so neither is left dangling.
+        lease_accounts = {lease.account_id for lease in leases}
+        affected_accounts = sorted(lease_accounts | {a["account_id"] for a in stale_allocations})
+
+        new_node_by_account: Dict[str, ProxyNode] = {}
+        for acc in affected_accounts:
+            hash_val = zlib.crc32(acc.encode("utf-8")) & 0xFFFFFFFF
+            new_node_by_account[acc] = candidates[hash_val % len(candidates)]
+
+        rehomed_details = []
+        for acc in affected_accounts:
+            new_node = new_node_by_account[acc]
+
+            if acc in lease_accounts:
+                self.storage.set_lease(acc, new_node.name)
+
             self.storage.record_circuit_event(
                 node_name=broken_node_name,
                 from_state=HealthStatus.DEAD.value,
@@ -152,13 +177,27 @@ class Router:
                 reason=f"auto_rehome_to_{new_node.name}"
             )
             rehomed_details.append({
-                "account_id": lease.account_id,
+                "account_id": acc,
                 "from_node": broken_node_name,
                 "to_node": new_node.name,
                 "new_proxy_url": new_node.proxy_url
             })
 
-        return {"rehomed_count": len(rehomed_details), "details": rehomed_details}
+        # Rewrite universal allocations still pointing at the dead node (service preserved)
+        allocation_records: List[Tuple[str, str, str, str]] = [
+            (a["service"], a["account_id"], new_node_by_account[a["account_id"]].name, now_str)
+            for a in stale_allocations
+            if a["account_id"] in new_node_by_account
+        ]
+        if allocation_records:
+            self.storage.batch_save_allocations(allocation_records)
+
+        return {
+            "rehomed_count": len(rehomed_details),
+            "leases_rehomed_count": len(lease_accounts),
+            "allocations_rehomed_count": len(allocation_records),
+            "details": rehomed_details
+        }
 
     def resolve_relay_hop(self, node: ProxyNode) -> Optional[ProxyNode]:
         """
@@ -229,8 +268,10 @@ class Router:
         ]
 
         if not clean_candidates:
-            # All available nodes are in cooldown; reuse least recent
-            clean_candidates = candidates
+            # Every healthy exit is cooling down for this target service.
+            # Refuse the allocation instead of silently reusing a burned exit
+            # (callers translate None into HTTP 503).
+            return None
 
         clean_candidates.sort(key=lambda x: x.name)
 
@@ -278,6 +319,7 @@ class Router:
         """
         event_id = self.storage.record_battery_event(report)
         new_lease = None
+        svc = report.target_service or "default"
 
         if report.force_rebind or report.event_type in (
             BatteryEventType.RATE_LIMITED_429.value,
@@ -286,14 +328,16 @@ class Router:
         ):
             target_region = None
             target_egress = None
+            previous_node_name = None
 
             # 1. Check account_allocations first
-            alloc = self.storage.find_allocation_by_account(report.account_id, service=report.target_service)
+            alloc = self.storage.find_allocation_by_account(report.account_id, service=svc)
             if alloc:
                 old_node = self.storage.get_node(alloc["node_name"])
                 if old_node:
                     target_region = old_node.region
                     target_egress = old_node.egress_type
+                    previous_node_name = old_node.name
             else:
                 existing_lease = self.storage.get_lease(report.account_id)
                 if existing_lease:
@@ -301,28 +345,23 @@ class Router:
                     if old_node:
                         target_region = old_node.region
                         target_egress = old_node.egress_type
+                        previous_node_name = old_node.name
 
             new_lease = self.acquire_for_account(
                 account_id=report.account_id,
                 region=target_region,
                 egress_type=target_egress,
                 force_rebind=True,
-                service=report.target_service
+                service=svc,
+                # A swap that recomputes the same node is a no-op; exclude it.
+                exclude_node=previous_node_name
             )
 
-            # 2. Synchronize all service allocations associated with this account
+            # 2. Rewrite ONLY the reporting service's binding. Touching sibling
+            # services would contaminate unrelated pools with this exit.
             if new_lease:
-                services_to_update = set()
-                if report.target_service:
-                    services_to_update.add(report.target_service)
-                for svc in self.storage.find_services_for_account(report.account_id):
-                    services_to_update.add(svc)
-                if not services_to_update:
-                    services_to_update.add("default")
-
                 now_str = datetime.now().isoformat()
-                records = [(svc, report.account_id, new_lease.node_name, now_str) for svc in services_to_update]
-                self.storage.batch_save_allocations(records)
+                self.storage.batch_save_allocations([(svc, report.account_id, new_lease.node_name, now_str)])
 
         lease_dict = None
         if new_lease:
