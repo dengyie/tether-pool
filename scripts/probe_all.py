@@ -25,8 +25,9 @@ async def main():
     storage = Storage()
     prober = Prober(storage, timeout=12.0)
 
-    console.print("[yellow][*] Probing 108 nodes across Tokyo, Netherlands, Singapore, India, Hong Kong, and US-West...[/yellow]")
-    results = await prober.probe_all(concurrency=15)
+    total_count = len(storage.list_nodes())
+    console.print(f"[yellow][*] Probing {total_count} nodes across Tokyo, Netherlands, Singapore, India, Hong Kong, US-West, and US-Central...[/yellow]")
+    results = await prober.probe_all(concurrency=35)
 
     # Build rich table
     table = Table(title="Global Proxy Node Pool Status")

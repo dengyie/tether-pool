@@ -116,11 +116,14 @@ class AllocationEngine:
                 if nodes or not allow_cross_tier:
                     break
 
-        # 3. Last fallback
+        # 3. Last fallback (must strictly exclude DEAD nodes)
         if not nodes and allow_cross_tier:
-            nodes = self.storage.list_nodes(region=region, egress_type=egress_preference)
+            nodes = [n for n in self.storage.list_nodes(region=region, egress_type=egress_preference) if n.status != HealthStatus.DEAD.value]
             if not nodes:
-                nodes = self.storage.list_nodes()
+                nodes = [n for n in self.storage.list_nodes() if n.status != HealthStatus.DEAD.value]
+
+        # Ensure no DEAD node ever passes through
+        nodes = [n for n in nodes if n.status != HealthStatus.DEAD.value]
 
         # Interleave nodes across regions for maximum geographical diversity
         region_buckets: Dict[str, List[ProxyNode]] = {}
@@ -365,6 +368,8 @@ class AllocationEngine:
         account_id: str,
         egress_preference: Optional[str] = None,
         region: Optional[str] = None,
+        tier: Optional[str] = None,
+        tier_policy: Optional[str] = None,
         force_rebalance: bool = False,
         gateway_base: str = "http://127.0.0.1:9101"
     ) -> AccountAllocationItem:
@@ -374,7 +379,7 @@ class AllocationEngine:
         """
         with BINDING_WRITE_LOCK:
             return self._acquire_single(
-                service, account_id, egress_preference, region, force_rebalance, gateway_base
+                service, account_id, egress_preference, region, tier, tier_policy, force_rebalance, gateway_base
             )
 
     def _acquire_single(
@@ -383,6 +388,8 @@ class AllocationEngine:
         account_id: str,
         egress_preference: Optional[str] = None,
         region: Optional[str] = None,
+        tier: Optional[str] = None,
+        tier_policy: Optional[str] = None,
         force_rebalance: bool = False,
         gateway_base: str = "http://127.0.0.1:9101"
     ) -> AccountAllocationItem:
@@ -391,7 +398,7 @@ class AllocationEngine:
             if existing:
                 node = self.storage.get_node(existing["node_name"])
                 if node and node.status == HealthStatus.HEALTHY.value:
-                    gw_url = self._build_gateway_proxy_url(account_id, gateway_base, node.egress_type, node.region, service=service)
+                    gw_url = self._build_gateway_proxy_url(account_id, gateway_base, node.egress_type, node.region, service=service, tier=node.tier)
                     return AccountAllocationItem(
                         account_id=account_id,
                         node_name=node.name,
@@ -401,10 +408,16 @@ class AllocationEngine:
                         region=node.region,
                         egress_type=node.egress_type,
                         service=service,
-                        allocated_at=existing["allocated_at"]
+                        allocated_at=existing["allocated_at"],
+                        tier=node.tier
                     )
 
-        nodes = self._get_eligible_nodes(egress_preference=egress_preference, region=region)
+        nodes = self._get_eligible_nodes(
+            egress_preference=egress_preference,
+            region=region,
+            tier=tier,
+            tier_policy=tier_policy
+        )
         if not nodes:
             raise RuntimeError("No eligible nodes available for allocation")
 
@@ -422,7 +435,7 @@ class AllocationEngine:
         now_str = datetime.now().isoformat()
         self.storage.batch_save_allocations([(service, account_id, least_loaded_node.name, now_str)])
 
-        gw_url = self._build_gateway_proxy_url(account_id, gateway_base, least_loaded_node.egress_type, least_loaded_node.region, service=service)
+        gw_url = self._build_gateway_proxy_url(account_id, gateway_base, least_loaded_node.egress_type, least_loaded_node.region, service=service, tier=least_loaded_node.tier)
         return AccountAllocationItem(
             account_id=account_id,
             node_name=least_loaded_node.name,
@@ -432,5 +445,6 @@ class AllocationEngine:
             region=least_loaded_node.region,
             egress_type=least_loaded_node.egress_type,
             service=service,
-            allocated_at=now_str
+            allocated_at=now_str,
+            tier=least_loaded_node.tier
         )

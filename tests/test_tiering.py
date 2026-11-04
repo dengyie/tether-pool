@@ -12,12 +12,10 @@ Validates:
 
 import os
 import tempfile
-import pytest
 from core.quality import IPQualityEvaluator, QualityTier
 from core.models import ProxyNode, ProbeResult, EgressType, Tier, TierPolicy
 from core.storage import Storage
 from core.router import Router
-from core.allocator import AllocationEngine, BatchAllocationRequest
 from gateway.server import parse_proxy_credentials
 
 

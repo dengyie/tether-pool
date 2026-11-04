@@ -132,7 +132,14 @@ class Prober:
 
         async def _worker(node: ProxyNode) -> ProbeResult:
             async with sem:
-                return await self.probe_node(node, force=force)
+                try:
+                    return await self.probe_node(node, force=force)
+                except Exception as exc:
+                    return ProbeResult(
+                        node_name=node.name,
+                        success=False,
+                        error=f"worker_exception: {exc}"[:120]
+                    )
 
         tasks = [_worker(node) for node in nodes]
         results = await asyncio.gather(*tasks)

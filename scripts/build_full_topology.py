@@ -14,7 +14,6 @@ Nodes:
 Total: 8 + 40 + 80 + 50 + 150 + 100 + 51 = 479 nodes.
 """
 
-import os
 import yaml
 
 OUTPUT_PATH = "config/nodes.yaml"

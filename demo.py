@@ -38,7 +38,7 @@ async def run_demo():
     console.print("\n")
     console.print(Panel.fit(
         "[bold cyan]🌐 Unified Global IP Pool System v2.0 - Dual-Mode Showcase[/bold cyan]\n"
-        "[italic white]108 Independent Exits · 4-State Circuit Breaker · Self-Healing · Unified Gateway (:9101)[/italic white]",
+        "[italic white]470+ Independent Exits · 4-State Circuit Breaker · Quality Pool Separation · Unified Gateway (:9101)[/italic white]",
         border_style="cyan"
     ))
 
@@ -56,10 +56,10 @@ async def run_demo():
     stats_table.add_column("Node Count", justify="right", style="green")
     stats_table.add_column("Type Breakdown", style="magenta")
 
-    stats_table.add_row("Total Active Nodes", str(stats.total_nodes), "100 WARP IPv6 + 8 Native")
+    stats_table.add_row("Total Active Nodes", str(stats.total_nodes), "420 WARP IPv6 + 8 Native + 51 Clash")
     stats_table.add_row("Healthy Exits", str(stats.healthy_nodes), "Operational")
     for reg, count in sorted(stats.region_distribution.items()):
-        reg_type = "25 WARP + 1~2 Native" if count >= 25 else "1 Native IPv4"
+        reg_type = "Multi-Egress Mixed Pool"
         stats_table.add_row(f"Region: {reg.upper()}", str(count), reg_type)
 
     console.print(stats_table)
@@ -69,10 +69,10 @@ async def run_demo():
     sample_node_names = [
         "aws-tokyo-warp-01",
         "huawei-sg-warp-01",
-        "mesh-nl-warp-01",
-        "india-warp-01",
+        "leaseweb-nl-warp-01",
+        "azure-india-warp-01",
         "aws-tokyo-native-v4",
-        "hk-native-v4"
+        "azure-hk-native-v4"
     ]
 
     probe_table = Table(title="Real-Time Probe Results (over EasyTier Mesh)", border_style="cyan")

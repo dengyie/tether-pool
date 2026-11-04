@@ -84,6 +84,7 @@ def load_initial_nodes():
                 relay_mode=item.get("relay_mode", "relay_fallback"),
                 relay_hop_node=item.get("relay_hop_node"),
                 tier=init_tier,
+                configured_tier=configured_tier,
                 quality_score=score
             )
             storage.upsert_node(node)
@@ -233,8 +234,9 @@ def list_nodes(
     return storage.list_nodes(region=region, egress_type=egress_type, status=status, tier=tier)
 
 
-def _lease_from_allocation(account_id: str, alloc: dict) -> Optional[LeaseInfo]:
-    node = storage.get_node(alloc["node_name"])
+def _lease_from_allocation(account_id: str, alloc: dict, st: Optional[Storage] = None) -> Optional[LeaseInfo]:
+    target_storage = st or storage
+    node = target_storage.get_node(alloc["node_name"])
     if not node:
         return None
     return LeaseInfo(
@@ -245,6 +247,7 @@ def _lease_from_allocation(account_id: str, alloc: dict) -> Optional[LeaseInfo]:
         region=node.region,
         egress_type=node.egress_type,
         assigned_at=alloc["allocated_at"],
+        tier=node.tier
     )
 
 
@@ -485,6 +488,8 @@ def acquire_account_allocation(
     account_id: str = Query(..., description="Unique account ID or email"),
     egress_preference: Optional[str] = Query("warp_ipv6", description="Preferred egress type"),
     region: Optional[str] = Query(None, description="Optional region preference"),
+    tier: Optional[str] = Query(None, description="Optional tier filter: premium or standard"),
+    tier_policy: Optional[str] = Query(None, description="Optional tier policy: standard_first, premium_first, premium_only, standard_only"),
     force_rebalance: bool = Query(False, description="Force reallocating to a different node")
 ):
     """
@@ -496,6 +501,8 @@ def acquire_account_allocation(
             account_id=account_id,
             egress_preference=egress_preference,
             region=region,
+            tier=tier,
+            tier_policy=tier_policy,
             force_rebalance=force_rebalance
         )
     except ValueError as ve:

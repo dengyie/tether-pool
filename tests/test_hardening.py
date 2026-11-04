@@ -106,7 +106,7 @@ def test_bindings_metric_reads_allocations_not_legacy_leases(storage):
     ])
 
     dist = storage.get_metrics_bindings_distribution()
-    assert dist == [{"region": "osaka", "egress_type": EgressType.WARP_IPV6.value, "count": 3}]
+    assert dist == [{"region": "osaka", "egress_type": EgressType.WARP_IPV6.value, "tier": "standard", "count": 3}]
 
 
 # ------------------------------------------- non-destructive startup reconcile

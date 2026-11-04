@@ -25,21 +25,21 @@ class MetricsCollector:
 
         # 1. Node counts by region, egress_type, and status
         node_dist = self.storage.get_metrics_node_distribution()
-        lines.append("# HELP ip_pool_node_count Total proxy nodes grouped by region, egress type and status")
+        lines.append("# HELP ip_pool_node_count Total proxy nodes grouped by region, egress type, status and tier")
         lines.append("# TYPE ip_pool_node_count gauge")
         for item in node_dist:
             lines.append(
-                f'ip_pool_node_count{{region="{item["region"]}",egress_type="{item["egress_type"]}",status="{item["status"]}"}} {item["count"]}'
+                f'ip_pool_node_count{{region="{item["region"]}",egress_type="{item["egress_type"]}",status="{item["status"]}",tier="{item.get("tier", "standard")}"}} {item["count"]}'
             )
         lines.append("")
 
         # 2. Active account bindings by region and egress_type
         leases_dist = self.storage.get_metrics_bindings_distribution()
-        lines.append("# HELP ip_pool_account_bindings Active account->exit bindings grouped by region and egress type")
+        lines.append("# HELP ip_pool_account_bindings Active account->exit bindings grouped by region, egress type and tier")
         lines.append("# TYPE ip_pool_account_bindings gauge")
         for item in leases_dist:
             lines.append(
-                f'ip_pool_account_bindings{{region="{item["region"]}",egress_type="{item["egress_type"]}"}} {item["count"]}'
+                f'ip_pool_account_bindings{{region="{item["region"]}",egress_type="{item["egress_type"]}",tier="{item.get("tier", "standard")}"}} {item["count"]}'
             )
         lines.append("")
 

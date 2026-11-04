@@ -61,6 +61,7 @@ class ProxyNode(BaseModel):
     relay_mode: str = RelayMode.RELAY_FALLBACK.value
     relay_hop_node: Optional[str] = None
     tier: str = Tier.STANDARD.value
+    configured_tier: Optional[str] = None
     quality_score: int = 50
 
     @property

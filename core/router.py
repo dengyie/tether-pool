@@ -29,6 +29,29 @@ class Router:
         service: Optional[str] = None,
         exclude_node: Optional[str] = None
     ) -> Optional[LeaseInfo]:
+        with BINDING_WRITE_LOCK:
+            return self._acquire_for_account(
+                account_id=account_id,
+                egress_type=egress_type,
+                region=region,
+                tier=tier,
+                tier_policy=tier_policy,
+                force_rebind=force_rebind,
+                service=service,
+                exclude_node=exclude_node
+            )
+
+    def _acquire_for_account(
+        self,
+        account_id: str,
+        egress_type: Optional[str] = EgressType.WARP_IPV6.value,
+        region: Optional[str] = None,
+        tier: Optional[str] = None,
+        tier_policy: Optional[str] = None,
+        force_rebind: bool = False,
+        service: Optional[str] = None,
+        exclude_node: Optional[str] = None
+    ) -> Optional[LeaseInfo]:
         """
         Sticky assignment for an account.
         Prioritizes universal account allocations, falling back to deterministic CRC32 mapping.
@@ -67,8 +90,6 @@ class Router:
             if policy == TierPolicy.PREMIUM_ONLY.value and node.tier != Tier.PREMIUM.value:
                 return False
             if policy == TierPolicy.STANDARD_ONLY.value and node.tier != Tier.STANDARD.value:
-                return False
-            if tier and node.tier != tier:
                 return False
             return True
 
@@ -405,10 +426,6 @@ class Router:
                 candidates = self.storage.list_nodes(egress_type=egress_type, status=HealthStatus.HEALTHY.value)
             if not candidates:
                 candidates = self.storage.list_nodes(status=HealthStatus.HEALTHY.value)
-            if not candidates:
-                candidates = self.storage.list_nodes(region=region, egress_type=egress_type)
-            if not candidates:
-                candidates = self.storage.list_nodes()
 
         if not candidates:
             return None

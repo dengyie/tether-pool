@@ -65,6 +65,7 @@ class Storage:
                     relay_mode TEXT DEFAULT 'relay_fallback',
                     relay_hop_node TEXT,
                     tier TEXT DEFAULT 'standard',
+                    configured_tier TEXT,
                     quality_score INTEGER DEFAULT 50
                 );
 
@@ -143,12 +144,14 @@ class Storage:
                 ("relay_mode", "TEXT", "'relay_fallback'"),
                 ("relay_hop_node", "TEXT", "NULL"),
                 ("tier", "TEXT", "'standard'"),
-                ("quality_score", "INTEGER", "50")
+                ("quality_score", "INTEGER", "50"),
+                ("configured_tier", "TEXT", "NULL")
             ]:
                 if col not in existing_cols:
                     conn.execute(f"ALTER TABLE nodes ADD COLUMN {col} {col_type} DEFAULT {default_val}")
 
             conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_tier ON nodes(tier);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_status_tier_region ON nodes(status, tier, region);")
 
     def upsert_node(self, node: ProxyNode):
         with self._get_conn() as conn:
@@ -157,9 +160,9 @@ class Storage:
                     name, host, port, protocol, region, egress_type, tags, weight,
                     exit_ip, latency_ms, status, fail_count, last_probed_at,
                     circuit_state, consecutive_failures, consecutive_successes, next_probe_allowed_at,
-                    relay_mode, relay_hop_node, tier, quality_score
+                    relay_mode, relay_hop_node, tier, configured_tier, quality_score
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     host=excluded.host,
                     port=excluded.port,
@@ -170,8 +173,9 @@ class Storage:
                     weight=excluded.weight,
                     relay_mode=excluded.relay_mode,
                     relay_hop_node=excluded.relay_hop_node,
-                    tier=excluded.tier,
-                    quality_score=excluded.quality_score,
+                    configured_tier=COALESCE(excluded.configured_tier, nodes.configured_tier),
+                    tier=CASE WHEN nodes.status != 'unprobed' AND excluded.status = 'unprobed' THEN nodes.tier ELSE excluded.tier END,
+                    quality_score=CASE WHEN nodes.status != 'unprobed' AND excluded.status = 'unprobed' THEN nodes.quality_score ELSE excluded.quality_score END,
                     status=CASE WHEN excluded.status != 'unprobed' THEN excluded.status ELSE nodes.status END,
                     circuit_state=CASE WHEN excluded.circuit_state != 'unprobed' THEN excluded.circuit_state ELSE nodes.circuit_state END,
                     consecutive_failures=CASE WHEN excluded.status != 'unprobed' THEN excluded.consecutive_failures ELSE nodes.consecutive_failures END,
@@ -184,7 +188,7 @@ class Storage:
                 node.circuit_state or node.status, node.consecutive_failures,
                 node.consecutive_successes, node.next_probe_allowed_at,
                 node.relay_mode, node.relay_hop_node,
-                node.tier or Tier.STANDARD.value, node.quality_score or 50
+                node.tier or Tier.STANDARD.value, node.configured_tier, node.quality_score or 50
             ))
 
     def update_node_status(self, node_name: str, status: str):
@@ -241,7 +245,7 @@ class Storage:
                 status=new_state,
                 consecutive_failures=new_fails,
                 exit_ip=cur_ip,
-                configured_tier=node.tier
+                configured_tier=node.configured_tier
             )
 
             if res.success:
@@ -358,6 +362,7 @@ class Storage:
             relay_mode=row["relay_mode"] if "relay_mode" in keys and row["relay_mode"] else RelayMode.RELAY_FALLBACK.value,
             relay_hop_node=row["relay_hop_node"] if "relay_hop_node" in keys else None,
             tier=row["tier"] if "tier" in keys and row["tier"] else Tier.STANDARD.value,
+            configured_tier=row["configured_tier"] if "configured_tier" in keys and row["configured_tier"] else None,
             quality_score=row["quality_score"] if "quality_score" in keys and row["quality_score"] is not None else 50
         )
 
@@ -522,11 +527,11 @@ class Storage:
     def get_metrics_node_distribution(self) -> List[Dict[str, Any]]:
         with self._get_conn() as conn:
             rows = conn.execute("""
-                SELECT region, egress_type, status, COUNT(*) as cnt
+                SELECT region, egress_type, status, tier, COUNT(*) as cnt
                 FROM nodes
-                GROUP BY region, egress_type, status
+                GROUP BY region, egress_type, status, tier
             """).fetchall()
-            return [{"region": r["region"], "egress_type": r["egress_type"], "status": r["status"], "count": r["cnt"]} for r in rows]
+            return [{"region": r["region"], "egress_type": r["egress_type"], "status": r["status"], "tier": r["tier"] or "standard", "count": r["cnt"]} for r in rows]
 
     def get_metrics_bindings_distribution(self) -> List[Dict[str, Any]]:
         """
@@ -538,12 +543,12 @@ class Storage:
         """
         with self._get_conn() as conn:
             rows = conn.execute("""
-                SELECT n.region, n.egress_type, COUNT(*) as cnt
+                SELECT n.region, n.egress_type, n.tier, COUNT(*) as cnt
                 FROM account_allocations a
                 JOIN nodes n ON a.node_name = n.name
-                GROUP BY n.region, n.egress_type
+                GROUP BY n.region, n.egress_type, n.tier
             """).fetchall()
-            return [{"region": r["region"], "egress_type": r["egress_type"], "count": r["cnt"]} for r in rows]
+            return [{"region": r["region"], "egress_type": r["egress_type"], "tier": r["tier"] or "standard", "count": r["cnt"]} for r in rows]
 
     def get_metrics_probe_latencies(self) -> List[Dict[str, Any]]:
         with self._get_conn() as conn:

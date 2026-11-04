@@ -79,6 +79,8 @@ class TetherPoolClient:
         service: str = "default",
         egress_preference: str = "warp_ipv6",
         region: Optional[str] = None,
+        tier: Optional[str] = None,
+        tier_policy: Optional[str] = None,
         max_accounts_per_ip: int = 50,
         force_rebalance: bool = False,
         strategy: str = "balanced_round_robin"
@@ -92,6 +94,8 @@ class TetherPoolClient:
             "strategy": strategy,
             "egress_preference": egress_preference,
             "region": region,
+            "tier": tier,
+            "tier_policy": tier_policy,
             "max_accounts_per_ip": max_accounts_per_ip,
             "force_rebalance": force_rebalance
         }
@@ -103,6 +107,8 @@ class TetherPoolClient:
         service: str = "default",
         egress_preference: str = "warp_ipv6",
         region: Optional[str] = None,
+        tier: Optional[str] = None,
+        tier_policy: Optional[str] = None,
         force_rebalance: bool = False
     ) -> Dict[str, Any]:
         """
@@ -116,6 +122,10 @@ class TetherPoolClient:
         }
         if region:
             params["region"] = region
+        if tier:
+            params["tier"] = tier
+        if tier_policy:
+            params["tier_policy"] = tier_policy
         return self._http_request("POST", "/v1/allocation/acquire", params=params)
 
     def release_account(self, account_id: str, service: str = "default") -> bool:
@@ -144,12 +154,14 @@ class TetherPoolClient:
         account_id: str,
         egress_type: Optional[str] = "warp_ipv6",
         region: Optional[str] = None,
-        service: Optional[str] = None
+        service: Optional[str] = None,
+        tier: Optional[str] = None,
+        tier_policy: Optional[str] = None
     ) -> str:
         """
         Generates a transparent gateway proxy URL with parametric authentication.
         Downstream services can use this single URL in requests/httpx/Playwright without API pre-registration!
-        Example: http://user_001__type_warp_ipv6__region_tokyo__service_grok2api:tetherpool@127.0.0.1:9101
+        Example: http://user_001__type_warp_ipv6__region_tokyo__tier_premium__service_grok2api:tetherpool@127.0.0.1:9101
         """
         parsed = urlparse(self.gateway_base)
         netloc = parsed.netloc or f"{parsed.hostname or '127.0.0.1'}:{parsed.port or 9101}"
@@ -160,6 +172,10 @@ class TetherPoolClient:
             parts.append(f"type_{egress_type}")
         if region:
             parts.append(f"region_{region}")
+        if tier:
+            parts.append(f"tier_{tier}")
+        if tier_policy:
+            parts.append(f"policy_{tier_policy}")
         if service and service != "default":
             parts.append(f"service_{service}")
         auth_user = "__".join(parts)

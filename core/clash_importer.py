@@ -11,9 +11,6 @@ from __future__ import annotations
 import os
 import re
 import yaml
-import json
-import urllib.request
-import urllib.error
 from typing import List, Dict, Any, Optional
 
 from core.models import ProxyNode, EgressType, HealthStatus

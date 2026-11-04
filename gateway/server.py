@@ -16,7 +16,7 @@ from typing import Optional, Tuple, Dict
 # Ensure project root is in sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.models import ProxyNode, RelayMode, ProbeResult
+from core.models import ProxyNode, RelayMode, ProbeResult, HealthStatus
 from core.storage import Storage
 from core.router import Router
 
@@ -591,11 +591,16 @@ class ForwardProxyGateway:
             except Exception as exc:
                 last_err = exc
                 excluded = node.name
-                self.storage.update_probe_result(ProbeResult(
+                _, event = self.storage.update_probe_result(ProbeResult(
                     node_name=node.name,
                     success=False,
                     error=f"gateway_connect_failed: {exc}"[:120],
                 ))
+                if event and event.to_state == HealthStatus.DEAD.value and self.router:
+                    try:
+                        self.router.rehome_leases_for_node(node.name)
+                    except Exception as rehome_err:
+                        print(f"[-] Error rehoming leases for {node.name} on gateway failure: {rehome_err}")
 
         raise last_err if last_err else RuntimeError("Upstream connection failed")
 

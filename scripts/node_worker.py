@@ -261,15 +261,6 @@ def update_sing_box_config(endpoints, mesh_ip, start_port=10881, has_native_v6=F
 
         rules.append({"inbound": ib_tag, "outbound": ep_tag})
 
-    if mesh_ip == "10.144.144.13":
-        inbounds.append({
-            "type": "mixed",
-            "tag": "socks-warp-compat-10880",
-            "listen": mesh_ip,
-            "listen_port": 10880
-        })
-        rules.append({"inbound": "socks-warp-compat-10880", "outbound": "warp-ep01"})
-
     cfg["inbounds"] = inbounds
     cfg["endpoints"] = new_endpoints
     cfg["outbounds"] = outbounds
@@ -326,6 +317,8 @@ def test_ports(mesh_ip, start_port=10881, count=25, has_native_v6=False):
     success = 0
     for i in range(count):
         port = start_port + i
+        if port >= 11010:
+            port += 1
         try:
             out = run_cmd(f"curl -s --max-time 6 -x socks5h://{mesh_ip}:{port} https://api64.ipify.org")
             if out and ":" in out:
