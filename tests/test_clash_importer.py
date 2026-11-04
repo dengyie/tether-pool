@@ -5,13 +5,11 @@ tests/test_clash_importer.py - Unit tests for Clash / 3X-UI proxy importer & Mih
 import os
 import tempfile
 import yaml
-import pytest
-from core.models import EgressType, HealthStatus
+from core.models import EgressType
 from core.clash_importer import (
     detect_region,
     sanitize_slug,
     ClashImporter,
-    DEFAULT_BASE_PORT,
 )
 
 

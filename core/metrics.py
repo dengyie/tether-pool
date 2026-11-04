@@ -33,13 +33,13 @@ class MetricsCollector:
             )
         lines.append("")
 
-        # 2. Active leases by region and egress_type
-        leases_dist = self.storage.get_metrics_leases_distribution()
-        lines.append("# HELP ip_pool_leases_active Total active sticky account leases grouped by region and egress type")
-        lines.append("# TYPE ip_pool_leases_active gauge")
+        # 2. Active account bindings by region and egress_type
+        leases_dist = self.storage.get_metrics_bindings_distribution()
+        lines.append("# HELP ip_pool_account_bindings Active account->exit bindings grouped by region and egress type")
+        lines.append("# TYPE ip_pool_account_bindings gauge")
         for item in leases_dist:
             lines.append(
-                f'ip_pool_leases_active{{region="{item["region"]}",egress_type="{item["egress_type"]}"}} {item["count"]}'
+                f'ip_pool_account_bindings{{region="{item["region"]}",egress_type="{item["egress_type"]}"}} {item["count"]}'
             )
         lines.append("")
 

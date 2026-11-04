@@ -47,12 +47,20 @@ def test_nodes_endpoint(client):
 
 
 def test_acquire_endpoint(client):
-    res = client.get("/v1/acquire?account_id=test_api_user")
+    # Acquiring mutates state: POST creates, GET only reads.
+    assert client.get("/v1/acquire?account_id=test_api_user").status_code == 404
+
+    res = client.post("/v1/acquire?account_id=test_api_user")
     assert res.status_code == 200
     data = res.json()
     assert data["account_id"] == "test_api_user"
     assert "proxy_url" in data
     assert "node_name" in data
+
+    # GET now returns the existing binding and must not create a new one.
+    res = client.get("/v1/acquire?account_id=test_api_user")
+    assert res.status_code == 200
+    assert res.json()["node_name"] == data["node_name"]
 
 
 def test_export_grok2api_endpoint(client):

@@ -8,9 +8,10 @@ from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
 from core.models import (
     ProxyNode, LeaseInfo, EgressType, HealthStatus,
-    RegistrationLease, BatteryEventReport, BatteryEventType, RelayMode
+    RegistrationLease, BatteryEventReport, BatteryEventType
 )
 from core.storage import Storage
+from core.locks import BINDING_WRITE_LOCK
 
 
 class Router:
@@ -35,8 +36,15 @@ class Router:
         `service` is normalized to "default" for both lookup and persistence so that a
         caller omitting the service can never pick up another service's binding.
         `exclude_node` prevents a forced rebind from landing back on the failing node.
+
+        A caller-supplied region/egress filter is a *per-call* constraint, not a reason to
+        rewrite an existing binding: when a healthy binding exists but does not satisfy the
+        filter, a constrained node is returned ephemerally and the stored binding is left
+        untouched. Only an explicit `force_rebind` (or the absence of any binding) persists
+        a new mapping, so a plain read can never silently re-point an account.
         """
         svc = service or "default"
+        binding_conflict = False
 
         # 1. Check existing lease if not forcing rebind
         if not force_rebind:
@@ -55,6 +63,8 @@ class Router:
                             egress_type=node.egress_type,
                             assigned_at=alloc["allocated_at"]
                         )
+                    # Healthy binding that only fails this call's filter -> keep it.
+                    binding_conflict = True
 
             # 1b. Legacy lease table check
             existing = self.storage.get_lease(account_id)
@@ -64,6 +74,7 @@ class Router:
                 if node and node.status == HealthStatus.HEALTHY.value and node.name != exclude_node:
                     if (not egress_type or node.egress_type == egress_type) and (not region or node.region == region):
                         return existing
+                    binding_conflict = True
 
         # 2. Get eligible candidates (strict healthy first)
         candidates = self.storage.list_nodes(region=region, egress_type=egress_type, status=HealthStatus.HEALTHY.value)
@@ -100,8 +111,9 @@ class Router:
 
         now_str = datetime.now().isoformat()
 
-        # 4. Ephemeral/anonymous requests do NOT pollute database
-        if account_id.startswith("anon_"):
+        # 4. Ephemeral cases do NOT pollute database: anonymous accounts, and accounts
+        # whose stored binding only failed this call's constraint filter.
+        if account_id.startswith("anon_") or binding_conflict:
             return LeaseInfo(
                 account_id=account_id,
                 node_name=selected_node.name,
@@ -124,6 +136,10 @@ class Router:
         When a node's circuit breaker trips OPEN (dead), proactively rehome
         all attached account leases to healthy backup nodes in the same region.
         """
+        with BINDING_WRITE_LOCK:
+            return self._rehome_leases_for_node(broken_node_name)
+
+    def _rehome_leases_for_node(self, broken_node_name: str) -> Dict[str, Any]:
         leases = self.storage.get_leases_for_node(broken_node_name)
         stale_allocations = self.storage.get_allocations_for_node(broken_node_name)
         if not leases and not stale_allocations:
@@ -170,18 +186,24 @@ class Router:
             if acc in lease_accounts:
                 self.storage.set_lease(acc, new_node.name)
 
-            self.storage.record_circuit_event(
-                node_name=broken_node_name,
-                from_state=HealthStatus.DEAD.value,
-                to_state="rehomed",
-                reason=f"auto_rehome_to_{new_node.name}"
-            )
             rehomed_details.append({
                 "account_id": acc,
                 "from_node": broken_node_name,
                 "to_node": new_node.name,
                 "new_proxy_url": new_node.proxy_url
             })
+
+        # One event per rehome sweep, not one per account: the audit trail only needs to
+        # record that the node was drained, and per-account rows would grow the event
+        # table with the number of bound accounts.
+        if rehomed_details:
+            target_nodes = sorted({d["to_node"] for d in rehomed_details})
+            self.storage.record_circuit_event(
+                node_name=broken_node_name,
+                from_state=HealthStatus.DEAD.value,
+                to_state="rehomed",
+                reason=f"auto_rehome_{len(rehomed_details)}_accounts_to_{len(target_nodes)}_nodes"
+            )
 
         # Rewrite universal allocations still pointing at the dead node (service preserved)
         allocation_records: List[Tuple[str, str, str, str]] = [
@@ -237,7 +259,24 @@ class Router:
         Dedicated anti-sybil egress assignment for batch account registration bots.
         Ensures that allocated exit IPs have not been used for the same target service
         within the cooldown window.
+
+        The choose-then-lock window is serialized: without it, two concurrent registrations
+        both pass the cooldown filter and receive the same exit, which is exactly the reuse
+        this endpoint exists to prevent.
         """
+        with BINDING_WRITE_LOCK:
+            return self._acquire_for_registration(
+                account_id, target_service, region, egress_type, cooldown_seconds
+            )
+
+    def _acquire_for_registration(
+        self,
+        account_id: str,
+        target_service: str,
+        region: Optional[str],
+        egress_type: Optional[str],
+        cooldown_seconds: int = 1800
+    ) -> Optional[RegistrationLease]:
         self.storage.clean_expired_cooldowns()
 
         # 1. Fetch eligible candidates
@@ -256,16 +295,19 @@ class Router:
         if not candidates:
             return None
 
-        # 2. Filter out candidates whose exit_ip is currently in cooldown for target_service
+        # 2. Only nodes with a known exit IP can be protected by an IP cooldown. Nodes
+        # that have not been probed yet would bypass the filter entirely and lock their
+        # shared mesh host, so they are excluded until a probe reveals their exit.
+        candidates = [c for c in candidates if c.exit_ip]
+        if not candidates:
+            return None
+
         cooled_exit_ips = {
             c.exit_ip for c in self.storage.get_active_cooldowns(target_service=target_service)
             if c.exit_ip
         }
 
-        clean_candidates = [
-            c for c in candidates
-            if not c.exit_ip or c.exit_ip not in cooled_exit_ips
-        ]
+        clean_candidates = [c for c in candidates if c.exit_ip not in cooled_exit_ips]
 
         if not clean_candidates:
             # Every healthy exit is cooling down for this target service.
@@ -282,9 +324,8 @@ class Router:
 
         # 4. Lock IP cooldown
         now_str = datetime.now().isoformat()
-        ip_to_lock = selected_node.exit_ip or selected_node.host
         cooldown_record = self.storage.add_ip_cooldown(
-            exit_ip=ip_to_lock,
+            exit_ip=selected_node.exit_ip,
             target_service=target_service,
             node_name=selected_node.name,
             cooldown_seconds=cooldown_seconds
@@ -317,6 +358,10 @@ class Router:
         Handles battery degradation / 429 / 401 events reported by downstream battery consumers
         (e.g., grok2api, cpa-manager-plus). Performs automatic battery swapping (lease rebind).
         """
+        with BINDING_WRITE_LOCK:
+            return self._handle_battery_event(report)
+
+    def _handle_battery_event(self, report: BatteryEventReport) -> Dict[str, Any]:
         event_id = self.storage.record_battery_event(report)
         new_lease = None
         svc = report.target_service or "default"

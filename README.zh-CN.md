@@ -90,7 +90,7 @@ pip install -r requirements.txt
 ```
 10 秒内完整跑通全池拓扑校验、双栈实时探活、断路器熔断自愈演练与 `:9101` 正向网关转发验证。
 
-### 3. 执行自动化测试 (84 项全绿)
+### 3. 执行自动化测试 (99 项全绿)
 ```bash
 .venv/bin/pytest -v
 ```
@@ -104,9 +104,15 @@ pip install -r requirements.txt
 - 控制台界面：`http://127.0.0.1:9100/dashboard`
 - Prometheus 指标：`http://127.0.0.1:9100/metrics`
 
-> **网络暴露防护：** 两个监听器默认仅绑定 `127.0.0.1`，且控制面本身不含用户鉴权。
-> 如需对外暴露，必须同时设置 `HOST=0.0.0.0` 与 `IP_POOL_API_TOKEN=<密钥>`；
-> 设置后所有 `/v1/*` 接口都要求携带 `Authorization: Bearer <密钥>`。
+> **网络暴露防护：** 两个监听器默认仅绑定 `127.0.0.1`。设置 `IP_POOL_API_TOKEN=<密钥>` 后，
+> **除 `/health` 外的所有端点**都要求携带密钥（`Authorization: Bearer <密钥>`、`?token=<密钥>`，
+> 或 dashboard 握手写入的 HttpOnly Cookie）。浏览器只需访问一次 `/dashboard?token=<密钥>`，
+> 密钥即被换成 Cookie，页面后续同源请求自动携带；`/metrics` 同样受保护（Prometheus 抓取请用
+> `Authorization: Bearer <密钥>`）。
+>
+> **节点清单对齐：** 启动时，数据库中已存在但 `config/nodes.yaml` 已移除的节点会被标记为 `dead`
+> （保留账号绑定，交由自愈重签迁移）。**破坏性删除需显式开启**：`IP_POOL_PRUNE_MISSING_NODES=1`，
+> 且配置文件至少含 10 个节点（避免配置被截断时误清空注册表）。
 - 统一正向网关：`http://127.0.0.1:9101`
 
 ---
@@ -139,7 +145,8 @@ curl -x http://bob:secret@127.0.0.1:9101 \
 | `GET` | `/metrics` | 云原生 Prometheus OpenMetrics 导出端点 |
 | `GET` | `/v1/stats` | 节点总数、健康度分类与区域分布统计 |
 | `GET` | `/v1/nodes` | 查询节点列表（支持 `region`, `egress_type`, `status` 过滤） |
-| `GET` | `/v1/acquire` | 获取账号绑定的粘性节点租约 |
+| `GET` | `/v1/acquire` | 只读查询已有的粘性绑定（无绑定时返回 `404`，不会创建） |
+| `POST` | `/v1/acquire` | 创建/返回粘性绑定（`account_id`, `region`, `egress_type`, `service`） |
 | `POST` | `/v1/probe` | 触发全池异步并发健康探测 |
 | `GET` | `/v1/circuit/events` | 查询断路器状态变迁与自愈重签审计日志 |
 | `POST` | `/v1/circuit/reset` | 运维人员手动复位节点断路器至 `healthy` |
@@ -176,7 +183,7 @@ ip-pool/
 │   ├── gemini_adapter.py       # Gemini Web 逆向出站适配器
 │   ├── playwright_pool.py      # Python 爬虫与 Playwright 代理池 SDK
 │   └── tetherpool_client.py    # 控制面零依赖 HTTP 客户端
-├── tests/                      # 隔离沙箱自动化单元测试 (84 项全绿)
+├── tests/                      # 隔离沙箱自动化单元测试 (99 项全绿)
 ├── demo.py                     # 端到端交互式全功能演练脚本
 ├── requirements.txt            # Python 依赖清单
 └── start.sh                    # 双进程后台守护启停脚本

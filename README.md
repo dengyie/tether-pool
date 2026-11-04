@@ -88,7 +88,7 @@ pip install -r requirements.txt
 ```
 Verifies pool topology, multi-region probing, circuit breaker self-healing, forward proxy gateway tunneling, and adapter exports in ~10 seconds.
 
-### 3. Run Unit Tests (84 Tests Passing)
+### 3. Run Unit Tests (99 Tests Passing)
 ```bash
 .venv/bin/pytest -v
 ```
@@ -102,10 +102,18 @@ Verifies pool topology, multi-region probing, circuit breaker self-healing, forw
 - Web Dashboard: `http://127.0.0.1:9100/dashboard`
 - Prometheus Metrics: `http://127.0.0.1:9100/metrics`
 
-> **Network exposure:** both listeners bind to `127.0.0.1` by default and the control plane
-> has no built-in user auth. To expose it beyond loopback, set `HOST=0.0.0.0` **and**
-> `IP_POOL_API_TOKEN=<secret>` — every `/v1/*` endpoint then requires
-> `Authorization: Bearer <secret>`.
+> **Network exposure:** both listeners bind to `127.0.0.1` by default. When
+> `IP_POOL_API_TOKEN=<secret>` is set, **every endpoint except `/health`** requires the token
+> (`Authorization: Bearer <secret>`, `?token=<secret>`, or the HttpOnly cookie set by the
+> dashboard handshake). Browsers navigate to `/dashboard?token=<secret>` once; the token is
+> exchanged for a cookie so the page's same-origin fetches keep working. `/metrics` is
+> protected too (use `Authorization: Bearer <secret>` for Prometheus scraping).
+>
+> **Node inventory reconciliation:** on startup, nodes present in the database but missing
+> from `config/nodes.yaml` are marked `dead` by default (bindings are preserved so the
+> self-healing re-home path can move them). Destructive deletion requires explicit opt-in:
+> `IP_POOL_PRUNE_MISSING_NODES=1` (and at least 10 configured nodes, so a truncated config
+> cannot wipe the registry).
 - Forward Proxy Gateway: `http://127.0.0.1:9101`
 
 ---
@@ -138,7 +146,8 @@ curl -x http://bob:secret@127.0.0.1:9101 \
 | `GET` | `/metrics` | Cloud-native Prometheus OpenMetrics |
 | `GET` | `/v1/stats` | Real-time node count, health breakdown, and distribution |
 | `GET` | `/v1/nodes` | List all nodes with filters (`region`, `egress_type`, `status`) |
-| `GET` | `/v1/acquire` | Acquire sticky proxy lease (`account_id`, `region`, `egress_type`) |
+| `GET` | `/v1/acquire` | Read the existing sticky binding (`404` when none — never mutates state) |
+| `POST` | `/v1/acquire` | Create/return the sticky binding (`account_id`, `region`, `egress_type`, `service`) |
 | `POST` | `/v1/probe` | Trigger concurrent background probe across all nodes |
 | `GET` | `/v1/circuit/events` | Audit log of circuit transitions and lease migrations |
 | `POST` | `/v1/circuit/reset` | Operator manual reset of a node to `healthy` |
@@ -175,7 +184,7 @@ ip-pool/
 │   ├── gemini_adapter.py       # Gemini Web reverse routing adapter
 │   ├── playwright_pool.py      # Python crawler & Playwright pool SDK
 │   └── tetherpool_client.py    # Zero-dependency HTTP client for the control plane
-├── tests/                      # Pytest isolated unit test suite (84 passing tests)
+├── tests/                      # Pytest isolated unit test suite (99 passing tests)
 ├── demo.py                     # Interactive end-to-end verification showcase
 ├── requirements.txt            # Python dependencies
 └── start.sh                    # Dual-process background daemon manager

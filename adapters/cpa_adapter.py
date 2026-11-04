@@ -6,11 +6,11 @@ Generates proxy definitions and credential-level sticky routing for CPA.
 import os
 import sys
 import yaml
-from typing import List, Dict, Any, Optional
+from typing import Dict, Any, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.storage import Storage
-from core.models import HealthStatus, EgressType
+from core.models import HealthStatus
 
 
 class CpaAdapter:

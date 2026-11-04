@@ -13,7 +13,6 @@ Each test pins down one previously-broken behaviour so it cannot silently regres
 """
 
 import os
-import tempfile
 
 import pytest
 

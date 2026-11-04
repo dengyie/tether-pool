@@ -221,6 +221,15 @@
                         <option value="vietnam">🇻🇳 偏好：越南 (Vietnam)</option>
                         <option value="switzerland">🇨🇭 偏好：瑞士 (Switzerland)</option>
                     </select>
+                    <select id="sim-egress" class="px-2.5 py-1.5 bg-dark-700 border border-slate-700 rounded-lg text-xs text-slate-200 focus:outline-none">
+                        <option value="">不限出口类型</option>
+                        <option value="warp_ipv6">🌩️ WARP IPv6</option>
+                        <option value="native_ipv4">🌐 原生 IPv4</option>
+                        <option value="native_ipv6">🌐 原生 IPv6</option>
+                        <option value="clash_proxy">🧩 Clash / 3X-UI</option>
+                    </select>
+                    <input type="text" id="sim-service" placeholder="服务名 (默认 default)"
+                        class="px-3 py-1.5 bg-dark-700 border border-slate-700 rounded-lg text-xs text-slate-200 placeholder-slate-500 focus:outline-none w-full sm:w-36">
                     <button onclick="simulateAcquire()" class="px-3.5 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-medium rounded-lg transition shadow">
                         计算租约
                     </button>
@@ -546,13 +555,18 @@
         async function simulateAcquire() {
             const account = document.getElementById('sim-account').value.trim();
             const region = document.getElementById('sim-region').value;
+            const egress = document.getElementById('sim-egress').value;
+            const service = document.getElementById('sim-service').value.trim();
             if (!account) return alert('请输入 Account ID');
 
+            // POST: acquiring a binding mutates state; GET /v1/acquire only reads it.
             let url = `/v1/acquire?account_id=${encodeURIComponent(account)}`;
             if (region) url += `&region=${encodeURIComponent(region)}`;
+            if (egress) url += `&egress_type=${encodeURIComponent(egress)}`;
+            if (service) url += `&service=${encodeURIComponent(service)}`;
 
             try {
-                const res = await fetch(url);
+                const res = await fetch(url, { method: 'POST' });
                 if (!res.ok) throw new Error(await res.text());
                 const lease = await res.json();
                 currentLease = lease;

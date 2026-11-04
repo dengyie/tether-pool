@@ -50,7 +50,8 @@ def test_extract_routing_headers(temp_gateway):
     acc2, reg2, egr2, svc2 = gateway._extract_routing_headers(h2, "127.0.0.1")
     assert acc2 == "bob_user"
     assert reg2 == "singapore"
-    assert egr2 == "warp_ipv6"
+    # No implicit egress default: an omitted type must not re-point an existing binding
+    assert egr2 is None
     assert svc2 is None
 
     # 3. Anonymous fallback generates distributed ephemeral id
@@ -81,6 +82,98 @@ async def test_gateway_connect_no_nodes(temp_gateway):
     await server.wait_closed()
 
     assert b"503 Service Unavailable" in resp
+
+
+@pytest.mark.asyncio
+async def test_gateway_retries_on_upstream_connect_failure(temp_gateway, monkeypatch):
+    """A request-time connect failure must be recorded as a probe failure and the
+    request retried on a different node instead of returning 502 for a whole interval."""
+    gateway, storage, router = temp_gateway
+
+    for i in range(2):
+        storage.upsert_node(ProxyNode(
+            name=f"gw-retry-{i}",
+            host="10.144.144.3",
+            port=10881 + i,
+            region="tokyo",
+            egress_type=EgressType.WARP_IPV6.value,
+            status=HealthStatus.HEALTHY.value,
+            exit_ip=f"2a09:bac5:9::{i}",
+        ))
+
+    # A local stand-in for the tunnelled origin
+    async def echo_handler(reader, writer):
+        while True:
+            data = await reader.read(4096)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+        writer.close()
+
+    echo_server = await asyncio.start_server(echo_handler, "127.0.0.1", 0)
+    echo_port = echo_server.sockets[0].getsockname()[1]
+
+    attempts = []
+    captured = {}
+    real_connect = gateway.connect_upstream_adaptive
+
+    async def flaky_connect(node, target_host, target_port, timeout=15.0):
+        attempts.append(node.name)
+        if len(attempts) == 1:
+            raise OSError("simulated mesh failure")
+        reader, writer = await asyncio.open_connection("127.0.0.1", echo_port)
+        captured["writer"] = writer
+        return reader, writer
+
+    monkeypatch.setattr(gateway, "connect_upstream_adaptive", flaky_connect)
+
+    server = await asyncio.start_server(gateway.handle_client, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(
+        b"CONNECT example.com:443 HTTP/1.1\r\n"
+        b"Host: example.com:443\r\n"
+        b"X-Account-Id: retry-acct\r\n\r\n"
+    )
+    await writer.drain()
+
+    resp = await reader.readuntil(b"\r\n\r\n")
+    assert b"200 Connection Established" in resp
+    assert attempts == ["gw-retry-0", "gw-retry-1"] or (
+        len(attempts) == 2 and attempts[0] != attempts[1]
+    )
+
+    # The failing node was reported to the circuit breaker immediately
+    failed = storage.get_node(attempts[0])
+    assert failed.consecutive_failures >= 1
+    assert failed.status == HealthStatus.DEGRADED.value
+
+    # Tunnel is functional end-to-end
+    writer.write(b"ping-through-tunnel")
+    await writer.drain()
+    assert await reader.read(64) == b"ping-through-tunnel"
+
+    # Disconnect: the upstream socket must be released, not leaked
+    writer.close()
+    await writer.wait_closed()
+    await asyncio.sleep(0.1)
+    assert captured["writer"].is_closing()
+
+    server.close()
+    await server.wait_closed()
+    echo_server.close()
+    await echo_server.wait_closed()
+    assert real_connect is not None
+
+
+def test_extract_routing_headers_no_implicit_egress_default(temp_gateway):
+    """An omitted egress type must not silently re-point a stored binding."""
+    gateway, _storage, _router = temp_gateway
+    acc, region, egress, service = gateway._extract_routing_headers({}, "127.0.0.1")
+    assert egress is None
+    assert service is None
 
 
 def test_parse_host_port():

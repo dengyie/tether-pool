@@ -3,7 +3,7 @@ tests/test_anti_sybil_and_battery.py - Tests for Registration Anti-Sybil Cooldow
 """
 
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime
 from starlette.testclient import TestClient
 
 from core.models import (

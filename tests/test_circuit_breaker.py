@@ -118,12 +118,12 @@ def test_lease_rehoming_on_node_trip(temp_env):
     assert new_lease_a.node_name == "tokyo-node-backup"
     assert new_lease_b.node_name == "tokyo-node-backup"
 
-    # Verify circuit events table has the rehomed events attributed to the broken node
+    # One audit event per rehome sweep, not one per re-homed account
     events = storage.list_circuit_events(limit=10)
     rehome_events = [e for e in events if e.to_state == "rehomed"]
-    assert len(rehome_events) == 2
+    assert len(rehome_events) == 1
     assert rehome_events[0].node_name == "tokyo-node-primary"
-    assert "auto_rehome_to_tokyo-node-backup" in rehome_events[0].reason
+    assert "auto_rehome_2_accounts" in rehome_events[0].reason
 
 
 def test_manual_circuit_reset(temp_env):

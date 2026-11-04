@@ -27,7 +27,7 @@ if not os.environ.get("IP_POOL_DEMO_USE_LIVE_DB"):
 from core.storage import Storage
 from core.prober import Prober
 from core.router import Router
-from core.models import EgressType, HealthStatus, ProbeResult
+from core.models import ProbeResult
 from core.metrics import MetricsCollector
 from gateway.server import ForwardProxyGateway
 from api.server import load_initial_nodes

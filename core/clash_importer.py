@@ -14,7 +14,7 @@ import yaml
 import json
 import urllib.request
 import urllib.error
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 
 from core.models import ProxyNode, EgressType, HealthStatus
 

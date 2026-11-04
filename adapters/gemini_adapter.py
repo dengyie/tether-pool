@@ -5,7 +5,7 @@ Enforces regional affinity (Tokyo, Singapore, US-West) and session persistence f
 
 import os
 import sys
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

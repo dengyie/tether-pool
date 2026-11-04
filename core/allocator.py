@@ -13,11 +13,12 @@ from typing import List, Dict, Optional, Any, Tuple
 from urllib.parse import urlparse, quote
 
 from core.models import (
-    ProxyNode, HealthStatus, EgressType,
+    ProxyNode, HealthStatus,
     BatchAllocationRequest, BatchAllocationResponse,
     AccountAllocationItem, AllocationStrategy
 )
 from core.storage import Storage
+from core.locks import BINDING_WRITE_LOCK
 
 
 class ConsistentHashRing:
@@ -141,7 +142,19 @@ class AllocationEngine:
         Batch-allocates a list of accounts (e.g. 2,100 grok2api accounts) across available nodes.
         Guarantees minimal variance (balanced spread) across all available IPv6/IPv4 exits.
         Enforces max_accounts_per_ip capacity constraints.
+
+        Occupancy is read, then bindings are written; the whole window is serialized so
+        concurrent HTTP batches cannot both observe the same pre-write state and overfill
+        an exit (`api/server.py` endpoints are sync `def` and run in a threadpool).
         """
+        with BINDING_WRITE_LOCK:
+            return self._batch_allocate(request, gateway_base)
+
+    def _batch_allocate(
+        self,
+        request: BatchAllocationRequest,
+        gateway_base: str = "http://127.0.0.1:9101"
+    ) -> BatchAllocationResponse:
         if not request.accounts:
             return BatchAllocationResponse(
                 service=request.service,
@@ -314,6 +327,20 @@ class AllocationEngine:
         On-demand acquisition for a single account.
         Checks existing allocation; if missing, picks least loaded eligible node.
         """
+        with BINDING_WRITE_LOCK:
+            return self._acquire_single(
+                service, account_id, egress_preference, region, force_rebalance, gateway_base
+            )
+
+    def _acquire_single(
+        self,
+        service: str,
+        account_id: str,
+        egress_preference: Optional[str] = None,
+        region: Optional[str] = None,
+        force_rebalance: bool = False,
+        gateway_base: str = "http://127.0.0.1:9101"
+    ) -> AccountAllocationItem:
         if not force_rebalance:
             existing = self.storage.get_allocation(service, account_id)
             if existing:

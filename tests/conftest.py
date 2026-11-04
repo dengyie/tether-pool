@@ -2,8 +2,6 @@
 tests/conftest.py - Pytest fixtures and test environment isolation
 """
 
-import os
-import tempfile
 import pytest
 from core.storage import Storage
 from core.router import Router

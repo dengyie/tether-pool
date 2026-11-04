@@ -172,13 +172,31 @@
 | `ip_pool_node_count` | Gauge | `region`, `egress_type`, `status` | 各区域不同状态的节点数量分布 |
 | `ip_pool_probe_duration_seconds` | Histogram | `region`, `egress_type` | 探测 RTT 延迟直方图（分桶：0.5, 1, 2, 5, 10, 15s） |
 | `ip_pool_probes_total` | Counter | `region`, `status` (`success`/`failure`) | 探活请求总次数计数 |
-| `ip_pool_leases_active` | Gauge | `region`, `egress_type` | 当前数据库中生效的粘性租约总数 |
+| `ip_pool_account_bindings` | Gauge | `region`, `egress_type` | 当前生效的账号→出口绑定总数（读 `account_allocations`，非 legacy `leases`） |
 | `ip_pool_circuit_transitions_total` | Counter | `region`, `from_state`, `to_state` | 断路器状态变迁计数（熔断告警核心指标） |
 | `ip_pool_gateway_requests_total` | Counter | `region`, `status_code` | 统一正向网关 (:9101) 转发的请求总数 |
 
 ---
 
-### 4.5 上游适配器矩阵（Adapters Matrix）
+### 4.5 一致性、并发与恢复不变量（生产约束）
+
+以下不变量是生产可用性的底线，任何改动都必须保持成立（均有回归测试守护，见 `tests/test_hardening.py`）：
+
+| 不变量 | 语义 | 实现位置 |
+| :--- | :--- | :--- |
+| **单一权威绑定源** | `account_allocations` 为唯一权威绑定表；legacy `leases` 仅为 `default` 命名空间的镜像。释放某服务最后一个绑定时**同一事务**内删除 lease 镜像，避免“已释放却仍被粘住”。 | `core/storage.py::delete_allocation` |
+| **历史数据收敛** | 启动时把无对应 allocation 的孤儿 lease 回填为 `default` 绑定（幂等），使容量核算、监控、自愈三方口径一致。 | `core/storage.py::migrate_legacy_leases`（由 `api/server.py::load_initial_nodes` 调用） |
+| **临界区串行化** | 分配/注册均为“先读后写”，必须整体串行。FastAPI 在 40 线程池中执行同步端点，无锁会超额占用同一出口（实测 5 容量被放行 10 个）并使注册重复出口（实测 2 个出口发出 5 个租约）。 | `core/locks.py::BINDING_WRITE_LOCK` |
+| **启动对齐非破坏性** | 配置文件中缺失的节点默认仅标记 `dead`，绑定保留交由自愈重签；破坏性删除需 `IP_POOL_PRUNE_MISSING_NODES=1` 且配置节点数 ≥ 10。 | `api/server.py::load_initial_nodes` |
+| **绑定只读语义** | 调用方传入的 `region`/`egress_type` 是**本次调用**约束，不匹配时返回临时节点且不覆盖已存绑定；只有显式 `force_rebind` 才写入。`GET /v1/acquire` 只读，无绑定返回 `404`。 | `core/router.py::acquire_for_account`、`api/server.py` |
+| **注册出口可冷却** | 无 `exit_ip` 的未探测节点不得参与注册分配，否则会绕过 IP 冷却并锁死共享 mesh 主机；全池冷却时返回 `503` 而非复用烧毁出口。 | `core/router.py::acquire_for_registration` |
+| **请求期故障反馈** | 网关 CONNECT/透传建连失败立即记为探测失败（无需等整个探测周期）并换节点重试一次；`503`=池内无可用节点，`502`=上游建连失败，避免误判。 | `gateway/server.py::_open_upstream` |
+| **鉴权面完整** | 设置 `IP_POOL_API_TOKEN` 后，除 `/health` 外所有端点（含 `/metrics`）受保护；浏览器通过 `/dashboard?token=` 换取 HttpOnly Cookie 完成握手。 | `api/server.py::bearer_auth_middleware` |
+| **追加表有界** | `probe_history`、`circuit_events`、`battery_events` 统一按 `IP_POOL_PROBE_HISTORY_KEEP_DAYS`（默认 7 天）裁剪，避免无限增长。 | `core/storage.py::prune_event_tables` |
+
+---
+
+### 4.6 上游适配器矩阵（Adapters Matrix）
 
 1. **`adapters/grok2api_adapter.py`（增强版）**：
    - 增强：在当前均分离散 2,103 个账号至 100 个 WARP IPv6 出口的基础上，增加增量模式（只同步新增账号，保留已有映射）。

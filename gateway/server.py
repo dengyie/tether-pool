@@ -7,7 +7,6 @@ import asyncio
 import base64
 import os
 import sys
-import re
 import socket
 import struct
 import urllib.parse
@@ -17,7 +16,7 @@ from typing import Optional, Tuple, Dict
 # Ensure project root is in sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.models import ProxyNode, LeaseInfo, EgressType, RelayMode
+from core.models import ProxyNode, RelayMode, ProbeResult
 from core.storage import Storage
 from core.router import Router
 
@@ -39,6 +38,10 @@ INTERNAL_ROUTING_HEADERS = frozenset({
     "proxy-connection",
     "connection",
 })
+
+
+class NoPoolNodesError(RuntimeError):
+    """No usable node in the pool: a capacity condition (503), not an upstream fault."""
 
 
 def _is_internal_header(name: str) -> bool:
@@ -360,7 +363,9 @@ class ForwardProxyGateway:
             account_id = f"anon_{uuid.uuid4().hex[:8]}"
 
         region = headers_dict.get("x-region") or auth_region
-        egress_type = headers_dict.get("x-egress-type") or auth_egress or EgressType.WARP_IPV6.value
+        # No implicit egress filter: an unspecified type must not re-point an account
+        # that is already bound to a non-WARP exit. Callers that need WARP ask for it.
+        egress_type = headers_dict.get("x-egress-type") or auth_egress
         service = headers_dict.get("x-service") or headers_dict.get("x-target-service") or auth_service
 
         return account_id, region, egress_type, service
@@ -418,6 +423,57 @@ class ForwardProxyGateway:
                 # Both direct and chained relay failed; emergency bridge via relay hop directly as egress
                 return await socks5_connect(relay_hop.host, relay_hop.port, target_host, target_port, timeout=timeout)
 
+    async def _open_upstream(
+        self,
+        account_id: str,
+        region: Optional[str],
+        egress_type: Optional[str],
+        service: Optional[str],
+        target_host: str,
+        target_port: int,
+    ):
+        """
+        Opens the upstream SOCKS5 tunnel for an account, retrying once on a different exit.
+
+        A request-time connect failure is the fastest signal that a node is broken, so it
+        is recorded as a probe failure (letting the circuit breaker react immediately
+        instead of waiting up to one full sweep) and the request is retried through
+        another node rather than returning 502 for the rest of the probe interval.
+        """
+        excluded = None
+        last_err: Optional[Exception] = None
+
+        for attempt in range(2):
+            lease = self.router.acquire_for_account(
+                account_id=account_id,
+                region=region,
+                egress_type=egress_type,
+                service=service,
+                force_rebind=attempt > 0,
+                exclude_node=excluded,
+            )
+            if not lease:
+                raise NoPoolNodesError("No available proxy nodes in IP pool")
+
+            node = self.storage.get_node(lease.node_name)
+            if not node:
+                raise NoPoolNodesError("Target proxy node not found in registry")
+
+            try:
+                return await self.connect_upstream_adaptive(
+                    node=node, target_host=target_host, target_port=target_port
+                )
+            except Exception as exc:
+                last_err = exc
+                excluded = node.name
+                self.storage.update_probe_result(ProbeResult(
+                    node_name=node.name,
+                    success=False,
+                    error=f"gateway_connect_failed: {exc}"[:120],
+                ))
+
+        raise last_err if last_err else RuntimeError("Upstream connection failed")
+
     async def handle_client(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
         peer = client_writer.get_extra_info("peername")
         client_ip = peer[0] if peer else "127.0.0.1"
@@ -449,30 +505,7 @@ class ForwardProxyGateway:
             # 2. Extract routing constraints
             account_id, region, egress_type, service = self._extract_routing_headers(headers_dict, client_ip)
 
-            # 3. Resolve sticky lease
-            lease = self.router.acquire_for_account(
-                account_id=account_id,
-                region=region,
-                egress_type=egress_type,
-                service=service
-            )
-            if not lease:
-                err_resp = b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\r\nNo available proxy nodes in IP pool\r\n"
-                client_writer.write(err_resp)
-                await client_writer.drain()
-                client_writer.close()
-                return
-
-            # Extract upstream node host and port
-            node = self.storage.get_node(lease.node_name)
-            if not node:
-                err_resp = b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\n\r\nTarget proxy node not found in registry\r\n"
-                client_writer.write(err_resp)
-                await client_writer.drain()
-                client_writer.close()
-                return
-
-            # 4. Handle HTTP CONNECT (HTTPS)
+            # 3. Handle HTTP CONNECT (HTTPS)
             if method.upper() == "CONNECT":
                 try:
                     target_host, target_port = parse_host_port(target, default_port=443)
@@ -484,11 +517,15 @@ class ForwardProxyGateway:
                     return
 
                 try:
-                    remote_reader, remote_writer = await self.connect_upstream_adaptive(
-                        node=node,
-                        target_host=target_host,
-                        target_port=target_port
+                    remote_reader, remote_writer = await self._open_upstream(
+                        account_id, region, egress_type, service, target_host, target_port
                     )
+                except NoPoolNodesError as pool_err:
+                    err_resp = f"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\r\n{pool_err}\r\n".encode()
+                    client_writer.write(err_resp)
+                    await client_writer.drain()
+                    client_writer.close()
+                    return
                 except Exception as conn_err:
                     err_resp = f"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\n\r\nFailed to connect upstream SOCKS5 node: {conn_err}\r\n".encode()
                     client_writer.write(err_resp)
@@ -496,14 +533,17 @@ class ForwardProxyGateway:
                     client_writer.close()
                     return
 
-                # Send 200 Connection Established to client
-                client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                await client_writer.drain()
+                # The upstream socket belongs to this request from the moment it is open:
+                # close it on every exit path, including a client disconnect in the window
+                # before the 200 response has been written.
+                try:
+                    client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    await client_writer.drain()
+                    await pump_streams(client_reader, client_writer, remote_reader, remote_writer)
+                finally:
+                    remote_writer.close()
 
-                # Pump streams
-                await pump_streams(client_reader, client_writer, remote_reader, remote_writer)
-
-            # 5. Handle standard HTTP GET/POST/etc.
+            # 4. Handle standard HTTP GET/POST/etc.
             else:
                 parsed_url = urllib.parse.urlsplit(target)
                 raw_host = parsed_url.netloc or headers_dict.get("host", "")
@@ -521,11 +561,15 @@ class ForwardProxyGateway:
                     path_and_query += f"?{parsed_url.query}"
 
                 try:
-                    remote_reader, remote_writer = await self.connect_upstream_adaptive(
-                        node=node,
-                        target_host=target_host,
-                        target_port=target_port
+                    remote_reader, remote_writer = await self._open_upstream(
+                        account_id, region, egress_type, service, target_host, target_port
                     )
+                except NoPoolNodesError as pool_err:
+                    err_resp = f"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\r\n{pool_err}\r\n".encode()
+                    client_writer.write(err_resp)
+                    await client_writer.drain()
+                    client_writer.close()
+                    return
                 except Exception as conn_err:
                     err_resp = f"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\n\r\nFailed to connect upstream SOCKS5 node: {conn_err}\r\n".encode()
                     client_writer.write(err_resp)
@@ -533,24 +577,26 @@ class ForwardProxyGateway:
                     client_writer.close()
                     return
 
-                # Reconstruct clean HTTP request without internal headers
-                new_req_lines = [f"{method} {path_and_query} {version}"]
-                for line in lines[1:]:
-                    if ":" in line:
-                        k, _ = line.split(":", 1)
-                        if not _is_internal_header(k):
-                            new_req_lines.append(line)
-                new_req_lines.append("Connection: close")
-                new_req_payload = "\r\n".join(new_req_lines) + "\r\n\r\n"
+                try:
+                    # Reconstruct clean HTTP request without internal headers
+                    new_req_lines = [f"{method} {path_and_query} {version}"]
+                    for line in lines[1:]:
+                        if ":" in line:
+                            k, _ = line.split(":", 1)
+                            if not _is_internal_header(k):
+                                new_req_lines.append(line)
+                    new_req_lines.append("Connection: close")
+                    new_req_payload = "\r\n".join(new_req_lines) + "\r\n\r\n"
 
-                remote_writer.write(new_req_payload.encode("iso-8859-1"))
-                await remote_writer.drain()
+                    remote_writer.write(new_req_payload.encode("iso-8859-1"))
+                    await remote_writer.drain()
 
-                # Pump streams
-                await pump_streams(client_reader, client_writer, remote_reader, remote_writer)
+                    await pump_streams(client_reader, client_writer, remote_reader, remote_writer)
+                finally:
+                    remote_writer.close()
 
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[-] Gateway client error ({client_ip}): {e}")
         finally:
             # Every exit path (early returns included) must release the client socket.
             try:

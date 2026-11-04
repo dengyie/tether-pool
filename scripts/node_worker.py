@@ -10,7 +10,6 @@ import json
 import subprocess
 import time
 import base64
-import urllib.request
 import datetime
 
 WGCF_BIN = os.environ.get("WGCF_BIN", "/usr/local/bin/wgcf")

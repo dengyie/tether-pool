@@ -7,7 +7,7 @@ import yaml
 import asyncio
 from contextlib import asynccontextmanager
 from typing import Optional, List
-from fastapi import FastAPI, Query, BackgroundTasks, HTTPException, Body, Request
+from fastapi import FastAPI, Query, BackgroundTasks, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, HTMLResponse, RedirectResponse, JSONResponse
 
@@ -27,14 +27,19 @@ from adapters.cpa_adapter import CpaAdapter
 CONFIG_FILE = os.environ.get("IP_POOL_CONFIG", os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "nodes.yaml"))
 DASHBOARD_HTML = os.path.join(os.path.dirname(os.path.dirname(__file__)), "web", "templates", "dashboard.html")
 
-# Optional bearer-token auth for the control plane. When set, every endpoint
-# except /health, /dashboard and / requires "Authorization: Bearer <token>".
+# Optional bearer-token auth for the control plane. When set, /health stays public and
+# every other endpoint requires the token, provided as `Authorization: Bearer <token>`,
+# a `?token=` query parameter, or the `ip_pool_token` cookie set by /dashboard.
 API_TOKEN = os.environ.get("IP_POOL_API_TOKEN", "").strip()
+AUTH_COOKIE_NAME = "ip_pool_token"
 PROBE_INTERVAL_SECONDS = int(os.environ.get("IP_POOL_PROBE_INTERVAL", "300"))
 PROBE_HISTORY_KEEP_DAYS = int(os.environ.get("IP_POOL_PROBE_HISTORY_KEEP_DAYS", "7"))
 # Config files below this node count are treated as incomplete (e.g. a scratch
-# override), so startup never prunes the live registry against them.
+# override), so startup never acts on the registry based on them.
 MIN_CONFIG_NODES_FOR_PRUNE = 10
+# Deleting nodes missing from config also deletes their bindings. Default is to mark them
+# DEAD and let self-healing re-home; set to 1 to accept the destructive cleanup.
+PRUNE_MISSING_NODES = os.environ.get("IP_POOL_PRUNE_MISSING_NODES", "").strip() in ("1", "true", "yes")
 
 storage = Storage()
 router = Router(storage)
@@ -74,13 +79,27 @@ def load_initial_nodes():
             storage.upsert_node(node)
     print(f"[+] Loaded/upserted {len(nodes_data)} nodes into storage.")
 
-    # Remove nodes that vanished from the authority config, but only when the
-    # config plausibly reflects the full pool (prevents wiping the registry on
-    # a truncated scratch file).
+    # Legacy `leases` rows without an allocation predate the universal layer; backfill
+    # them so capacity accounting, monitoring and re-homing share one source of truth.
+    migrated = storage.migrate_legacy_leases()
+    if migrated:
+        print(f"[+] Migrated {migrated} legacy lease(s) into account_allocations.")
+
+    # Nodes absent from the authority config are marked DEAD so the existing self-healing
+    # path can re-home their bindings. Hard deletion is destructive (it cascades to
+    # account_allocations and leases) and therefore requires an explicit opt-in.
     if len(nodes_data) >= MIN_CONFIG_NODES_FOR_PRUNE:
-        kept = storage.prune_nodes_except([item["name"] for item in nodes_data])
-        if kept:
-            print(f"[+] Pruned {len(kept)} nodes absent from {os.path.basename(CONFIG_FILE)}")
+        keep_names = [item["name"] for item in nodes_data]
+        if PRUNE_MISSING_NODES:
+            pruned = storage.prune_nodes_except(keep_names)
+            if pruned:
+                print(f"[!] Deleted {len(pruned)} nodes absent from {os.path.basename(CONFIG_FILE)} "
+                      f"(IP_POOL_PRUNE_MISSING_NODES=1)")
+        else:
+            stale = storage.mark_nodes_missing_as_dead(keep_names)
+            if stale:
+                print(f"[+] Marked {len(stale)} nodes absent from {os.path.basename(CONFIG_FILE)} as DEAD "
+                      f"(bindings preserved for self-healing)")
     return len(nodes_data)
 
 
@@ -95,9 +114,11 @@ async def background_probe_loop():
                     results = await prober.probe_all(concurrency=25)
                     healthy = sum(1 for r in results if r.success)
                     print(f"[+] Scheduled probe finished: {healthy}/{len(results)} nodes healthy.")
-                    pruned = storage.prune_probe_history(keep_days=PROBE_HISTORY_KEEP_DAYS)
-                    if pruned:
-                        print(f"[+] Pruned {pruned} stale probe_history rows (>{PROBE_HISTORY_KEEP_DAYS}d).")
+                    pruned = storage.prune_event_tables(keep_days=PROBE_HISTORY_KEEP_DAYS)
+                    pruned_total = {k: v for k, v in pruned.items() if v}
+                    if pruned_total:
+                        detail = ", ".join(f"{k}={v}" for k, v in pruned_total.items())
+                        print(f"[+] Pruned stale event rows (>{PROBE_HISTORY_KEEP_DAYS}d): {detail}")
         except Exception as e:
             print(f"[-] Scheduled probe error: {e}")
         await asyncio.sleep(PROBE_INTERVAL_SECONDS)
@@ -109,7 +130,10 @@ async def lifespan(app: FastAPI):
     # Initial probe in background on startup
     probe_task = asyncio.create_task(background_probe_loop())
     yield
+    # Await the cancellation so in-flight probe sockets are closed before shutdown
+    # instead of being torn down mid-await during interpreter exit.
     probe_task.cancel()
+    await asyncio.gather(probe_task, return_exceptions=True)
 
 
 app = FastAPI(
@@ -120,14 +144,40 @@ app = FastAPI(
 )
 
 
+def _provided_token(request: Request) -> str:
+    """Token from the Authorization header, cookie, or query parameter."""
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        return auth_header[len("Bearer "):].strip()
+    cookie = request.cookies.get(AUTH_COOKIE_NAME, "")
+    if cookie:
+        return cookie
+    return request.query_params.get("token", "").strip()
+
+
 @app.middleware("http")
 async def bearer_auth_middleware(request: Request, call_next):
-    if API_TOKEN:
-        path = request.url.path
-        if path not in ("/health", "/dashboard", "/"):
-            auth_header = request.headers.get("authorization", "")
-            if auth_header != f"Bearer {API_TOKEN}":
-                return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    if API_TOKEN and request.url.path != "/health":
+        token = _provided_token(request)
+        if token != API_TOKEN:
+            # Browsers cannot attach an Authorization header to a navigation request,
+            # so entering the dashboard is a two-step handshake: ?token=... is exchanged
+            # for an HttpOnly cookie, after which the page's same-origin fetches carry it.
+            if request.url.path in ("/", "/dashboard") and request.method in ("GET", "HEAD"):
+                return HTMLResponse(
+                    "<html><body style='font-family:system-ui;padding:2rem'>"
+                    "<h3>IP Pool control plane</h3>"
+                    "<p>Access requires a token. Open <code>/dashboard?token=&lt;YOUR_TOKEN&gt;</code>.</p>"
+                    "</body></html>",
+                    status_code=401,
+                )
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        if request.query_params.get("token") and request.url.path == "/dashboard":
+            response = RedirectResponse(url="/dashboard", status_code=302)
+            response.set_cookie(
+                AUTH_COOKIE_NAME, token, httponly=True, samesite="lax", path="/"
+            )
+            return response
     return await call_next(request)
 
 
@@ -172,18 +222,67 @@ def list_nodes(
     return storage.list_nodes(region=region, egress_type=egress_type, status=status)
 
 
+def _lease_from_allocation(account_id: str, alloc: dict) -> Optional[LeaseInfo]:
+    node = storage.get_node(alloc["node_name"])
+    if not node:
+        return None
+    return LeaseInfo(
+        account_id=account_id,
+        node_name=node.name,
+        proxy_url=node.proxy_url,
+        exit_ip=node.exit_ip,
+        region=node.region,
+        egress_type=node.egress_type,
+        assigned_at=alloc["allocated_at"],
+    )
+
+
 @app.get("/v1/acquire", response_model=LeaseInfo)
+def get_bound_lease(
+    account_id: str = Query(..., description="Unique account ID / email"),
+    service: Optional[str] = Query(None, description="Service namespace (defaults to 'default')")
+):
+    """
+    Reads the account's current binding without creating one.
+
+    Acquiring is a state change and lives on POST; a GET must stay safe so that
+    prefetches, retries and link previews cannot silently bind accounts or consume
+    capacity.
+    """
+    svc = service or "default"
+    alloc = storage.find_allocation_by_account(account_id, service=svc)
+    lease = _lease_from_allocation(account_id, alloc) if alloc else None
+    if not lease:
+        legacy = storage.get_lease(account_id)
+        if legacy:
+            lease = legacy
+    if not lease:
+        raise HTTPException(status_code=404, detail=f"No binding for account '{account_id}' in service '{svc}'")
+    return lease
+
+
+@app.post("/v1/acquire", response_model=LeaseInfo)
 def acquire_node(
     account_id: str = Query(..., description="Unique account ID / email"),
-    egress_type: Optional[str] = Query("warp_ipv6", description="Preferred egress type (warp_ipv6, native_ipv4, native_ipv6)"),
+    egress_type: Optional[str] = Query(None, description="Optional egress type constraint (warp_ipv6, native_ipv4, native_ipv6)"),
     region: Optional[str] = Query(None, description="Optional target region (tokyo, netherlands, singapore, india)"),
-    force_rebind: bool = Query(False, description="Force re-allocating a new node")
+    force_rebind: bool = Query(False, description="Force re-allocating a new node"),
+    service: Optional[str] = Query(None, description="Service namespace (defaults to 'default')")
 ):
+    """
+    Acquires (or returns) the account's sticky binding.
+
+    `egress_type`/`region` are optional constraints for this call: when the account
+    already has a healthy binding that does not match them, the constrained node is
+    returned without overwriting the stored binding. Use `force_rebind=true` to
+    deliberately re-point the account.
+    """
     lease = router.acquire_for_account(
         account_id=account_id,
         egress_type=egress_type,
         region=region,
-        force_rebind=force_rebind
+        force_rebind=force_rebind,
+        service=service
     )
     if not lease:
         raise HTTPException(status_code=503, detail="No available proxy node matching criteria")

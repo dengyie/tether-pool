@@ -10,8 +10,7 @@ from datetime import datetime, timedelta
 from contextlib import contextmanager
 from core.models import (
     ProxyNode, ProbeResult, LeaseInfo, PoolStats, HealthStatus,
-    EgressType, CircuitEvent, RelayMode, IpCooldownRecord,
-    BatteryEventReport, BatteryEventType
+    CircuitEvent, RelayMode, IpCooldownRecord, BatteryEventReport
 )
 from core.circuit import CircuitBreaker
 
@@ -384,10 +383,6 @@ class Storage:
                 for r in rows
             ]
 
-    def count_all_leases(self) -> int:
-        with self._get_conn() as conn:
-            return conn.execute("SELECT COUNT(*) FROM leases").fetchone()[0]
-
     def record_circuit_event(self, node_name: str, from_state: str, to_state: str, reason: str) -> CircuitEvent:
         now_str = datetime.now().isoformat()
         with self._get_conn() as conn:
@@ -480,12 +475,19 @@ class Storage:
             """).fetchall()
             return [{"region": r["region"], "egress_type": r["egress_type"], "status": r["status"], "count": r["cnt"]} for r in rows]
 
-    def get_metrics_leases_distribution(self) -> List[Dict[str, Any]]:
+    def get_metrics_bindings_distribution(self) -> List[Dict[str, Any]]:
+        """
+        Active account bindings grouped by region and egress type.
+
+        Reads `account_allocations` (the authoritative binding table) rather than the
+        legacy `leases` mirror; otherwise every account bound through the universal
+        allocation layer is invisible to monitoring.
+        """
         with self._get_conn() as conn:
             rows = conn.execute("""
                 SELECT n.region, n.egress_type, COUNT(*) as cnt
-                FROM leases l
-                JOIN nodes n ON l.node_name = n.name
+                FROM account_allocations a
+                JOIN nodes n ON a.node_name = n.name
                 GROUP BY n.region, n.egress_type
             """).fetchall()
             return [{"region": r["region"], "egress_type": r["egress_type"], "count": r["cnt"]} for r in rows]
@@ -651,14 +653,6 @@ class Storage:
             row = conn.execute(query, params).fetchone()
             return dict(row) if row else None
 
-    def find_services_for_account(self, account_id: str) -> List[str]:
-        """
-        Lists all services that have an allocation for the given account.
-        """
-        with self._get_conn() as conn:
-            rows = conn.execute("SELECT DISTINCT service FROM account_allocations WHERE account_id = ?", (account_id,)).fetchall()
-            return [r[0] for r in rows]
-
     def update_allocation_node(self, service: str, account_id: str, new_node_name: str) -> bool:
         now_str = datetime.now().isoformat()
         with self._get_conn() as conn:
@@ -693,12 +687,50 @@ class Storage:
             return [dict(r) for r in rows]
 
     def delete_allocation(self, service: str, account_id: str) -> bool:
+        """
+        Unbinds an account from a service.
+
+        The legacy `leases` table is a mirror of the `default` namespace, so it must be
+        cleared in the same transaction once the account has no bindings left anywhere.
+        Otherwise `acquire_for_account` would resurrect the released lease and the
+        account would silently remain bound while no longer counting against capacity.
+        """
         with self._get_conn() as conn:
             cur = conn.execute("""
                 DELETE FROM account_allocations
                 WHERE service = ? AND account_id = ?
             """, (service, account_id))
+            remaining = conn.execute(
+                "SELECT COUNT(*) FROM account_allocations WHERE account_id = ?",
+                (account_id,)
+            ).fetchone()[0]
+            if remaining == 0:
+                conn.execute("DELETE FROM leases WHERE account_id = ?", (account_id,))
             return cur.rowcount > 0
+
+    def migrate_legacy_leases(self, service: str = "default") -> int:
+        """
+        Backfills `account_allocations` from `leases` rows that have no allocation.
+
+        Keeps the invariant "a lease row implies at least one allocation row" so that
+        capacity accounting, monitoring and re-homing all agree. Idempotent.
+        """
+        with self._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT l.account_id, l.node_name, l.assigned_at
+                FROM leases l
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM account_allocations a WHERE a.account_id = l.account_id
+                )
+            """).fetchall()
+            if not rows:
+                return 0
+            conn.executemany("""
+                INSERT INTO account_allocations (service, account_id, node_name, allocated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(service, account_id) DO NOTHING
+            """, [(service, r["account_id"], r["node_name"], r["assigned_at"]) for r in rows])
+            return len(rows)
 
     def get_allocations_overview(self) -> Dict[str, Any]:
         """
@@ -769,6 +801,50 @@ class Storage:
         with self._get_conn() as conn:
             cur = conn.execute("DELETE FROM probe_history WHERE probed_at < ?", (cutoff,))
             return cur.rowcount
+
+    def prune_circuit_events(self, keep_days: int = 7) -> int:
+        """Deletes circuit_events rows older than keep_days (append-only table)."""
+        cutoff = (datetime.now() - timedelta(days=keep_days)).isoformat()
+        with self._get_conn() as conn:
+            cur = conn.execute("DELETE FROM circuit_events WHERE created_at < ?", (cutoff,))
+            return cur.rowcount
+
+    def prune_battery_events(self, keep_days: int = 7) -> int:
+        """Deletes battery_events rows older than keep_days (append-only table)."""
+        cutoff = (datetime.now() - timedelta(days=keep_days)).isoformat()
+        with self._get_conn() as conn:
+            cur = conn.execute("DELETE FROM battery_events WHERE created_at < ?", (cutoff,))
+            return cur.rowcount
+
+    def prune_event_tables(self, keep_days: int = 7) -> Dict[str, int]:
+        """Applies the same retention window to every append-only event table."""
+        return {
+            "probe_history": self.prune_probe_history(keep_days),
+            "circuit_events": self.prune_circuit_events(keep_days),
+            "battery_events": self.prune_battery_events(keep_days),
+        }
+
+    def mark_nodes_missing_as_dead(self, keep_names: List[str]) -> List[str]:
+        """
+        Marks registry nodes absent from the authoritative inventory as DEAD.
+
+        Deliberately non-destructive: bindings stay intact and the existing self-healing
+        path re-homes them to healthy nodes. Hard deletion is only performed when the
+        operator explicitly opts in (see `prune_nodes_except`).
+        """
+        with self._get_conn() as conn:
+            existing = [r["name"] for r in conn.execute("SELECT name FROM nodes").fetchall()]
+            keep = set(keep_names)
+            stale = [n for n in existing if n not in keep]
+            if not stale:
+                return []
+            placeholders = ",".join("?" * len(stale))
+            conn.execute(
+                f"UPDATE nodes SET status = ?, circuit_state = ? "
+                f"WHERE name IN ({placeholders})",
+                [HealthStatus.DEAD.value, HealthStatus.DEAD.value, *stale]
+            )
+            return stale
 
     def prune_nodes_except(self, keep_names: List[str]) -> List[str]:
         """
