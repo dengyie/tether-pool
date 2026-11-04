@@ -4,7 +4,7 @@ core/models.py - Domain models for IP Pool System
 
 from enum import Enum
 from typing import List, Optional, Dict
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class EgressType(str, Enum):
@@ -208,33 +208,83 @@ class AllocationOverviewResponse(BaseModel):
 
 
 class NodeCreateRequest(BaseModel):
-    name: str
-    host: str
-    port: int
-    protocol: str = "socks5h"
-    region: str
-    egress_type: str
+    name: str = Field(..., min_length=1, max_length=100)
+    host: str = Field(..., min_length=1)
+    port: int = Field(..., ge=1, le=65535, description="Port number must be between 1 and 65535")
+    protocol: str = Field("socks5h", description="Proxy protocol (socks5h, socks5, http, https)")
+    region: str = Field(..., min_length=1)
+    egress_type: str = Field(..., min_length=1)
     tags: List[str] = Field(default_factory=list)
-    weight: int = 100
+    weight: int = Field(100, ge=1, le=1000)
     tier: Optional[str] = None
     configured_tier: Optional[str] = None
     relay_mode: str = RelayMode.RELAY_FALLBACK.value
     relay_hop_node: Optional[str] = None
 
+    @field_validator("tier", "configured_tier")
+    @classmethod
+    def validate_tier(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v_clean = v.strip().lower()
+            if v_clean not in (Tier.PREMIUM.value, Tier.STANDARD.value):
+                raise ValueError(f"Invalid tier: '{v}'. Must be '{Tier.PREMIUM.value}' or '{Tier.STANDARD.value}'")
+            return v_clean
+        return None
+
+    @field_validator("protocol")
+    @classmethod
+    def validate_protocol(cls, v: str) -> str:
+        v_clean = v.strip().lower()
+        if v_clean not in ("socks5h", "socks5", "http", "https"):
+            raise ValueError(f"Unsupported protocol: '{v}'. Must be socks5h, socks5, http, or https")
+        return v_clean
+
 
 class NodeUpdateRequest(BaseModel):
     host: Optional[str] = None
-    port: Optional[int] = None
+    port: Optional[int] = Field(None, ge=1, le=65535)
     protocol: Optional[str] = None
     region: Optional[str] = None
     egress_type: Optional[str] = None
     tags: Optional[List[str]] = None
-    weight: Optional[int] = None
+    weight: Optional[int] = Field(None, ge=1, le=1000)
     status: Optional[str] = None
     tier: Optional[str] = None
     configured_tier: Optional[str] = None
     relay_mode: Optional[str] = None
     relay_hop_node: Optional[str] = None
+
+    @field_validator("tier", "configured_tier")
+    @classmethod
+    def validate_tier(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v_clean = v.strip().lower()
+            if v_clean not in (Tier.PREMIUM.value, Tier.STANDARD.value):
+                raise ValueError(f"Invalid tier: '{v}'. Must be '{Tier.PREMIUM.value}' or '{Tier.STANDARD.value}'")
+            return v_clean
+        return None
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v_clean = v.strip().lower()
+            valid_statuses = {s.value for s in HealthStatus}
+            if v_clean not in valid_statuses:
+                raise ValueError(f"Invalid status: '{v}'. Must be one of {valid_statuses}")
+            return v_clean
+        return None
+
+    @field_validator("protocol")
+    @classmethod
+    def validate_protocol(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v_clean = v.strip().lower()
+            if v_clean not in ("socks5h", "socks5", "http", "https"):
+                raise ValueError(f"Unsupported protocol: '{v}'. Must be socks5h, socks5, http, or https")
+            return v_clean
+        return None
+
 
 
 

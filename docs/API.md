@@ -49,7 +49,7 @@ TetherPool 控制面提供高可用、异步非阻塞的 RESTful API，默认监
     "relay_mode": "relay_fallback"
   }
   ```
-  *(注：`tier` 可选 `premium` 或 `standard`；`relay_mode` 可选 `direct_only`, `relay_pref`, `relay_fallback`)*
+  *(注：`tier` 可选 `premium` 或 `standard`；`relay_mode` 可选 `direct_only`, `relay_pref`, `relay_fallback`。API 创建的节点系统会自动打上 `api_managed` 标签，即使执行 `POST /v1/config/reload` 重新读取静态 YAML，动态注册的节点也绝不会被错误标记为 dead 或被修剪删除)*
 - **成功响应**：`200 OK` (返回完整的 `ProxyNode` 对象)
 
 ---

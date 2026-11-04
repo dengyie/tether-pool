@@ -36,6 +36,8 @@ INTERNAL_ROUTING_HEADERS = frozenset({
     "x-tier-policy",
     "x-service",
     "x-target-service",
+    "x-rebind",
+    "x-force-rebind",
     "proxy-authorization",
     "proxy-connection",
     "connection",
@@ -251,7 +253,7 @@ async def pump_streams(r1: asyncio.StreamReader, w1: asyncio.StreamWriter, r2: a
 class ParsedCredentials:
     """
     Parametric credential parse result. Supports 4-item tuple unpacking for full backward
-    compatibility, as well as property access for tier and tier_policy.
+    compatibility, as well as property access for tier, tier_policy, and force_rebind.
     """
     def __init__(
         self,
@@ -260,7 +262,8 @@ class ParsedCredentials:
         egress_type: Optional[str] = None,
         service: Optional[str] = None,
         tier: Optional[str] = None,
-        tier_policy: Optional[str] = None
+        tier_policy: Optional[str] = None,
+        force_rebind: bool = False
     ):
         self.account_id = account_id
         self.region = region
@@ -268,6 +271,7 @@ class ParsedCredentials:
         self.service = service
         self.tier = tier
         self.tier_policy = tier_policy
+        self.force_rebind = force_rebind
 
     def __iter__(self):
         yield self.account_id
@@ -282,14 +286,14 @@ class ParsedCredentials:
     def __len__(self):
         return 4
 
-    def as_tuple(self) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
-        return (self.account_id, self.region, self.egress_type, self.service, self.tier, self.tier_policy)
+    def as_tuple(self) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], bool]:
+        return (self.account_id, self.region, self.egress_type, self.service, self.tier, self.tier_policy, self.force_rebind)
 
 
 class RoutingContext:
     """
     Gateway request routing context. Supports 4-item unpacking for backward compatibility,
-    as well as properties for tier and tier_policy.
+    as well as properties for tier, tier_policy, and force_rebind.
     """
     def __init__(
         self,
@@ -298,7 +302,8 @@ class RoutingContext:
         egress_type: Optional[str] = None,
         service: Optional[str] = None,
         tier: Optional[str] = None,
-        tier_policy: Optional[str] = None
+        tier_policy: Optional[str] = None,
+        force_rebind: bool = False
     ):
         self.account_id = account_id
         self.region = region
@@ -306,6 +311,7 @@ class RoutingContext:
         self.service = service
         self.tier = tier
         self.tier_policy = tier_policy
+        self.force_rebind = force_rebind
 
     def __iter__(self):
         yield self.account_id
@@ -323,12 +329,12 @@ class RoutingContext:
 
 def parse_proxy_credentials(raw_user: str) -> ParsedCredentials:
     """
-    Parses parametric proxy username into (account_id, region, egress_type, service, tier, tier_policy).
+    Parses parametric proxy username into (account_id, region, egress_type, service, tier, tier_policy, force_rebind).
     Supported formats:
     1. Plain account ID: 'bot_user_01'
-    2. Double-underscore tags: 'bot_01__type_warp_ipv6__region_tokyo__tier_premium__service_grok2api'
-    3. Query-string format: 'bot_01?region=tokyo&type=warp_ipv6&tier=premium&service=grok2api'
-    4. Key-value dash format: 'account=bot_01-region=tokyo-type=warp_ipv6-tier=premium-service=grok2api'
+    2. Double-underscore tags: 'bot_01__type_warp_ipv6__region_tokyo__tier_premium__service_grok2api__rebind_true'
+    3. Query-string format: 'bot_01?region=tokyo&type=warp_ipv6&tier=premium&service=grok2api&rebind=true'
+    4. Key-value dash format: 'account=bot_01-region=tokyo-type=warp_ipv6-tier=premium-service=grok2api-rebind=true'
     """
     if not raw_user:
         return ParsedCredentials(f"anon_{uuid.uuid4().hex[:8]}")
@@ -340,6 +346,7 @@ def parse_proxy_credentials(raw_user: str) -> ParsedCredentials:
     service = None
     tier = None
     tier_policy = None
+    force_rebind = False
 
     # Format 3: Query-string format
     if "?" in raw_user:
@@ -360,8 +367,10 @@ def parse_proxy_credentials(raw_user: str) -> ParsedCredentials:
                     tier = v.lower()
                 elif k in ("tier_policy", "policy", "routing_policy"):
                     tier_policy = v.lower()
+                elif k in ("rebind", "force_rebind", "rebalance"):
+                    force_rebind = v.lower() in ("true", "1", "yes")
 
-    # Format 2: Double-underscore format (e.g. acc_001__type_warp_ipv6__region_tokyo__tier_premium)
+    # Format 2: Double-underscore format (e.g. acc_001__type_warp_ipv6__region_tokyo__tier_premium__rebind_true)
     elif "__" in raw_user:
         parts = raw_user.split("__")
         account_id = parts[0]
@@ -385,9 +394,13 @@ def parse_proxy_credentials(raw_user: str) -> ParsedCredentials:
                 tier_policy = p_lower[7:]
             elif p_lower.startswith("tierpolicy_"):
                 tier_policy = p_lower[11:]
+            elif p_lower in ("rebind_true", "force_rebind", "rebind", "rebind=true"):
+                force_rebind = True
+            elif p_lower.startswith("rebind_"):
+                force_rebind = p_lower[7:] in ("true", "1", "yes")
 
-    # Format 4: Dash-separated key-value (e.g. account=bot_01-region=tokyo-tier=premium)
-    elif "account=" in raw_user.lower() or "region=" in raw_user.lower() or "type=" in raw_user.lower() or "service=" in raw_user.lower() or "tier=" in raw_user.lower():
+    # Format 4: Dash-separated key-value (e.g. account=bot_01-region=tokyo-tier=premium-rebind=true)
+    elif "account=" in raw_user.lower() or "region=" in raw_user.lower() or "type=" in raw_user.lower() or "service=" in raw_user.lower() or "tier=" in raw_user.lower() or "rebind=" in raw_user.lower():
         parts = raw_user.split("-")
         for p in parts:
             if "=" in p:
@@ -406,6 +419,8 @@ def parse_proxy_credentials(raw_user: str) -> ParsedCredentials:
                     tier = v.lower()
                 elif k in ("policy", "tier_policy"):
                     tier_policy = v.lower()
+                elif k in ("rebind", "force_rebind"):
+                    force_rebind = v.lower() in ("true", "1", "yes")
 
     # Sanitize and unquote account_id
     account_id = urllib.parse.unquote(account_id.strip()) if account_id else f"anon_{uuid.uuid4().hex[:8]}"
@@ -421,7 +436,8 @@ def parse_proxy_credentials(raw_user: str) -> ParsedCredentials:
         egress_type=egress_type,
         service=service,
         tier=tier,
-        tier_policy=tier_policy
+        tier_policy=tier_policy,
+        force_rebind=force_rebind
     )
 
 
@@ -451,6 +467,7 @@ class ForwardProxyGateway:
         auth_service = None
         auth_tier = None
         auth_policy = None
+        auth_force_rebind = False
 
         if not account_id and "proxy-authorization" in headers_dict:
             auth_val = headers_dict["proxy-authorization"].strip()
@@ -465,6 +482,7 @@ class ForwardProxyGateway:
                     auth_service = parsed.service
                     auth_tier = parsed.tier
                     auth_policy = parsed.tier_policy
+                    auth_force_rebind = parsed.force_rebind
                 except Exception:
                     pass
 
@@ -482,13 +500,19 @@ class ForwardProxyGateway:
         if tier_policy:
             tier_policy = tier_policy.strip().lower()
 
+        rebind_hdr = headers_dict.get("x-rebind") or headers_dict.get("x-force-rebind")
+        force_rebind = auth_force_rebind
+        if rebind_hdr:
+            force_rebind = rebind_hdr.strip().lower() in ("true", "1", "yes")
+
         return RoutingContext(
             account_id=account_id,
             region=region,
             egress_type=egress_type,
             service=service,
             tier=tier,
-            tier_policy=tier_policy
+            tier_policy=tier_policy,
+            force_rebind=force_rebind
         )
 
     async def connect_upstream_adaptive(
@@ -554,6 +578,7 @@ class ForwardProxyGateway:
         target_port: int,
         tier: Optional[str] = None,
         tier_policy: Optional[str] = None,
+        force_rebind: bool = False,
     ):
         """
         Opens the upstream SOCKS5 tunnel for an account, retrying once on a different exit.
@@ -574,7 +599,7 @@ class ForwardProxyGateway:
                 tier=tier,
                 tier_policy=tier_policy,
                 service=service,
-                force_rebind=attempt > 0,
+                force_rebind=force_rebind or (attempt > 0),
                 exclude_node=excluded,
             )
             if not lease:
@@ -655,7 +680,8 @@ class ForwardProxyGateway:
                         target_host=target_host,
                         target_port=target_port,
                         tier=route_ctx.tier,
-                        tier_policy=route_ctx.tier_policy
+                        tier_policy=route_ctx.tier_policy,
+                        force_rebind=route_ctx.force_rebind,
                     )
                 except NoPoolNodesError as pool_err:
                     err_resp = f"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\r\n{pool_err}\r\n".encode()
@@ -706,7 +732,8 @@ class ForwardProxyGateway:
                         target_host=target_host,
                         target_port=target_port,
                         tier=route_ctx.tier,
-                        tier_policy=route_ctx.tier_policy
+                        tier_policy=route_ctx.tier_policy,
+                        force_rebind=route_ctx.force_rebind,
                     )
                 except NoPoolNodesError as pool_err:
                     err_resp = f"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\r\n{pool_err}\r\n".encode()

@@ -80,9 +80,7 @@ class AllocationEngine:
                 if n:
                     return n
             if region:
-                n = self.storage.list_nodes(region=region, status=p_status, tier=p_tier)
-                if n:
-                    return n
+                return self.storage.list_nodes(region=region, status=p_status, tier=p_tier)
             if egress_preference:
                 n = self.storage.list_nodes(egress_type=egress_preference, status=p_status, tier=p_tier)
                 if n:
@@ -398,19 +396,32 @@ class AllocationEngine:
             if existing:
                 node = self.storage.get_node(existing["node_name"])
                 if node and node.status == HealthStatus.HEALTHY.value:
-                    gw_url = self._build_gateway_proxy_url(account_id, gateway_base, node.egress_type, node.region, service=service, tier=node.tier)
-                    return AccountAllocationItem(
-                        account_id=account_id,
-                        node_name=node.name,
-                        proxy_url=node.proxy_url,
-                        gateway_proxy_url=gw_url,
-                        exit_ip=node.exit_ip,
-                        region=node.region,
-                        egress_type=node.egress_type,
-                        service=service,
-                        allocated_at=existing["allocated_at"],
-                        tier=node.tier
-                    )
+                    matches = True
+                    if egress_preference and node.egress_type != egress_preference:
+                        matches = False
+                    if region and node.region != region:
+                        matches = False
+                    if tier_policy == TierPolicy.PREMIUM_ONLY.value and node.tier != Tier.PREMIUM.value:
+                        matches = False
+                    elif tier_policy == TierPolicy.STANDARD_ONLY.value and node.tier != Tier.STANDARD.value:
+                        matches = False
+                    elif tier and node.tier != tier and not tier_policy:
+                        matches = False
+
+                    if matches:
+                        gw_url = self._build_gateway_proxy_url(account_id, gateway_base, node.egress_type, node.region, service=service, tier=node.tier)
+                        return AccountAllocationItem(
+                            account_id=account_id,
+                            node_name=node.name,
+                            proxy_url=node.proxy_url,
+                            gateway_proxy_url=gw_url,
+                            exit_ip=node.exit_ip,
+                            region=node.region,
+                            egress_type=node.egress_type,
+                            service=service,
+                            allocated_at=existing["allocated_at"],
+                            tier=node.tier
+                        )
 
         nodes = self._get_eligible_nodes(
             egress_preference=egress_preference,

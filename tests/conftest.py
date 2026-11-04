@@ -37,3 +37,14 @@ def isolate_api_storage(tmp_path, monkeypatch):
     monkeypatch.setattr(api.server, "cpa_adapter", isolated_cpa)
 
     yield isolated_storage
+
+
+@pytest.fixture
+def storage(isolate_api_storage):
+    return isolate_api_storage
+
+
+@pytest.fixture
+def router(storage):
+    return Router(storage)
+

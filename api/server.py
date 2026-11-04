@@ -24,6 +24,7 @@ from core.router import Router
 from core.metrics import MetricsCollector
 from core.allocator import AllocationEngine
 from core.quality import IPQualityEvaluator
+from core.locks import BINDING_WRITE_LOCK
 from adapters.cpa_adapter import CpaAdapter
 
 CONFIG_FILE = os.environ.get("IP_POOL_CONFIG", os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "nodes.yaml"))
@@ -249,10 +250,15 @@ def create_or_upsert_node(req: NodeCreateRequest):
     """
     Directly creates or updates a proxy node in the pool via API.
     Evaluates quality scores and configures quality tiers dynamically.
+    Tags node with 'api_managed' to prevent pruning or demotion during static config reloads.
     """
     configured_tier = req.configured_tier or req.tier
+    tags = list(req.tags)
+    if "api_managed" not in tags:
+        tags.append("api_managed")
+
     score, init_tier, _ = IPQualityEvaluator.evaluate_node(
-        tags=req.tags,
+        tags=tags,
         egress_type=req.egress_type,
         status="unprobed",
         configured_tier=configured_tier
@@ -265,7 +271,7 @@ def create_or_upsert_node(req: NodeCreateRequest):
         protocol=req.protocol,
         region=req.region,
         egress_type=req.egress_type,
-        tags=req.tags,
+        tags=tags,
         weight=req.weight,
         relay_mode=req.relay_mode,
         relay_hop_node=req.relay_hop_node,
@@ -315,21 +321,26 @@ def delete_node(
     """
     Deletes a proxy node from the pool.
     Optionally auto-rehomes any bound accounts before removal.
+    Uses BINDING_WRITE_LOCK and pre-marks node as DEAD so concurrent acquisitions cannot target it.
     """
-    existing = storage.get_node(name)
-    if not existing:
-        raise HTTPException(status_code=404, detail=f"Node '{name}' not found")
+    with BINDING_WRITE_LOCK:
+        existing = storage.get_node(name)
+        if not existing:
+            raise HTTPException(status_code=404, detail=f"Node '{name}' not found")
 
-    rehome_result = None
-    if rehome:
-        rehome_result = router.rehome_leases_for_node(name)
+        # Pre-mark node as DEAD so no concurrent requests can select it during rehoming
+        storage.update_node(name, {"status": HealthStatus.DEAD.value, "circuit_state": HealthStatus.DEAD.value})
 
-    deleted = storage.delete_node(name, prune_bindings=True)
-    return {
-        "deleted": deleted,
-        "node_name": name,
-        "rehome_result": rehome_result
-    }
+        rehome_result = None
+        if rehome:
+            rehome_result = router.rehome_leases_for_node(name)
+
+        deleted = storage.delete_node(name, prune_bindings=True)
+        return {
+            "deleted": deleted,
+            "node_name": name,
+            "rehome_result": rehome_result
+        }
 
 
 @app.post("/v1/config/reload")

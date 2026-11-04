@@ -885,13 +885,18 @@ class Storage:
     def mark_nodes_missing_as_dead(self, keep_names: List[str]) -> List[str]:
         """
         Marks registry nodes absent from the authoritative inventory as DEAD.
+        Excludes dynamic API-managed nodes (tagged 'api_managed') from being marked dead.
 
         Deliberately non-destructive: bindings stay intact and the existing self-healing
         path re-homes them to healthy nodes. Hard deletion is only performed when the
         operator explicitly opts in (see `prune_nodes_except`).
         """
         with self._get_conn() as conn:
-            existing = [r["name"] for r in conn.execute("SELECT name FROM nodes").fetchall()]
+            existing = [
+                r["name"] for r in conn.execute(
+                    "SELECT name FROM nodes WHERE tags NOT LIKE '%\"api_managed\"%'"
+                ).fetchall()
+            ]
             keep = set(keep_names)
             stale = [n for n in existing if n not in keep]
             if not stale:
@@ -907,10 +912,15 @@ class Storage:
     def prune_nodes_except(self, keep_names: List[str]) -> List[str]:
         """
         Removes nodes absent from the authoritative inventory along with their bindings.
+        Excludes dynamic API-managed nodes (tagged 'api_managed') from being pruned.
         Returns the pruned node names. Callers must validate `keep_names` first.
         """
         with self._get_conn() as conn:
-            existing = [r["name"] for r in conn.execute("SELECT name FROM nodes").fetchall()]
+            existing = [
+                r["name"] for r in conn.execute(
+                    "SELECT name FROM nodes WHERE tags NOT LIKE '%\"api_managed\"%'"
+                ).fetchall()
+            ]
             stale = [n for n in existing if n not in set(keep_names)]
             if not stale:
                 return []
@@ -939,6 +949,7 @@ class Storage:
         Supported fields: host, port, protocol, region, egress_type, tags, weight,
         status, circuit_state, tier, configured_tier, relay_mode, relay_hop_node,
         quality_score.
+        Automatically synchronizes circuit_state with status and records circuit transition audit event.
         """
         if not updates:
             return self.get_node(name)
@@ -952,14 +963,25 @@ class Storage:
         if not valid_updates:
             return self.get_node(name)
 
+        # Synchronize status and circuit_state to prevent split-brain state machine
+        if "status" in valid_updates and "circuit_state" not in valid_updates:
+            valid_updates["circuit_state"] = valid_updates["status"]
+        elif "circuit_state" in valid_updates and "status" not in valid_updates:
+            valid_updates["status"] = valid_updates["circuit_state"]
+
         # Convert tags to json if provided as list
         if "tags" in valid_updates and isinstance(valid_updates["tags"], list):
             valid_updates["tags"] = json.dumps(valid_updates["tags"])
+
+        current_node = self.get_node(name)
+        if not current_node:
+            return None
 
         set_clauses = [f"{k} = ?" for k in valid_updates.keys()]
         values = list(valid_updates.values())
         values.append(name)
 
+        now_str = datetime.now().isoformat()
         with self._get_conn() as conn:
             cur = conn.execute(
                 f"UPDATE nodes SET {', '.join(set_clauses)} WHERE name = ?",
@@ -967,6 +989,13 @@ class Storage:
             )
             if cur.rowcount == 0:
                 return None
+
+            # Record circuit audit transition event if status changed
+            if "status" in valid_updates and current_node.status != valid_updates["status"]:
+                conn.execute("""
+                    INSERT INTO circuit_events (node_name, from_state, to_state, reason, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (name, current_node.status, valid_updates["status"], "api_manual_patch", now_str))
 
         return self.get_node(name)
 
