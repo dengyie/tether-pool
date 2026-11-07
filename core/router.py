@@ -103,9 +103,9 @@ class Router:
             return True
 
         # 1. Check existing lease if not forcing rebind
+        alloc = self.storage.find_allocation_by_account(account_id, service=svc)
         if not force_rebind:
             # 1a. Universal Allocation Engine bindings check first
-            alloc = self.storage.find_allocation_by_account(account_id, service=svc)
             if alloc:
                 node = self.storage.get_node(alloc["node_name"])
                 if (
@@ -143,6 +143,20 @@ class Router:
                     if _node_matches_constraints(node):
                         return existing
                     binding_conflict = True
+
+        # A forced rebind must actually change nodes; the deterministic CRC32 hash below
+        # would otherwise re-select the current sticky node (the documented
+        # `__rebind_true` no-op fixed in production on 2026-11-05). The binding is only
+        # consulted here, so the steady-state path keeps its single query.
+        if force_rebind:
+            current_node_name = alloc["node_name"] if alloc and alloc.get("node_name") else None
+            if current_node_name is None:
+                current_lease = self.storage.get_lease(account_id)
+                if current_lease and not self.storage.find_allocation_by_account(account_id):
+                    # Pre-migration accounts bound only through the legacy lease mirror.
+                    current_node_name = current_lease.node_name
+            if current_node_name:
+                excluded.add(current_node_name)
 
         # 2. Get eligible candidates (tier-aware ladder search)
         candidates = self._get_candidates_for_tier_policy(

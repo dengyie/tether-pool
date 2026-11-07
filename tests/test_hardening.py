@@ -248,6 +248,25 @@ def test_force_rebind_still_persists_the_new_binding(storage):
     assert storage.get_allocation("svc", "acc-rb")["node_name"] == second.node_name
 
 
+def test_force_rebind_without_exclude_moves_off_current_node(storage):
+    """A bare force_rebind must not re-hash onto the node it is leaving.
+
+    Production regression (2026-11-05): without an explicit `exclude_node` the
+    deterministic CRC32 hash re-selected the sticky node, turning `__rebind_true`
+    into a silent no-op.
+    """
+    storage.upsert_node(_node("rb-c", exit_ip="2a09:bac5:cc::5"))
+    storage.upsert_node(_node("rb-d", exit_ip="2a09:bac5:cc::6"))
+    router = Router(storage)
+
+    first = router.acquire_for_account("acc-rb2", service="svc")
+    second = router.acquire_for_account("acc-rb2", service="svc", force_rebind=True)
+
+    assert second is not None
+    assert second.node_name != first.node_name
+    assert storage.get_allocation("svc", "acc-rb2")["node_name"] == second.node_name
+
+
 # --------------------------------------------------------------- auth coherence
 
 

@@ -5,6 +5,7 @@ Transparently maps client requests to sticky EasyTier SOCKS5 exits based on head
 
 import asyncio
 import base64
+import logging
 import os
 import sys
 import socket
@@ -51,6 +52,8 @@ ERR_BINDING_REHOMED = "binding_rehomed"
 ERR_NO_HEALTHY_TARGET = "no_healthy_target"
 
 # Routing metadata consumed by the gateway itself; never forwarded to origins.
+logger = logging.getLogger("tetherpool.gateway")
+
 INTERNAL_ROUTING_HEADERS = frozenset({
     "x-account-id",
     "x-region",
@@ -518,6 +521,25 @@ class ForwardProxyGateway:
         # R4: optional peer-table watcher, started by `start()` when enabled.
         self.peer_monitor = peer_monitor
         self._peer_task = None
+        # Per-account relay counters (prod hotfix): attribute unified-gateway traffic to
+        # downstream accounts. anon_* ids collapse into one label to bound cardinality.
+        self.relay_total: Dict[str, int] = {}
+
+    def _record_relay(self, account_id: str, node_name: str, target: str) -> None:
+        key = account_id if not account_id.startswith("anon_") else "anon"
+        if key not in self.relay_total and len(self.relay_total) >= 2000:
+            key = "other"
+        self.relay_total[key] = self.relay_total.get(key, 0) + 1
+        logger.info("relay established account=%s node=%s target=%s", key, node_name, target)
+
+    def render_metrics(self) -> bytes:
+        lines = [
+            "# HELP tetherpool_gateway_relay_total Relay connections established per account.",
+            "# TYPE tetherpool_gateway_relay_total counter",
+        ]
+        for acct, count in sorted(self.relay_total.items()):
+            lines.append('tetherpool_gateway_relay_total{account="%s"} %d' % (acct, count))
+        return ("\n".join(lines) + "\n").encode()
 
     def _extract_routing_headers(self, headers_dict: Dict[str, str], client_ip: str) -> RoutingContext:
         """
@@ -737,6 +759,10 @@ class ForwardProxyGateway:
                     self.isolator.note_success(node.name)
                 except Exception as note_err:
                     print(f"[-] Isolator note_success failed for {node.name}: {note_err}")
+                # Per-account attribution for the unified gateway (ops hotfix carried over
+                # from production: without it there is no way to see which downstream
+                # account generated the traffic).
+                self._record_relay(account_id, node.name, f"{target_host}:{target_port}")
                 return streams
             except Exception as exc:
                 last_err = exc
@@ -856,6 +882,18 @@ class ForwardProxyGateway:
 
             # 2. Extract routing constraints
             route_ctx = self._extract_routing_headers(headers_dict, client_ip)
+
+            # Internal Prometheus endpoint: GET /metrics never proxies; it reports the
+            # gateway's own per-account relay counters (ops hotfix carried over from prod).
+            if method.upper() == "GET" and target.split("?")[0] == "/metrics":
+                body = self.render_metrics()
+                resp = ("HTTP/1.1 200 OK" + "\r\n"
+                        + "Content-Type: text/plain; version=0.0.4\r\n"
+                        + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode() + body
+                client_writer.write(resp)
+                await client_writer.drain()
+                client_writer.close()
+                return
 
             # 3. Handle HTTP CONNECT (HTTPS)
             if method.upper() == "CONNECT":
@@ -1033,6 +1071,7 @@ class ForwardProxyGateway:
 
 
 async def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     storage = Storage()
     router = Router(storage)
     isolator = FailureDomainIsolator(storage, router)
