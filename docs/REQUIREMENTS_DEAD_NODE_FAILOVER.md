@@ -1,9 +1,9 @@
 # 需求：死节点有界重试与自动换节点（Dead-Node Failover & Rehome）
 
-> **状态**：待 TetherPool 项目迭代实现
+> **状态**：📌 复盘归档（2026-11-07）— 死节点换路能力已由 grok2api 侧实现并上线，**不再作为 TetherPool 交付项**
 > **提出方**：grok2api 运维（2026-11-07 线上事故复盘）
-> **优先级**：P0（当前线上持续产生失败请求）
-> **范围**：`gateway/server.py` 请求链路 + `core/router.py` 分配/重编排 + 下游绑定契约
+> **优先级**：已关闭（原 P0）。保留为跨组件验收用例与供给侧约束说明
+> **范围**：事故复盘；serving 路径的健康判定与绑定归 grok2api，TetherPool 只做节点/账号供给（见第七节）
 
 ---
 
@@ -214,8 +214,16 @@ epoch: int                # 绑定版本，配合 R5(b) 增量对账
 
 ---
 
-## 七、交接说明
+## 七、交接说明（职责边界，2026-11-07 修订）
 
-- 该需求由 **TetherPool 项目**实现；grok2api 侧只负责"请求失败后按错误语义重试一次"，不再承担出口健康管理。
-- grok2api 当前缺陷（拨号期超时被误判为"已提交"从而拒绝换账号）由 grok2api 自行修复，**与本需求解耦**，但两者叠加才能覆盖今天的事故。
+> **本节此前写作"grok2api 不再承担出口健康管理"，与线上实现相反，已纠正。**
+
+- **serving 路径的出口健康与账号绑定，归 grok2api 自己负责**，TetherPool 不介入：
+  - 健康真相：grok2api 内置探活（`egress_nodes.probe_status` / `last_probed_at`）＋ 请求期反馈（`egress.Feedback`：传输错误 → `health*=0.7` 并进入 `min(10min, 30s·2^(n-1))` 冷却；403 走反爬降级；401/429/5xx 不动节点健康）；
+  - 绑定：`provider_accounts.egress_node_id` 粘性绑定，只迁 `egress_assignment_mode=auto` 且 `auth_status=active` 的账号，手动绑定永不移动；
+  - 自动纠偏：`RebalanceAccounts` 由 1 分钟维护循环驱动（受 `AssignmentIntervalSeconds` 节流，含 5 分钟迁移冷却、`maxAutomaticReassignments=200`、节点占比/迁移占比预算）。
+  - 上述能力已上线并通过演练（停用一个节点 45s 内疏散 28 个账号，恢复后 60s 补回 27 个）。
+- **TetherPool / ip-pool 只做供给**：批量部署出口节点、批量注册/养号（注册机）、账号换血（接电池）。它**不持有 serving 路径的健康判定，也不直接改写下游绑定**。节点产出以"新增 `egress_nodes` 行"的形式交给 grok2api，之后健康与分配完全由 grok2api 自治。
+- **因此本文标题里的"Dead-Node Failover & Rehome"不再是对 TetherPool 的交付要求**：该能力已由 grok2api 侧的请求期反馈 + 自动重平衡覆盖。本文保留为**事故复盘与跨组件验收用例**（上方指标表可直接用于 grok2api 回归）。
+- grok2api 侧此前缺陷（拨号期超时被误判为"已提交"从而拒绝换账号）已修复：`createRequestNotSent` 在上下文守卫之前采集拨号期证据，且 `GenerateVideo` 现在会把创建请求的拨号失败/拒绝状态回灌 `egress.Feedback`——这正是"死节点保持 healthy 导致粘性账号持续付拨号超时"的根因。
 - 事故证据：`request_audit_attempts.error_chain_json`（`socks connect tcp 10.144.144.12:10900 → dial tcp → i/o timeout`）、grok2api `media_jobs.egress_node_id` 分布、`easytier-cli peer` 输出。
