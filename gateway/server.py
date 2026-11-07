@@ -12,7 +12,7 @@ import socket
 import struct
 import urllib.parse
 import uuid
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, Any
 
 # Ensure project root is in sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -521,16 +521,63 @@ class ForwardProxyGateway:
         # R4: optional peer-table watcher, started by `start()` when enabled.
         self.peer_monitor = peer_monitor
         self._peer_task = None
-        # Per-account relay counters (prod hotfix): attribute unified-gateway traffic to
-        # downstream accounts. anon_* ids collapse into one label to bound cardinality.
+        # Relay attribution: per-account and per-exit counters let ops see which downstream
+        # and which exit actually carry traffic. Both maps are capped so a hostile or buggy
+        # downstream can never grow gateway memory without bound.
         self.relay_total: Dict[str, int] = {}
+        self.relay_nodes: Dict[str, int] = {}
+        self.relay_count: int = 0
+        self._relay_reported_count: int = 0
+        # 0 disables the periodic reporter (per-connection DEBUG detail still exists).
+        self.relay_report_interval = max(
+            0.0, float(os.environ.get("GATEWAY_RELAY_SUMMARY_INTERVAL_SEC", "60"))
+        )
+        self._relay_task = None
+
+    # Cap on distinct labels per relay map; extra keys collapse into "other".
+    RELAY_LABEL_CAP = 2000
+
+    @classmethod
+    def _relay_key(cls, raw: str, table: Dict[str, int], cap: int = None) -> str:
+        """Collapses anonymous ids and overflow into bounded labels."""
+        key = raw if not raw.startswith("anon_") else "anon"
+        limit = cls.RELAY_LABEL_CAP if cap is None else cap
+        if key not in table and len(table) >= limit:
+            return "other"
+        return key
 
     def _record_relay(self, account_id: str, node_name: str, target: str) -> None:
-        key = account_id if not account_id.startswith("anon_") else "anon"
-        if key not in self.relay_total and len(self.relay_total) >= 2000:
-            key = "other"
-        self.relay_total[key] = self.relay_total.get(key, 0) + 1
-        logger.info("relay established account=%s node=%s target=%s", key, node_name, target)
+        acct = self._relay_key(account_id, self.relay_total, self.RELAY_LABEL_CAP)
+        node = self._relay_key(node_name, self.relay_nodes, self.RELAY_LABEL_CAP)
+        self.relay_total[acct] = self.relay_total.get(acct, 0) + 1
+        self.relay_nodes[node] = self.relay_nodes.get(node, 0) + 1
+        self.relay_count += 1
+        # Per-connection detail stays at DEBUG: at one INFO line per relayed request the
+        # production journal grew without bound. The periodic `relay_summary` reports the
+        # same information once per interval, and /metrics keeps the exact counters, so
+        # nothing is lost by demoting this line.
+        logger.debug("relay established account=%s node=%s target=%s", acct, node, target)
+
+    def relay_summary(self) -> Dict[str, Any]:
+        """
+        Bounded snapshot of relay activity since the previous report.
+
+        Called only by the periodic reporter: a year of traffic costs one journald line
+        per interval instead of one per connection. Returns the interval delta plus the
+        top accounts and exits — which is what actually answers "who is using this".
+        """
+        delta = self.relay_count - self._relay_reported_count
+        self._relay_reported_count = self.relay_count
+        top_accounts = sorted(self.relay_total.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+        top_nodes = sorted(self.relay_nodes.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+        return {
+            "relays": delta,
+            "total": self.relay_count,
+            "accounts": len(self.relay_total),
+            "nodes": len(self.relay_nodes),
+            "top_accounts": top_accounts,
+            "top_nodes": top_nodes,
+        }
 
     def render_metrics(self) -> bytes:
         lines = [
@@ -539,6 +586,10 @@ class ForwardProxyGateway:
         ]
         for acct, count in sorted(self.relay_total.items()):
             lines.append('tetherpool_gateway_relay_total{account="%s"} %d' % (acct, count))
+        lines.append("# HELP tetherpool_gateway_relay_by_node_total Relay connections established per exit node.")
+        lines.append("# TYPE tetherpool_gateway_relay_by_node_total counter")
+        for node, count in sorted(self.relay_nodes.items()):
+            lines.append('tetherpool_gateway_relay_by_node_total{node="%s"} %d' % (node, count))
         return ("\n".join(lines) + "\n").encode()
 
     def _extract_routing_headers(self, headers_dict: Dict[str, str], client_ip: str) -> RoutingContext:
@@ -1050,28 +1101,62 @@ class ForwardProxyGateway:
                 logger.warning("EasyTier peer monitor error: %s", exc)
             await asyncio.sleep(EASYTIER_SCAN_INTERVAL_SEC)
 
+    async def _relay_report_loop(self):
+        """
+        Emits the bounded relay summary once per interval.
+
+        This is what keeps per-connection attribution observable without writing a line
+        per relayed request: the counters in /metrics stay exact, and the journal gets a
+        single aggregated line per interval with the top accounts and exits.
+        """
+        while True:
+            await asyncio.sleep(self.relay_report_interval)
+            try:
+                summary = self.relay_summary()
+                if summary["relays"]:
+                    logger.info(
+                        "relay summary %ss: relays=%d total=%d accounts=%d nodes=%d "
+                        "top_accounts=%s top_nodes=%s",
+                        int(self.relay_report_interval), summary["relays"],
+                        summary["total"], summary["accounts"], summary["nodes"],
+                        summary["top_accounts"], summary["top_nodes"],
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("relay summary error: %s", exc)
+
     async def start(self):
         self.server = await asyncio.start_server(self.handle_client, self.host, self.port)
         logger.info("Unified Forward Proxy Gateway listening on %s:%s", self.host, self.port)
         if self.peer_monitor is not None and EASYTIER_MONITOR_ENABLED:
             self._peer_task = asyncio.create_task(self._peer_monitor_loop())
             logger.info("EasyTier peer monitor started (whole-host fast detection)")
+        if self.relay_report_interval > 0:
+            self._relay_task = asyncio.create_task(self._relay_report_loop())
+            logger.info("Relay summary every %ss (per-connection detail at DEBUG)",
+                        int(self.relay_report_interval))
 
     async def stop(self):
-        if self._peer_task:
-            self._peer_task.cancel()
-            try:
-                await self._peer_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._peer_task = None
+        for task_attr in ("_peer_task", "_relay_task"):
+            task = getattr(self, task_attr)
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                setattr(self, task_attr, None)
         if self.server:
             self.server.close()
             await self.server.wait_closed()
 
 
 async def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logging.basicConfig(
+        level=os.environ.get("GATEWAY_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     storage = Storage()
     router = Router(storage)
     isolator = FailureDomainIsolator(storage, router)

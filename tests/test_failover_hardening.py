@@ -757,3 +757,55 @@ async def test_incident_mesh_nl_pool_never_returns_dead_exit(storage):
     dead_names = {n.name for n in dead}
     assert dialled, "no attempts were made"
     assert not (set(dialled) & dead_names), "gateway dialled a DEAD exit"
+
+
+# ------------------------------------------------------- relay attribution logging
+
+
+def test_relay_counters_are_bounded_and_relabeled(storage):
+    """Distinct labels must stay capped: a hostile downstream cannot grow the maps."""
+    gateway = ForwardProxyGateway(storage, Router(storage))
+    gateway.RELAY_LABEL_CAP = 5
+    for i in range(50):
+        gateway._record_relay(f"acct-{i}", f"node-{i}", "example.com:443")
+
+    # The cap bounds *real* labels; the overflow bucket is one extra entry.
+    assert len(gateway.relay_total) == 6
+    assert gateway.relay_total["other"] == 45
+    assert len(gateway.relay_nodes) == 6
+    assert gateway.relay_nodes["other"] == 45
+    assert gateway.relay_count == 50
+
+
+def test_relay_collapses_anonymous_ids(storage):
+    gateway = ForwardProxyGateway(storage, Router(storage))
+    for _ in range(3):
+        gateway._record_relay("anon_deadbeef", "tokyo-warp-0", "example.com:443")
+    assert gateway.relay_total == {"anon": 3}
+
+
+def test_relay_summary_reports_interval_delta_and_tops(storage):
+    """The periodic summary carries the interval delta plus the busiest accounts/exits."""
+    gateway = ForwardProxyGateway(storage, Router(storage))
+    for _ in range(5):
+        gateway._record_relay("acct-a", "node-x", "example.com:443")
+    gateway._record_relay("acct-b", "node-y", "example.com:443")
+
+    first = gateway.relay_summary()
+    assert first["relays"] == 6
+    assert first["total"] == 6
+    assert first["top_accounts"][0] == ("acct-a", 5)
+    assert first["top_nodes"][0] == ("node-x", 5)
+
+    # A quiet interval reports zero relays but keeps the cumulative totals.
+    second = gateway.relay_summary()
+    assert second["relays"] == 0
+    assert second["total"] == 6
+
+
+def test_render_metrics_exposes_account_and_node_counters(storage):
+    gateway = ForwardProxyGateway(storage, Router(storage))
+    gateway._record_relay("acct-a", "node-x", "example.com:443")
+    text = gateway.render_metrics().decode()
+    assert 'tetherpool_gateway_relay_total{account="acct-a"} 1' in text
+    assert 'tetherpool_gateway_relay_by_node_total{node="node-x"} 1' in text
