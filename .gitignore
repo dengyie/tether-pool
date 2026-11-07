@@ -8,3 +8,6 @@ logs/
 *.pid
 .pytest_cache/
 .DS_Store
+
+# Test isolation artifacts (accidentally committed in e9b09c3)
+.pytest_tmp*/
