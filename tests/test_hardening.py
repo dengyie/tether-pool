@@ -294,10 +294,18 @@ def test_prune_event_tables_bounds_every_append_only_table(storage):
         event_type=BatteryEventType.RATE_LIMITED_429.value,
         target_service="svc",
     ))
+    # A bind appends a binding_changes row (R5), which is append-only and must also be
+    # bounded by the same retention window.
+    storage.batch_save_allocations([("svc", "acc-ret", "ret-node", "2026-11-04T00:00:00")])
 
     pruned = storage.prune_event_tables(keep_days=0)
 
-    assert pruned == {"probe_history": 1, "circuit_events": 1, "battery_events": 1}
+    assert pruned == {
+        "probe_history": 1,
+        "circuit_events": 1,
+        "battery_events": 1,
+        "binding_changes": 1,
+    }
     with storage._get_conn() as conn:
-        for table in ("probe_history", "circuit_events", "battery_events"):
+        for table in ("probe_history", "circuit_events", "battery_events", "binding_changes"):
             assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0

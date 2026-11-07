@@ -73,4 +73,80 @@ class MetricsCollector:
             )
         lines.append("")
 
+        lines.extend(self._runtime_metrics_block())
+
         return "\n".join(lines) + "\n"
+
+    def _runtime_metrics_block(self) -> List[str]:
+        """
+        R7: metrics fed from the in-process runtime_metrics table (bounded cardinality,
+        surfaced here so the existing /metrics scrape stays the single entry point).
+
+        Histogram buckets are stored pre-aggregated per `le` (cumulative), plus `_sum` /
+        `_count`; the exporter renders the standard Prometheus bucket/sum/count layout.
+        """
+        lines: List[str] = []
+        runtime = self.storage.get_runtime_metrics()
+
+        counters = {
+            "ip_pool_retry_exhausted_total": (
+                "# HELP ip_pool_retry_exhausted_total Gateway retry budget exhausted per service and reason",
+                "# TYPE ip_pool_retry_exhausted_total counter",
+            ),
+            "ip_pool_rehome_total": (
+                "# HELP ip_pool_rehome_total Account binding rehomes per service and trigger",
+                "# TYPE ip_pool_rehome_total counter",
+            ),
+            "ip_pool_domain_trip_total": (
+                "# HELP ip_pool_domain_trip_total Whole failure-domain isolation trips",
+                "# TYPE ip_pool_domain_trip_total counter",
+            ),
+        }
+        for name, (help_line, type_line) in counters.items():
+            emitted = False
+            for item in runtime:
+                if item["name"] != name:
+                    continue
+                if not emitted:
+                    lines.append(help_line)
+                    lines.append(type_line)
+                    emitted = True
+                labels = ",".join(f'{k}="{v}"' for k, v in sorted(item["labels"].items()))
+                lines.append(f"{name}{{{labels}}} {item['value']:.0f}")
+            if emitted:
+                lines.append("")
+
+        # Histogram: exit nodes attempted per client request (gateway).
+        histogram = "ip_pool_gateway_attempts_per_request"
+        hist_items = [i for i in runtime if i["name"].startswith(histogram)]
+        if hist_items:
+            lines.append("# HELP ip_pool_gateway_attempts_per_request Exit nodes attempted per client request")
+            lines.append("# TYPE ip_pool_gateway_attempts_per_request histogram")
+            bucket_rows = sorted(
+                (i for i in hist_items if "_bucket" in i["name"]),
+                key=lambda i: float("inf") if i["labels"].get("le") == "+Inf" else float(i["labels"]["le"]),
+            )
+            for item in bucket_rows:
+                le = item["labels"].get("le", "+Inf")
+                lines.append(
+                    f'ip_pool_gateway_attempts_per_request_bucket{{le="{le}"}} {item["value"]:.0f}'
+                )
+            for item in hist_items:
+                if item["name"] == histogram + "_sum":
+                    lines.append(f"{histogram}_sum {item['value']:.2f}")
+                elif item["name"] == histogram + "_count":
+                    lines.append(f"{histogram}_count {item['value']:.0f}")
+            lines.append("")
+
+        # Gauge: whole-host unreachable duration (seconds) per fault domain.
+        gauge_name = "ip_pool_host_unreachable_seconds"
+        gauge_items = [i for i in runtime if i["name"] == gauge_name]
+        if gauge_items:
+            lines.append("# HELP ip_pool_host_unreachable_seconds How long a host has been unreachable, per fault domain")
+            lines.append("# TYPE ip_pool_host_unreachable_seconds gauge")
+            for item in gauge_items:
+                labels = ",".join(f'{k}="{v}"' for k, v in sorted(item["labels"].items()))
+                lines.append(f'{gauge_name}{{{labels}}} {item["value"]:.3f}')
+            lines.append("")
+
+        return lines

@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from core.models import (
     ProxyNode, ProbeResult, LeaseInfo, PoolStats, HealthStatus,
     CircuitEvent, RelayMode, IpCooldownRecord, BatteryEventReport,
-    Tier
+    Tier, BindingChangeRecord
 )
 from core.circuit import CircuitBreaker
 from core.quality import IPQualityEvaluator
@@ -66,13 +66,18 @@ class Storage:
                     relay_hop_node TEXT,
                     tier TEXT DEFAULT 'standard',
                     configured_tier TEXT,
-                    quality_score INTEGER DEFAULT 50
+                    quality_score INTEGER DEFAULT 50,
+                    fault_domain TEXT DEFAULT '',
+                    provider_region TEXT DEFAULT '',
+                    self_reported_at TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS leases (
                     account_id TEXT PRIMARY KEY,
                     node_name TEXT NOT NULL,
                     assigned_at TEXT NOT NULL,
+                    rebind_count INTEGER DEFAULT 0,
+                    last_rebind_reason TEXT DEFAULT '',
                     FOREIGN KEY (node_name) REFERENCES nodes(name)
                 );
 
@@ -118,8 +123,35 @@ class Storage:
                     account_id TEXT NOT NULL,
                     node_name TEXT NOT NULL,
                     allocated_at TEXT NOT NULL,
+                    rebind_count INTEGER DEFAULT 0,
+                    last_rebind_reason TEXT DEFAULT '',
                     PRIMARY KEY (service, account_id),
                     FOREIGN KEY (node_name) REFERENCES nodes(name)
+                );
+
+                CREATE TABLE IF NOT EXISTS binding_epoch_state (
+                    service TEXT PRIMARY KEY,
+                    epoch INTEGER NOT NULL DEFAULT 0,
+                    changed_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS binding_changes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    service TEXT NOT NULL,
+                    epoch INTEGER NOT NULL,
+                    account_id TEXT NOT NULL,
+                    from_node TEXT,
+                    to_node TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS runtime_metrics (
+                    name TEXT NOT NULL,
+                    labels TEXT NOT NULL,
+                    value REAL NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (name, labels)
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_nodes_region ON nodes(region);
@@ -145,13 +177,37 @@ class Storage:
                 ("relay_hop_node", "TEXT", "NULL"),
                 ("tier", "TEXT", "'standard'"),
                 ("quality_score", "INTEGER", "50"),
-                ("configured_tier", "TEXT", "NULL")
+                ("configured_tier", "TEXT", "NULL"),
+                ("fault_domain", "TEXT", "''"),
+                ("provider_region", "TEXT", "''"),
+                ("self_reported_at", "TEXT", "NULL")
             ]:
                 if col not in existing_cols:
                     conn.execute(f"ALTER TABLE nodes ADD COLUMN {col} {col_type} DEFAULT {default_val}")
 
+            lease_cols = [r["name"] for r in conn.execute("PRAGMA table_info(leases)").fetchall()]
+            for col, col_type, default_val in [
+                ("rebind_count", "INTEGER", "0"),
+                ("last_rebind_reason", "TEXT", "''")
+            ]:
+                if col not in lease_cols:
+                    conn.execute(f"ALTER TABLE leases ADD COLUMN {col} {col_type} DEFAULT {default_val}")
+
+            alloc_cols = [r["name"] for r in conn.execute("PRAGMA table_info(account_allocations)").fetchall()]
+            for col, col_type, default_val in [
+                ("rebind_count", "INTEGER", "0"),
+                ("last_rebind_reason", "TEXT", "''")
+            ]:
+                if col not in alloc_cols:
+                    conn.execute(f"ALTER TABLE account_allocations ADD COLUMN {col} {col_type} DEFAULT {default_val}")
+
             conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_tier ON nodes(tier);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_status_tier_region ON nodes(status, tier, region);")
+            # Created here (not in the script above) so legacy DBs get the columns migrated
+            # first — CREATE INDEX on a yet-unmigrated table would raise
+            # "no such column" on databases created before fault domains existed.
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_fault_domain ON nodes(fault_domain, host);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_binding_changes_epoch ON binding_changes(service, epoch);")
 
     def upsert_node(self, node: ProxyNode):
         with self._get_conn() as conn:
@@ -160,9 +216,10 @@ class Storage:
                     name, host, port, protocol, region, egress_type, tags, weight,
                     exit_ip, latency_ms, status, fail_count, last_probed_at,
                     circuit_state, consecutive_failures, consecutive_successes, next_probe_allowed_at,
-                    relay_mode, relay_hop_node, tier, configured_tier, quality_score
+                    relay_mode, relay_hop_node, tier, configured_tier, quality_score,
+                    fault_domain, provider_region, self_reported_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     host=excluded.host,
                     port=excluded.port,
@@ -180,7 +237,10 @@ class Storage:
                     circuit_state=CASE WHEN excluded.circuit_state != 'unprobed' THEN excluded.circuit_state ELSE nodes.circuit_state END,
                     consecutive_failures=CASE WHEN excluded.status != 'unprobed' THEN excluded.consecutive_failures ELSE nodes.consecutive_failures END,
                     consecutive_successes=CASE WHEN excluded.status != 'unprobed' THEN excluded.consecutive_successes ELSE nodes.consecutive_successes END,
-                    next_probe_allowed_at=CASE WHEN excluded.status != 'unprobed' THEN excluded.next_probe_allowed_at ELSE nodes.next_probe_allowed_at END
+                    next_probe_allowed_at=CASE WHEN excluded.status != 'unprobed' THEN excluded.next_probe_allowed_at ELSE nodes.next_probe_allowed_at END,
+                    fault_domain=CASE WHEN excluded.fault_domain != '' THEN excluded.fault_domain ELSE nodes.fault_domain END,
+                    provider_region=CASE WHEN excluded.provider_region != '' THEN excluded.provider_region ELSE nodes.provider_region END,
+                    self_reported_at=COALESCE(excluded.self_reported_at, nodes.self_reported_at)
             """, (
                 node.name, node.host, node.port, node.protocol, node.region,
                 node.egress_type, json.dumps(node.tags), node.weight,
@@ -188,7 +248,8 @@ class Storage:
                 node.circuit_state or node.status, node.consecutive_failures,
                 node.consecutive_successes, node.next_probe_allowed_at,
                 node.relay_mode, node.relay_hop_node,
-                node.tier or Tier.STANDARD.value, node.configured_tier, node.quality_score or 50
+                node.tier or Tier.STANDARD.value, node.configured_tier, node.quality_score or 50,
+                node.fault_domain or "", node.provider_region or "", node.self_reported_at
             ))
 
     def update_node_status(self, node_name: str, status: str):
@@ -363,19 +424,34 @@ class Storage:
             relay_hop_node=row["relay_hop_node"] if "relay_hop_node" in keys else None,
             tier=row["tier"] if "tier" in keys and row["tier"] else Tier.STANDARD.value,
             configured_tier=row["configured_tier"] if "configured_tier" in keys and row["configured_tier"] else None,
-            quality_score=row["quality_score"] if "quality_score" in keys and row["quality_score"] is not None else 50
+            quality_score=row["quality_score"] if "quality_score" in keys and row["quality_score"] is not None else 50,
+            fault_domain=row["fault_domain"] if "fault_domain" in keys and row["fault_domain"] else "",
+            provider_region=row["provider_region"] if "provider_region" in keys and row["provider_region"] else "",
+            self_reported_at=row["self_reported_at"] if "self_reported_at" in keys else None
         )
 
-    def set_lease(self, account_id: str, node_name: str) -> LeaseInfo:
+    def set_lease(self, account_id: str, node_name: str, rebind_reason: Optional[str] = None) -> LeaseInfo:
         now_str = datetime.now().isoformat()
         with self._get_conn() as conn:
+            # A rebind (as opposed to a first bind) bumps the account's counter so the
+            # "hot account" signal in R2 is observable.
+            existing = conn.execute(
+                "SELECT node_name FROM leases WHERE account_id = ?", (account_id,)
+            ).fetchone()
+            is_rebind = bool(existing and existing["node_name"] != node_name)
             conn.execute("""
-                INSERT INTO leases (account_id, node_name, assigned_at)
-                VALUES (?, ?, ?)
+                INSERT INTO leases (account_id, node_name, assigned_at, rebind_count, last_rebind_reason)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(account_id) DO UPDATE SET
                     node_name = excluded.node_name,
-                    assigned_at = excluded.assigned_at
-            """, (account_id, node_name, now_str))
+                    assigned_at = excluded.assigned_at,
+                    rebind_count = leases.rebind_count + CASE WHEN leases.node_name != excluded.node_name THEN 1 ELSE 0 END,
+                    last_rebind_reason = CASE WHEN leases.node_name != excluded.node_name THEN excluded.last_rebind_reason ELSE leases.last_rebind_reason END
+            """, (account_id, node_name, now_str, 1 if is_rebind else 0, rebind_reason or ""))
+            row = conn.execute(
+                "SELECT rebind_count, last_rebind_reason FROM leases WHERE account_id = ?",
+                (account_id,)
+            ).fetchone()
 
         node = self.get_node(node_name)
         return LeaseInfo(
@@ -386,13 +462,16 @@ class Storage:
             region=node.region if node else "",
             egress_type=node.egress_type if node else "",
             assigned_at=now_str,
-            tier=node.tier if node else None
+            tier=node.tier if node else None,
+            rebind_count=row["rebind_count"] if row else 0,
+            last_rebind_reason=(row["last_rebind_reason"] if row else "") or ""
         )
 
     def get_lease(self, account_id: str) -> Optional[LeaseInfo]:
         with self._get_conn() as conn:
             row = conn.execute("""
-                SELECT l.account_id, l.node_name, l.assigned_at, n.host, n.port, n.protocol, n.exit_ip, n.region, n.egress_type, n.tier
+                SELECT l.account_id, l.node_name, l.assigned_at, l.rebind_count, l.last_rebind_reason,
+                       n.host, n.port, n.protocol, n.exit_ip, n.region, n.egress_type, n.tier
                 FROM leases l
                 JOIN nodes n ON l.node_name = n.name
                 WHERE l.account_id = ?
@@ -406,14 +485,17 @@ class Storage:
                     region=row["region"],
                     egress_type=row["egress_type"],
                     assigned_at=row["assigned_at"],
-                    tier=row["tier"]
+                    tier=row["tier"],
+                    rebind_count=row["rebind_count"] if "rebind_count" in row.keys() and row["rebind_count"] else 0,
+                    last_rebind_reason=(row["last_rebind_reason"] if "last_rebind_reason" in row.keys() and row["last_rebind_reason"] else "")
                 )
         return None
 
     def get_leases_for_node(self, node_name: str) -> List[LeaseInfo]:
         with self._get_conn() as conn:
             rows = conn.execute("""
-                SELECT l.account_id, l.node_name, l.assigned_at, n.host, n.port, n.protocol, n.exit_ip, n.region, n.egress_type, n.tier
+                SELECT l.account_id, l.node_name, l.assigned_at, l.rebind_count, l.last_rebind_reason,
+                       n.host, n.port, n.protocol, n.exit_ip, n.region, n.egress_type, n.tier
                 FROM leases l
                 JOIN nodes n ON l.node_name = n.name
                 WHERE l.node_name = ?
@@ -427,7 +509,9 @@ class Storage:
                     region=r["region"],
                     egress_type=r["egress_type"],
                     assigned_at=r["assigned_at"],
-                    tier=r["tier"]
+                    tier=r["tier"],
+                    rebind_count=r["rebind_count"] if "rebind_count" in r.keys() and r["rebind_count"] else 0,
+                    last_rebind_reason=(r["last_rebind_reason"] if "last_rebind_reason" in r.keys() and r["last_rebind_reason"] else "")
                 )
                 for r in rows
             ]
@@ -675,20 +759,81 @@ class Storage:
 
     # --- Universal Account Allocation & Distribution ---
 
-    def batch_save_allocations(self, records: List[Tuple[str, str, str, str]]):
+    def batch_save_allocations(self, records: List[Tuple[str, str, str, str]], reason: str = "bind"):
         """
         Atomically upserts account allocations: List of (service, account_id, node_name, allocated_at).
+        When a binding's node changes, its rebind counter is incremented, the legacy lease
+        mirror is updated, the service binding epoch is advanced and a change-log row is
+        appended — all in the same transaction so rehomes are all-or-nothing and a
+        downstream reconciler can never observe a half-migrated binding (R2/R3/R5).
+
+        `reason` labels transitions (`bind`, `auto_rehome`, `domain_rehome`, ...) so the
+        incremental export can report why accounts moved.
         """
         if not records:
             return
+        now_str = datetime.now().isoformat()
         with self._get_conn() as conn:
+            # Pre-image lookup so rebind counts and change logs reflect real transitions.
+            # Later duplicates win, matching the upsert ordering executemany applies.
+            desired: Dict[Tuple[str, str], str] = {}
+            for service, account_id, node_name, _ in records:
+                desired[(service, account_id)] = node_name
+            pre_images: Dict[Tuple[str, str], Optional[str]] = {}
+            for key in desired:
+                row = conn.execute(
+                    "SELECT node_name FROM account_allocations WHERE service = ? AND account_id = ?",
+                    key
+                ).fetchone()
+                pre_images[key] = row["node_name"] if row else None
+
             conn.executemany("""
                 INSERT INTO account_allocations (service, account_id, node_name, allocated_at)
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(service, account_id) DO UPDATE SET
                     node_name = excluded.node_name,
-                    allocated_at = excluded.allocated_at;
-            """, records)
+                    allocated_at = excluded.allocated_at,
+                    rebind_count = CASE WHEN account_allocations.node_name != excluded.node_name
+                                        THEN account_allocations.rebind_count + 1
+                                        ELSE account_allocations.rebind_count END,
+                    last_rebind_reason = CASE WHEN account_allocations.node_name != excluded.node_name
+                                              THEN ?
+                                              ELSE account_allocations.last_rebind_reason END
+            """, [(*record, reason) for record in records])
+
+            # Advance each service's epoch once per call and append one change row per move.
+            changed = [
+                (s, a, old, desired[(s, a)])
+                for (s, a), old in pre_images.items()
+                if old != desired[(s, a)]
+            ]
+            if changed:
+                epochs = self._advance_binding_epochs(conn, {s for s, _, _, _ in changed}, now_str)
+                conn.executemany("""
+                    INSERT INTO binding_changes (service, epoch, account_id, from_node, to_node, reason, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, [
+                    (s, epochs[s], a, old, new, reason, now_str)
+                    for s, a, old, new in changed
+                ])
+
+                # Keep the legacy account-keyed lease mirror in the SAME transaction as the
+                # allocation it mirrors. The old code did this with one `set_lease` call per
+                # account, which turned a whole-host rehome into N separate commits.
+                lease_moves: Dict[str, Tuple[str, int]] = {}
+                for s, a, old, new in changed:
+                    # A first bind is not a rebind; a move is. If the account has several
+                    # services, any pre-existing binding makes this a rebind.
+                    lease_moves[a] = (new, 1 if old is not None else 0)
+                conn.executemany("""
+                    INSERT INTO leases (account_id, node_name, assigned_at, rebind_count, last_rebind_reason)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(account_id) DO UPDATE SET
+                        node_name = excluded.node_name,
+                        assigned_at = excluded.assigned_at,
+                        rebind_count = leases.rebind_count + CASE WHEN leases.node_name != excluded.node_name THEN 1 ELSE 0 END,
+                        last_rebind_reason = CASE WHEN leases.node_name != excluded.node_name THEN excluded.last_rebind_reason ELSE leases.last_rebind_reason END
+                """, [(acc, node, now_str, initial, reason) for acc, (node, initial) in lease_moves.items()])
 
     def find_allocation_by_account(self, account_id: str, service: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
@@ -874,12 +1019,25 @@ class Storage:
             cur = conn.execute("DELETE FROM battery_events WHERE created_at < ?", (cutoff,))
             return cur.rowcount
 
+    def prune_binding_changes(self, keep_days: int = 7) -> int:
+        """
+        Deletes binding_changes rows older than keep_days. Without this the incremental
+        reconciliation log (one row per rebind, 511+ rows per host outage) would grow
+        unbounded. Downstreams whose `since_epoch` predates the retention window must do a
+        full cold-start export instead of trusting an empty delta.
+        """
+        cutoff = (datetime.now() - timedelta(days=keep_days)).isoformat()
+        with self._get_conn() as conn:
+            cur = conn.execute("DELETE FROM binding_changes WHERE created_at < ?", (cutoff,))
+            return cur.rowcount
+
     def prune_event_tables(self, keep_days: int = 7) -> Dict[str, int]:
         """Applies the same retention window to every append-only event table."""
         return {
             "probe_history": self.prune_probe_history(keep_days),
             "circuit_events": self.prune_circuit_events(keep_days),
             "battery_events": self.prune_battery_events(keep_days),
+            "binding_changes": self.prune_binding_changes(keep_days),
         }
 
     def mark_nodes_missing_as_dead(self, keep_names: List[str]) -> List[str]:
@@ -943,12 +1101,270 @@ class Storage:
             cur = conn.execute("DELETE FROM nodes WHERE name = ?", (name,))
             return cur.rowcount > 0
 
+    # --- Binding Epoch & Change Log (R5 downstream reconciliation) ---
+
+    def _advance_binding_epochs(self, conn, services: set, now_str: str) -> Dict[str, int]:
+        """
+        Advances the global monotonic binding epoch for each service inside the caller's
+        transaction. Kept private: epoch bumps MUST happen in the same transaction as the
+        binding write that triggered them, otherwise a downstream reconciler could read a
+        half-migrated state.
+        """
+        epochs: Dict[str, int] = {}
+        for service in sorted(services):
+            conn.execute("""
+                INSERT INTO binding_epoch_state (service, epoch, changed_at)
+                VALUES (?, 1, ?)
+                ON CONFLICT(service) DO UPDATE SET
+                    epoch = binding_epoch_state.epoch + 1,
+                    changed_at = excluded.changed_at
+            """, (service, now_str))
+            row = conn.execute(
+                "SELECT epoch FROM binding_epoch_state WHERE service = ?", (service,)
+            ).fetchone()
+            epochs[service] = row["epoch"] if row else 0
+        return epochs
+
+    def get_binding_epoch(self, service: str) -> Optional[Dict[str, Any]]:
+        """Returns the current binding epoch for a service (or None when never written)."""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT epoch, changed_at FROM binding_epoch_state WHERE service = ?",
+                (service,)
+            ).fetchone()
+            if not row:
+                return None
+            info: Dict[str, Any] = {"service": service, "epoch": row["epoch"], "changed_at": row["changed_at"]}
+            last = conn.execute(
+                "SELECT reason FROM binding_changes WHERE service = ? ORDER BY id DESC LIMIT 1",
+                (service,)
+            ).fetchone()
+            info["last_change_reason"] = last["reason"] if last else None
+            return info
+
+    def list_binding_changes_since(self, service: str, epoch: int) -> List[BindingChangeRecord]:
+        """Incremental binding diff since an epoch, for downstream reconcile pulls (R5b)."""
+        with self._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT id, service, epoch, account_id, from_node, to_node, reason, created_at
+                FROM binding_changes
+                WHERE service = ? AND epoch > ?
+                ORDER BY id ASC
+            """, (service, epoch)).fetchall()
+            return [BindingChangeRecord(**dict(r)) for r in rows]
+
+    def move_account_binding(
+        self,
+        service: str,
+        account_id: str,
+        new_node_name: str,
+        reason: str = "auto_rehome",
+        cross_region_rebind: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Atomically rewrites ONE account's binding: allocation row + legacy lease mirror +
+        rebind counter + last_rebind_reason + binding epoch + change log, all inside one
+        transaction. This is the storage primitive behind R2 (request-time retry exhaustion)
+        and R3 (domain isolation) — the router picks the target node, storage guarantees the
+        write is atomic and idempotent.
+        """
+        now_str = datetime.now().isoformat()
+        with self._get_conn() as conn:
+            prev = conn.execute(
+                "SELECT node_name FROM account_allocations WHERE service = ? AND account_id = ?",
+                (service, account_id)
+            ).fetchone()
+            prev_node = prev["node_name"] if prev else None
+            if prev_node == new_node_name:
+                return {
+                    "moved": False, "already_on_target": True, "account_id": account_id,
+                    "service": service, "from_node": prev_node, "to_node": new_node_name
+                }
+
+            conn.execute("""
+                INSERT INTO account_allocations (service, account_id, node_name, allocated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(service, account_id) DO UPDATE SET
+                    node_name = excluded.node_name,
+                    allocated_at = excluded.allocated_at,
+                    rebind_count = account_allocations.rebind_count + 1,
+                    last_rebind_reason = ?
+            """, (service, account_id, new_node_name, now_str, reason))
+
+            # Legacy lease mirror (account-keyed); keep its own rebind counter in sync.
+            conn.execute("""
+                INSERT INTO leases (account_id, node_name, assigned_at, rebind_count, last_rebind_reason)
+                VALUES (?, ?, ?, 1, ?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    node_name = excluded.node_name,
+                    assigned_at = excluded.assigned_at,
+                    rebind_count = leases.rebind_count + CASE WHEN leases.node_name != excluded.node_name THEN 1 ELSE 0 END,
+                    last_rebind_reason = CASE WHEN leases.node_name != excluded.node_name THEN excluded.last_rebind_reason ELSE leases.last_rebind_reason END
+            """, (account_id, new_node_name, now_str, reason))
+
+            epoch = self._advance_binding_epochs(conn, {service}, now_str)[service]
+            conn.execute("""
+                INSERT INTO binding_changes (service, epoch, account_id, from_node, to_node, reason, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (service, epoch, account_id, prev_node, new_node_name, reason, now_str))
+
+        return {
+            "moved": True,
+            "account_id": account_id,
+            "service": service,
+            "from_node": prev_node,
+            "to_node": new_node_name,
+            "epoch": epoch,
+            "reason": reason,
+            "cross_region_rebind": cross_region_rebind
+        }
+
+    # --- Failure Domain Isolation (R3) ---
+
+    def list_nodes_by_domain(self, fault_domain: str) -> List[ProxyNode]:
+        """All nodes sharing a failure domain: explicit `fault_domain` or their connection host."""
+        with self._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT * FROM nodes
+                WHERE fault_domain = ? OR (fault_domain = '' AND host = ?)
+                ORDER BY name ASC
+            """, (fault_domain, fault_domain)).fetchall()
+            return [self._row_to_node(r) for r in rows]
+
+    def domain_status_counts(self, fault_domain: str) -> Dict[str, int]:
+        """Per-status node counts inside one failure domain (for quorum/alarm policy)."""
+        with self._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT status, COUNT(*) AS c FROM nodes
+                WHERE fault_domain = ? OR (fault_domain = '' AND host = ?)
+                GROUP BY status
+            """, (fault_domain, fault_domain)).fetchall()
+            return {
+                nr["status"]: nr["c"] for nr in rows
+            }
+
+    def mark_domain_dead(self, fault_domain: str, reason: str = "failure_domain_isolation") -> Tuple[List[ProxyNode], Optional[CircuitEvent]]:
+        """
+        Marks every non-dead node sharing a failure domain as DEAD in one sweep (single
+        transaction, single circuit event) instead of N independent per-node trips.
+        Returns (affected_nodes, domain_event).
+        """
+        now = datetime.now()
+        cooldown_sec = CircuitBreaker.compute_cooldown(2)  # baseline ~60s domain cooldown
+        next_allowed = (now + timedelta(seconds=cooldown_sec)).isoformat()
+        now_str = now.isoformat()
+
+        with self._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT * FROM nodes
+                WHERE (fault_domain = ? OR (fault_domain = '' AND host = ?))
+                  AND status != ?
+                ORDER BY name ASC
+            """, (fault_domain, fault_domain, HealthStatus.DEAD.value)).fetchall()
+            affected = [self._row_to_node(r) for r in rows]
+            if not affected:
+                return [], None
+
+            names = [n.name for n in affected]
+            placeholders = ",".join("?" * len(names))
+            conn.execute(
+                f"UPDATE nodes SET status = ?, circuit_state = ?, consecutive_failures = MAX(consecutive_failures, 2), "
+                f"consecutive_successes = 0, next_probe_allowed_at = ?, last_probed_at = ? WHERE name IN ({placeholders})",
+                [HealthStatus.DEAD.value, HealthStatus.DEAD.value, next_allowed, now_str, *names]
+            )
+            cur = conn.execute("""
+                INSERT INTO circuit_events (node_name, from_state, to_state, reason, created_at)
+                VALUES (?, 'domain_healthy', 'dead', ?, ?)
+            """, (fault_domain, f"{reason}_{len(affected)}_listeners", now_str))
+            event = CircuitEvent(
+                id=cur.lastrowid,
+                node_name=fault_domain,
+                from_state="domain_healthy",
+                to_state=HealthStatus.DEAD.value,
+                reason=f"{reason}_{len(affected)}_listeners",
+                created_at=now_str
+            )
+        return affected, event
+
+    def get_allocations_for_domain(self, fault_domain: str) -> List[Dict[str, Any]]:
+        """All service/account bindings pointing at any node inside a failure domain."""
+        with self._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT a.service, a.account_id, a.node_name, n.host, n.fault_domain, n.region, n.egress_type
+                FROM account_allocations a
+                JOIN nodes n ON a.node_name = n.name
+                WHERE n.fault_domain = ? OR (n.fault_domain = '' AND n.host = ?)
+                ORDER BY a.service ASC, a.account_id ASC
+            """, (fault_domain, fault_domain)).fetchall()
+            return [dict(r) for r in rows]
+
+    # --- Runtime Metrics Persistence (R7, cross-process safe) ---
+
+    def incr_metric(self, name: str, labels: Optional[Dict[str, str]] = None, value: float = 1.0):
+        """Atomically increments a runtime counter persisted in SQLite (survives gateway restarts)."""
+        label_json = json.dumps({k: str(v) for k, v in (labels or {}).items()}, sort_keys=True)
+        now_str = datetime.now().isoformat()
+        with self._get_conn() as conn:
+            conn.execute("""
+                INSERT INTO runtime_metrics (name, labels, value, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(name, labels) DO UPDATE SET
+                    value = runtime_metrics.value + excluded.value,
+                    updated_at = excluded.updated_at
+            """, (name, label_json, value, now_str))
+
+    def incr_metrics(self, entries: List[Tuple[str, Optional[Dict[str, str]], float]]):
+        """
+        Increments several counters in ONE transaction.
+
+        The gateway records up to seven histogram counters per proxied request; doing that
+        as seven separate commits put SQLite write latency on the request's success path.
+        """
+        if not entries:
+            return
+        now_str = datetime.now().isoformat()
+        rows = [
+            (name, json.dumps({k: str(v) for k, v in (labels or {}).items()}, sort_keys=True), value, now_str)
+            for name, labels, value in entries
+        ]
+        with self._get_conn() as conn:
+            conn.executemany("""
+                INSERT INTO runtime_metrics (name, labels, value, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(name, labels) DO UPDATE SET
+                    value = runtime_metrics.value + excluded.value,
+                    updated_at = excluded.updated_at
+            """, rows)
+
+    def set_metric(self, name: str, labels: Optional[Dict[str, str]] = None, value: float = 0.0):
+        """Overwrites a runtime gauge (last writer wins)."""
+        label_json = json.dumps({k: str(v) for k, v in (labels or {}).items()}, sort_keys=True)
+        now_str = datetime.now().isoformat()
+        with self._get_conn() as conn:
+            conn.execute("""
+                INSERT INTO runtime_metrics (name, labels, value, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(name, labels) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+            """, (name, label_json, value, now_str))
+
+    def get_runtime_metrics(self) -> List[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            rows = conn.execute("SELECT name, labels, value, updated_at FROM runtime_metrics").fetchall()
+            return [{
+                "name": r["name"],
+                "labels": json.loads(r["labels"]),
+                "value": r["value"],
+                "updated_at": r["updated_at"]
+            } for r in rows]
+
     def update_node(self, name: str, updates: Dict[str, Any]) -> Optional[ProxyNode]:
         """
         Updates specific fields of a node by name.
         Supported fields: host, port, protocol, region, egress_type, tags, weight,
         status, circuit_state, tier, configured_tier, relay_mode, relay_hop_node,
-        quality_score.
+        quality_score, fault_domain, provider_region, self_reported_at.
         Automatically synchronizes circuit_state with status and records circuit transition audit event.
         """
         if not updates:
@@ -957,7 +1373,8 @@ class Storage:
         allowed_fields = {
             "host", "port", "protocol", "region", "egress_type", "tags",
             "weight", "status", "circuit_state", "tier", "configured_tier",
-            "relay_mode", "relay_hop_node", "quality_score"
+            "relay_mode", "relay_hop_node", "quality_score",
+            "fault_domain", "provider_region", "self_reported_at"
         }
         valid_updates = {k: v for k, v in updates.items() if k in allowed_fields}
         if not valid_updates:

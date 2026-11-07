@@ -63,10 +63,22 @@ class ProxyNode(BaseModel):
     tier: str = Tier.STANDARD.value
     configured_tier: Optional[str] = None
     quality_score: int = 50
+    # Fault-domain identifiers: a host failure must isolate every listener on the
+    # same box in one sweep instead of 25 independent circuit trips. When
+    # `fault_domain` is empty the storage layer derives it from `host`.
+    fault_domain: str = ""
+    provider_region: str = ""
+    # Node-side last liveness heartbeat (e.g. EasyTier peer timestamp).
+    self_reported_at: Optional[str] = None
 
     @property
     def proxy_url(self) -> str:
         return f"{self.protocol}://{self.host}:{self.port}"
+
+    @property
+    def effective_fault_domain(self) -> str:
+        """Failure-domain key: explicit fault_domain wins, else the connection host."""
+        return self.fault_domain.strip() or self.host
 
 
 class CircuitEvent(BaseModel):
@@ -95,6 +107,27 @@ class LeaseInfo(BaseModel):
     egress_type: str
     assigned_at: str
     tier: Optional[str] = None
+    rebind_count: int = 0
+    last_rebind_reason: str = ""
+    binding_epoch: int = 0
+
+
+class BindingEpochInfo(BaseModel):
+    service: str
+    epoch: int
+    changed_at: Optional[str] = None
+    last_change_reason: Optional[str] = None
+
+
+class BindingChangeRecord(BaseModel):
+    id: Optional[int] = None
+    service: str
+    epoch: int
+    account_id: str
+    from_node: Optional[str] = None
+    to_node: str
+    reason: str
+    created_at: str
 
 
 class PoolStats(BaseModel):
@@ -220,6 +253,8 @@ class NodeCreateRequest(BaseModel):
     configured_tier: Optional[str] = None
     relay_mode: str = RelayMode.RELAY_FALLBACK.value
     relay_hop_node: Optional[str] = None
+    fault_domain: str = ""
+    provider_region: str = ""
 
     @field_validator("tier", "configured_tier")
     @classmethod
@@ -253,6 +288,9 @@ class NodeUpdateRequest(BaseModel):
     configured_tier: Optional[str] = None
     relay_mode: Optional[str] = None
     relay_hop_node: Optional[str] = None
+    fault_domain: Optional[str] = None
+    provider_region: Optional[str] = None
+    self_reported_at: Optional[str] = None
 
     @field_validator("tier", "configured_tier")
     @classmethod

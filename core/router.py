@@ -27,7 +27,8 @@ class Router:
         tier_policy: Optional[str] = None,
         force_rebind: bool = False,
         service: Optional[str] = None,
-        exclude_node: Optional[str] = None
+        exclude_node: Optional[str] = None,
+        exclude_nodes: Optional[set] = None
     ) -> Optional[LeaseInfo]:
         with BINDING_WRITE_LOCK:
             return self._acquire_for_account(
@@ -38,7 +39,8 @@ class Router:
                 tier_policy=tier_policy,
                 force_rebind=force_rebind,
                 service=service,
-                exclude_node=exclude_node
+                exclude_node=exclude_node,
+                exclude_nodes=exclude_nodes
             )
 
     def _acquire_for_account(
@@ -50,7 +52,8 @@ class Router:
         tier_policy: Optional[str] = None,
         force_rebind: bool = False,
         service: Optional[str] = None,
-        exclude_node: Optional[str] = None
+        exclude_node: Optional[str] = None,
+        exclude_nodes: Optional[set] = None
     ) -> Optional[LeaseInfo]:
         """
         Sticky assignment for an account.
@@ -70,6 +73,12 @@ class Router:
         """
         svc = service or "default"
         binding_conflict = False
+        # R1: the gateway retries with a *cumulative* exclusion set, so a request can never
+        # cycle back onto a node that already failed for it. `exclude_node` is kept as the
+        # single-node spelling used by the battery/rebind paths.
+        excluded: set = set(exclude_nodes or ())
+        if exclude_node:
+            excluded.add(exclude_node)
 
         # Determine effective tier policy
         # Default is standard_first (protects self-hosted/premium IPs).
@@ -99,7 +108,11 @@ class Router:
             alloc = self.storage.find_allocation_by_account(account_id, service=svc)
             if alloc:
                 node = self.storage.get_node(alloc["node_name"])
-                if node and node.status == HealthStatus.HEALTHY.value and node.name != exclude_node:
+                if (
+                    node
+                    and node.status == HealthStatus.HEALTHY.value
+                    and node.name not in excluded
+                ):
                     if _node_matches_constraints(node):
                         return LeaseInfo(
                             account_id=account_id,
@@ -114,12 +127,19 @@ class Router:
                     # Healthy binding that only fails this call's filter -> keep it.
                     binding_conflict = True
 
-            # 1b. Legacy lease table check
-            existing = self.storage.get_lease(account_id)
+            # 1b. Legacy lease table check — only for accounts that have NO universal
+            # allocation at all. `batch_save_allocations` now maintains this mirror in the
+            # same transaction as the authoritative allocation, so a lease row can belong
+            # to a *different* service. Adopting it here would leak that service's binding
+            # into the requested one and skip persisting the new allocation.
+            existing = (
+                None if self.storage.find_allocation_by_account(account_id)
+                else self.storage.get_lease(account_id)
+            )
             if existing:
                 node = self.storage.get_node(existing.node_name)
                 # Ensure existing node is HEALTHY (Closed)
-                if node and node.status == HealthStatus.HEALTHY.value and node.name != exclude_node:
+                if node and node.status == HealthStatus.HEALTHY.value and node.name not in excluded:
                     if _node_matches_constraints(node):
                         return existing
                     binding_conflict = True
@@ -131,11 +151,12 @@ class Router:
             policy=policy
         )
 
-        if exclude_node:
-            filtered = [c for c in candidates if c.name != exclude_node]
-            # Only honour the exclusion if it leaves usable options
-            if filtered:
-                candidates = filtered
+        if excluded:
+            filtered = [c for c in candidates if c.name not in excluded]
+            # Honour the exclusions even when they consume the whole pool: the tier ladder
+            # has already widened scope, and landing back on a node that just failed for
+            # this request is strictly worse than returning "no candidate" (-> 503).
+            candidates = filtered
 
         if not candidates:
             return None
@@ -248,6 +269,43 @@ class Router:
         with BINDING_WRITE_LOCK:
             return self._rehome_leases_for_node(broken_node_name)
 
+    def _find_rehome_candidates(
+        self,
+        target_region: Optional[str],
+        target_egress: Optional[str],
+        target_tier: Optional[str],
+        exclude_names: set
+    ) -> List[ProxyNode]:
+        """
+        Narrows the pool for a rebind the same way the allocation ladder does, from the
+        most sticky (same region + egress + tier) to the least (any healthy node ANYWHERE
+        is better than none). Only HEALTHY nodes qualify; DEAD / cooling nodes never enter
+        the sequence (R3 acceptance: after a mesh-nl kill the pool still has aws-tokyo /
+        huawei-sg / india visible, and never re-proposes a dead listener).
+        """
+        # Order matters: `egress_type` is preserved before region (R2 acceptance requires a
+        # rehomed warp_ipv6 account to stay on warp_ipv6), and region before tier. A
+        # same-region non-WARP node is therefore never chosen over a cross-region WARP one.
+        ladder = [
+            (target_region, target_egress, target_tier),
+            (target_region, target_egress, None),
+            (None, target_egress, target_tier),
+            (None, target_egress, None),
+            (target_region, None, target_tier),
+            (target_region, None, None),
+            (None, None, target_tier),
+            (None, None, None),
+        ]
+        for region, egress, tier in ladder:
+            cands = self.storage.list_nodes(
+                region=region, egress_type=egress,
+                status=HealthStatus.HEALTHY.value, tier=tier
+            )
+            cands = [c for c in cands if c.name not in exclude_names]
+            if cands:
+                return cands
+        return []
+
     def _rehome_leases_for_node(self, broken_node_name: str) -> Dict[str, Any]:
         leases = self.storage.get_leases_for_node(broken_node_name)
         stale_allocations = self.storage.get_allocations_for_node(broken_node_name)
@@ -259,35 +317,10 @@ class Router:
         target_egress = broken_node.egress_type if broken_node else None
         target_tier = broken_node.tier if broken_node else None
 
-        # Find healthy candidates in the same region, prioritizing the same tier
-        candidates = []
-        if target_tier:
-            candidates = self.storage.list_nodes(
-                region=target_region,
-                egress_type=target_egress,
-                status=HealthStatus.HEALTHY.value,
-                tier=target_tier
-            )
-            if not candidates and target_region:
-                candidates = self.storage.list_nodes(
-                    region=target_region,
-                    status=HealthStatus.HEALTHY.value,
-                    tier=target_tier
-                )
-
-        if not candidates:
-            candidates = self.storage.list_nodes(
-                region=target_region,
-                egress_type=target_egress,
-                status=HealthStatus.HEALTHY.value
-            )
-        if not candidates and target_region:
-            candidates = self.storage.list_nodes(region=target_region, status=HealthStatus.HEALTHY.value)
-        if not candidates:
-            candidates = self.storage.list_nodes(status=HealthStatus.HEALTHY.value)
-
-        # Filter out the broken node just in case
-        candidates = [c for c in candidates if c.name != broken_node_name]
+        candidates = self._find_rehome_candidates(
+            target_region, target_egress, target_tier,
+            exclude_names={broken_node_name}
+        )
         if not candidates:
             return {"rehomed_count": 0, "allocations_rehomed_count": 0, "details": [], "warning": "No healthy backup nodes available to rehome"}
 
@@ -308,10 +341,6 @@ class Router:
         rehomed_details = []
         for acc in affected_accounts:
             new_node = new_node_by_account[acc]
-
-            if acc in lease_accounts:
-                self.storage.set_lease(acc, new_node.name)
-
             rehomed_details.append({
                 "account_id": acc,
                 "from_node": broken_node_name,
@@ -332,13 +361,20 @@ class Router:
             )
 
         # Rewrite universal allocations still pointing at the dead node (service preserved)
+        # and adopt lease-only accounts into `default`; one transaction mirrors leases too.
         allocation_records: List[Tuple[str, str, str, str]] = [
             (a["service"], a["account_id"], new_node_by_account[a["account_id"]].name, now_str)
             for a in stale_allocations
             if a["account_id"] in new_node_by_account
         ]
+        allocated_accounts = {a["account_id"] for a in stale_allocations}
+        for acc in affected_accounts:
+            if acc not in allocated_accounts:
+                allocation_records.append(
+                    ("default", acc, new_node_by_account[acc].name, now_str)
+                )
         if allocation_records:
-            self.storage.batch_save_allocations(allocation_records)
+            self.storage.batch_save_allocations(allocation_records, reason="auto_rehome")
 
         return {
             "rehomed_count": len(rehomed_details),
@@ -346,6 +382,167 @@ class Router:
             "allocations_rehomed_count": len(allocation_records),
             "details": rehomed_details
         }
+
+    def rehome_leases_for_domain(self, fault_domain: str, affected_nodes: List[ProxyNode]) -> Dict[str, Any]:
+        """
+        R3: ONE batch rehome for every account bound anywhere inside a failed domain,
+        instead of one rehome sweep per listener. Called once per domain trip by the
+        failure-domain isolator; all 511 grok2api accounts bound to a dead host migrate
+        in a single batch (one epoch advance per service, one audit event).
+        """
+        with BINDING_WRITE_LOCK:
+            return self._rehome_leases_for_domain(fault_domain, affected_nodes)
+
+    def _rehome_leases_for_domain(self, fault_domain: str, affected_nodes: List[ProxyNode]) -> Dict[str, Any]:
+        broken_names = {n.name for n in affected_nodes}
+        if not broken_names:
+            return {"rehomed_count": 0, "allocations_rehomed_count": 0, "details": []}
+
+        # Union of leases + allocations across every listener in the domain. Accounts
+        # that only exist in the legacy lease table are adopted into the `default`
+        # namespace (same invariant `migrate_legacy_leases` maintains: a lease implies an
+        # allocation), so the whole domain move is still ONE atomic batch.
+        lease_accounts: Dict[str, str] = {}
+        stale_allocs: Dict[Tuple[str, str], str] = {}
+        for node_name in sorted(broken_names):
+            for lease in self.storage.get_leases_for_node(node_name):
+                lease_accounts.setdefault(lease.account_id, lease.node_name)
+            for a in self.storage.get_allocations_for_node(node_name):
+                stale_allocs[(a["service"], a["account_id"])] = a["node_name"]
+
+        affected_accounts = sorted(set(lease_accounts) | {acc for _, acc in stale_allocs})
+        if not affected_accounts:
+            return {"rehomed_count": 0, "allocations_rehomed_count": 0, "details": []}
+
+        anchor = self.storage.get_node(next(iter(sorted(broken_names)))) or affected_nodes[0]
+        candidates = self._find_rehome_candidates(
+            anchor.region, anchor.egress_type, anchor.tier,
+            exclude_names=broken_names
+        )
+        if not candidates:
+            return {
+                "rehomed_count": 0, "allocations_rehomed_count": 0, "details": [],
+                "warning": "No healthy backup nodes available to rehome domain"
+            }
+
+        candidates.sort(key=lambda x: x.name)
+        now_str = datetime.now().isoformat()
+
+        new_node_by_account: Dict[str, ProxyNode] = {}
+        for acc in affected_accounts:
+            hash_val = zlib.crc32(acc.encode("utf-8")) & 0xFFFFFFFF
+            new_node_by_account[acc] = candidates[hash_val % len(candidates)]
+
+        # Single transaction: allocation rows, legacy lease mirror, epoch advance and
+        # change-log rows all commit together (no per-account set_lease round trips).
+        allocation_records: List[Tuple[str, str, str, str]] = [
+            (svc, acc, new_node_by_account[acc].name, now_str)
+            for (svc, acc) in sorted(stale_allocs)
+            if acc in new_node_by_account
+        ]
+        allocated_accounts = {acc for _, acc in stale_allocs}
+        for acc in affected_accounts:
+            if acc not in allocated_accounts:
+                allocation_records.append(
+                    ("default", acc, new_node_by_account[acc].name, now_str)
+                )
+        if allocation_records:
+            self.storage.batch_save_allocations(allocation_records, reason="domain_rehome")
+
+        self.storage.record_circuit_event(
+            node_name=fault_domain,
+            from_state=HealthStatus.DEAD.value,
+            to_state="rehomed",
+            reason=f"domain_rehome_{len(affected_accounts)}_accounts_from_{len(broken_names)}_listeners"
+        )
+        self.storage.incr_metric("ip_pool_rehome_total", {"service": "domain", "trigger": "circuit_dead"})
+
+        return {
+            "rehomed_count": len(affected_accounts),
+            "leases_rehomed_count": len(lease_accounts),
+            "allocations_rehomed_count": len(allocation_records),
+            "details": [
+                {"account_id": acc, "from_node": "domain:" + fault_domain, "to_node": new_node_by_account[acc].name}
+                for acc in affected_accounts
+            ]
+        }
+
+    def rehome_account_binding(
+        self,
+        account_id: str,
+        failed_node_name: str,
+        service: Optional[str] = None,
+        trigger: str = "retry_exhausted",
+        allow_cross_region: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        R2: persist a SINGLE account's binding onto a healthy node when the request-time
+        retry budget is exhausted. Idempotent + deduplicated per account: a migrating
+        request wins the BINDING_WRITE_LOCK; the other N concurrent requests observe the
+        account already off the failed node and become no-ops, so exactly one migration
+        happens for the whole burst.
+
+        Stickyness: same region + egress_type + tier first; when no same-domain healthy
+        node exists and `allow_cross_region`, falls back across regions and marks the
+        transition `cross_region_rebind=True` (audited, metric-labeled).
+        """
+        with BINDING_WRITE_LOCK:
+            svc = service or "default"
+
+            # Dedup: another request already migrated this account, or the binding was
+            # never on the failed node → nothing to do.
+            current = self.storage.find_allocation_by_account(account_id, service=svc)
+            current_node_name = current["node_name"] if current else None
+            if current_node_name and current_node_name != failed_node_name:
+                return {"rehomed": False, "reason": "already_rehomed", "node": current_node_name}
+
+            failed = self.storage.get_node(failed_node_name)
+            if not failed:
+                return {"rehomed": False, "reason": "failed_node_missing"}
+
+            # Never re-park an account on a sibling listener of the host that just failed
+            # it: in the incident all 25 ports of mesh-nl died together, so "another node
+            # with the same host" is not a fallback, it is the same outage.
+            domain_peers = {
+                n.name for n in self.storage.list_nodes_by_domain(failed.effective_fault_domain)
+            }
+            candidates = self._find_rehome_candidates(
+                failed.region, failed.egress_type, failed.tier,
+                exclude_names={failed_node_name} | domain_peers
+            )
+            if not candidates:
+                return {"rehomed": False, "reason": "no_healthy_target"}
+
+            candidates.sort(key=lambda x: x.name)
+            hash_val = zlib.crc32(account_id.encode("utf-8")) & 0xFFFFFFFF
+            selected = candidates[hash_val % len(candidates)]
+
+            cross_region = bool(
+                failed.region
+                and selected.region
+                and selected.region != failed.region
+            )
+            moved = self.storage.move_account_binding(
+                service=svc,
+                account_id=account_id,
+                new_node_name=selected.name,
+                reason=trigger,
+                cross_region_rebind=cross_region,
+            )
+            if moved.get("moved"):
+                self.storage.incr_metric(
+                    "ip_pool_rehome_total",
+                    {"service": svc, "trigger": trigger}
+                )
+            return {
+                "rehomed": moved.get("moved", False),
+                "reason": trigger,
+                "from_node": failed_node_name,
+                "to_node": selected.name,
+                "cross_region_rebind": cross_region,
+                "new_proxy_url": selected.proxy_url,
+                "epoch": moved.get("epoch", 0),
+            }
 
     def resolve_relay_hop(self, node: ProxyNode) -> Optional[ProxyNode]:
         """

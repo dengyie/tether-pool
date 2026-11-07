@@ -6,7 +6,7 @@ import os
 import yaml
 import asyncio
 from contextlib import asynccontextmanager
-from typing import Optional, List
+from typing import Optional, List, Dict
 from fastapi import FastAPI, Query, BackgroundTasks, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, HTMLResponse, RedirectResponse, JSONResponse
@@ -85,6 +85,10 @@ def load_initial_nodes():
                 weight=item.get("weight", 100),
                 relay_mode=item.get("relay_mode", "relay_fallback"),
                 relay_hop_node=item.get("relay_hop_node"),
+                # Fault-domain identity may be declared in the authority config; when
+                # omitted, ProxyNode derives it from host (see effective_fault_domain).
+                fault_domain=item.get("fault_domain", "") or "",
+                provider_region=item.get("provider_region", "") or "",
                 tier=init_tier,
                 configured_tier=configured_tier,
                 quality_score=score
@@ -277,7 +281,9 @@ def create_or_upsert_node(req: NodeCreateRequest):
         relay_hop_node=req.relay_hop_node,
         tier=final_tier,
         configured_tier=configured_tier,
-        quality_score=score
+        quality_score=score,
+        fault_domain=req.fault_domain,
+        provider_region=req.provider_region
     )
     storage.upsert_node(node)
     saved = storage.get_node(req.name)
@@ -467,9 +473,68 @@ async def test_target_service(
     return res
 
 
+@app.get("/v1/bindings/epoch")
+def get_bindings_epoch(service: str = Query("default", min_length=1)):
+    """
+    R5(b): current monotonic binding epoch for a service.
+
+    Downstreams poll this cheaply; when `epoch` differs from the value they last
+    reconciled they pull `GET /v1/export/grok2api?since_epoch=N` for the delta.
+    This replaces "import once and trust it forever", the pattern that let 511
+    grok2api accounts keep dialling mesh-nl after the host was gone.
+    """
+    info = storage.get_binding_epoch(service)
+    if info is None:
+        return {"service": service, "epoch": 0, "changed_at": None, "last_change_reason": None}
+    return info
+
+
 @app.get("/v1/export/grok2api")
-def export_grok2api():
-    """Export healthy nodes formatted for grok2api egress node injection"""
+def export_grok2api(
+    since_epoch: Optional[int] = Query(
+        None, ge=0,
+        description="When set, return only the bindings that moved after this epoch"
+    )
+):
+    """Export healthy nodes formatted for grok2api egress node injection.
+
+    With `since_epoch=N` the response carries only accounts whose binding moved since epoch
+    N (mapped to their *current* node, not the intermediate hop) plus the current epoch, so
+    a downstream can reconcile incrementally instead of doing a one-time static import.
+    """
+    if since_epoch is not None:
+        service = "grok2api"
+        changes = storage.list_binding_changes_since(service, since_epoch)
+        current = storage.get_binding_epoch(service) or {
+            "epoch": 0, "changed_at": None, "last_change_reason": None
+        }
+        assignments = {}
+        for change in changes:
+            acc = change.account_id
+            if acc in assignments:
+                continue
+            alloc = storage.get_allocation(service, acc)
+            node = storage.get_node(alloc["node_name"]) if alloc else None
+            if not node:
+                continue
+            assignments[acc] = {
+                "name": node.name,
+                "url": f"socks5://{node.host}:{node.port}",
+                "region": node.region,
+                "egress_type": node.egress_type,
+                "exit_ip": node.exit_ip or ""
+            }
+        return {
+            "count": len(assignments),
+            "nodes": list(assignments.values()),
+            "assignments": assignments,
+            "epoch": current["epoch"],
+            "since_epoch": since_epoch,
+            "changed_at": current.get("changed_at"),
+            "last_change_reason": current.get("last_change_reason"),
+            "reason_breakdown": _binding_reason_breakdown(changes),
+        }
+
     nodes = storage.list_nodes(status="healthy")
     if not nodes:
         nodes = storage.list_nodes()  # fallback
@@ -484,6 +549,13 @@ def export_grok2api():
             "exit_ip": n.exit_ip or ""
         })
     return {"count": len(egress_nodes), "nodes": egress_nodes}
+
+
+def _binding_reason_breakdown(changes) -> Dict[str, int]:
+    breakdown: Dict[str, int] = {}
+    for change in changes:
+        breakdown[change.reason] = breakdown.get(change.reason, 0) + 1
+    return breakdown
 
 
 @app.get("/v1/export/cpa")

@@ -19,13 +19,36 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.models import ProxyNode, RelayMode, ProbeResult, HealthStatus
 from core.storage import Storage
 from core.router import Router
+from core.failover import FailureDomainIsolator, EasytierPeerMonitor
 
 DEFAULT_GATEWAY_HOST = os.environ.get("GATEWAY_HOST", "127.0.0.1")
 DEFAULT_GATEWAY_PORT = int(os.environ.get("GATEWAY_PORT", "9101"))
 BUFFER_SIZE = 65536
 CONNECT_TIMEOUT = 10.0
+
+# R1: bounded failover budget. The old code hardcoded `range(2)`, which meant a dead node
+# was retried exactly once and then the request died — even though the pool had dozens of
+# healthy exits. 3 attempts matches the acceptance target (3 x <=2s < 6s worst case).
+GATEWAY_MAX_ATTEMPTS = max(1, int(os.environ.get("GATEWAY_MAX_ATTEMPTS", "3")))
+# No wait by default: an all-healthy pool almost never retries, and adding sleep here
+# stacks directly onto the user-visible request latency.
+GATEWAY_RETRY_BACKOFF_MS = max(0, int(os.environ.get("GATEWAY_RETRY_BACKOFF_MS", "0")))
+# R4: hard ceiling on a *single* attempt, including any relay fallback chaining. Without
+# this the RELAY_FALLBACK path could spend 2s direct + 2s relay per attempt, so three
+# attempts would blow the 6s budget on a host that is simply gone.
+GATEWAY_ATTEMPT_TIMEOUT = float(os.environ.get("GATEWAY_ATTEMPT_TIMEOUT", "2.0"))
+
+# R4: EasyTier peer-table monitoring (sub-5s whole-host detection).
+EASYTIER_MONITOR_ENABLED = os.environ.get("EASYTIER_MONITOR_ENABLED", "1").strip() not in ("0", "false", "no")
+EASYTIER_SCAN_INTERVAL_SEC = float(os.environ.get("EASYTIER_SCAN_INTERVAL_SEC", "1.0"))
+
 # How long the surviving direction may keep draining after the opposite side EOFs.
 HALF_CLOSE_GRACE_SECONDS = 5.0
+
+# R6 error semantics, consumed by downstreams to decide whether to retry.
+ERR_POOL_EXHAUSTED = "pool_exhausted"
+ERR_BINDING_REHOMED = "binding_rehomed"
+ERR_NO_HEALTHY_TARGET = "no_healthy_target"
 
 # Routing metadata consumed by the gateway itself; never forwarded to origins.
 INTERNAL_ROUTING_HEADERS = frozenset({
@@ -46,6 +69,33 @@ INTERNAL_ROUTING_HEADERS = frozenset({
 
 class NoPoolNodesError(RuntimeError):
     """No usable node in the pool: a capacity condition (503), not an upstream fault."""
+
+
+class UpstreamFailoverError(Exception):
+    """
+    Retry budget exhausted for this request (R6).
+
+    Carries the machine-readable `code` the gateway puts in `X-TetherPool-Error` so a
+    downstream can distinguish "the whole pool is full" (shed load) from "your account's
+    binding was dead and has now moved, retry once" (retry immediately) without parsing
+    prose out of the response body.
+    """
+
+    def __init__(self, code: str, message: str, retry: Optional[int] = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.retry = retry
+
+    @property
+    def http_status(self) -> int:
+        if self.code == ERR_BINDING_REHOMED:
+            return 502
+        return 503
+
+    @property
+    def http_reason(self) -> str:
+        return "Bad Gateway" if self.http_status == 502 else "Service Unavailable"
 
 
 def _is_internal_header(name: str) -> bool:
@@ -442,12 +492,32 @@ def parse_proxy_credentials(raw_user: str) -> ParsedCredentials:
 
 
 class ForwardProxyGateway:
-    def __init__(self, storage: Storage, router: Router, host: str = DEFAULT_GATEWAY_HOST, port: int = DEFAULT_GATEWAY_PORT):
+    def __init__(
+        self,
+        storage: Storage,
+        router: Router,
+        host: str = DEFAULT_GATEWAY_HOST,
+        port: int = DEFAULT_GATEWAY_PORT,
+        max_attempts: int = GATEWAY_MAX_ATTEMPTS,
+        retry_backoff_ms: int = GATEWAY_RETRY_BACKOFF_MS,
+        attempt_timeout: float = GATEWAY_ATTEMPT_TIMEOUT,
+        isolator: Optional[FailureDomainIsolator] = None,
+        peer_monitor: Optional[EasytierPeerMonitor] = None
+    ):
         self.storage = storage
         self.router = router
         self.host = host
         self.port = port
         self.server = None
+        self.max_attempts = max(1, max_attempts)
+        self.retry_backoff = max(0, retry_backoff_ms) / 1000.0
+        self.attempt_timeout = max(0.1, attempt_timeout)
+        # R3: one isolator per gateway; it degrades to single-node reporting for
+        # domains that contain only one listener.
+        self.isolator = isolator or FailureDomainIsolator(storage, router)
+        # R4: optional peer-table watcher, started by `start()` when enabled.
+        self.peer_monitor = peer_monitor
+        self._peer_task = None
 
     def _extract_routing_headers(self, headers_dict: Dict[str, str], client_ip: str) -> RoutingContext:
         """
@@ -568,6 +638,31 @@ class ForwardProxyGateway:
                 # Both direct and chained relay failed; emergency bridge via relay hop directly as egress
                 return await socks5_connect(relay_hop.host, relay_hop.port, target_host, target_port, timeout=timeout)
 
+    def _record_attempts(self, attempts: int):
+        """Feeds the R7 per-request attempt histogram (rendered by MetricsCollector)."""
+        entries = []
+        for bound in (1, 2, 3, 4):
+            if attempts <= bound:
+                entries.append((
+                    "ip_pool_gateway_attempts_per_request_bucket",
+                    {"le": str(bound)}, 1.0,
+                ))
+        entries.append((
+            "ip_pool_gateway_attempts_per_request_bucket", {"le": "+Inf"}, 1.0
+        ))
+        entries.append((
+            "ip_pool_gateway_attempts_per_request_sum", {}, float(attempts)
+        ))
+        entries.append((
+            "ip_pool_gateway_attempts_per_request_count", {}, 1.0
+        ))
+        # One transaction: the old per-bucket writes put seven SQLite commits on the
+        # success path of every proxied request. Metrics must never fail a request.
+        try:
+            self.storage.incr_metrics(entries)
+        except Exception as exc:
+            print(f"[-] Failed to record gateway attempt metrics: {exc}")
+
     async def _open_upstream(
         self,
         account_id: str,
@@ -581,17 +676,28 @@ class ForwardProxyGateway:
         force_rebind: bool = False,
     ):
         """
-        Opens the upstream SOCKS5 tunnel for an account, retrying once on a different exit.
+        Opens the upstream SOCKS5 tunnel for an account, bounded by `max_attempts` (R1).
 
-        A request-time connect failure is the fastest signal that a node is broken, so it
-        is recorded as a probe failure (letting the circuit breaker react immediately
-        instead of waiting up to one full sweep) and the request is retried through
-        another node rather than returning 502 for the rest of the probe interval.
+        Only the CONNECT/dial phase happens here; once streams are returned the caller
+        starts forwarding, and no retry can happen after that — a forwarded request must
+        never be replayed (R1 constraint, and the exact reason grok2api's incident was
+        expensive: it retried at the wrong layer).
+
+        On each failure the node is (a) excluded for the rest of THIS request, (b) fed to
+        the circuit breaker, and (c) reported to the failure-domain isolator so a dead
+        host takes all of its listeners down in one sweep (R3). When the budget is spent,
+        the account's durable binding is moved to a healthy node (R2) so the *next* request
+        succeeds even if this one cannot.
         """
-        excluded = None
+        excluded: set = set()
         last_err: Optional[Exception] = None
+        attempts = 0
+        last_node_name: Optional[str] = None
 
-        for attempt in range(2):
+        for attempt in range(self.max_attempts):
+            if attempt > 0 and self.retry_backoff > 0:
+                await asyncio.sleep(self.retry_backoff)
+
             lease = self.router.acquire_for_account(
                 account_id=account_id,
                 region=region,
@@ -600,34 +706,125 @@ class ForwardProxyGateway:
                 tier_policy=tier_policy,
                 service=service,
                 force_rebind=force_rebind or (attempt > 0),
-                exclude_node=excluded,
+                exclude_nodes=excluded,
             )
             if not lease:
-                raise NoPoolNodesError("No available proxy nodes in IP pool")
+                # The pool itself cannot serve this request; retrying cannot help.
+                self._record_attempts(max(attempts, 1))
+                raise UpstreamFailoverError(
+                    ERR_POOL_EXHAUSTED,
+                    "No available proxy nodes in IP pool"
+                )
 
             node = self.storage.get_node(lease.node_name)
             if not node:
-                raise NoPoolNodesError("Target proxy node not found in registry")
+                excluded.add(lease.node_name)
+                continue
 
+            last_node_name = node.name
+            attempts += 1
             try:
-                return await self.connect_upstream_adaptive(
-                    node=node, target_host=target_host, target_port=target_port
+                streams = await asyncio.wait_for(
+                    self.connect_upstream_adaptive(
+                        node=node, target_host=target_host, target_port=target_port
+                    ),
+                    timeout=self.attempt_timeout,
                 )
+                self._record_attempts(attempts)
+                # A listener answered: re-arm its domain so a genuine second outage is not
+                # swallowed by the trip cooldown left over from the previous one.
+                try:
+                    self.isolator.note_success(node.name)
+                except Exception as note_err:
+                    print(f"[-] Isolator note_success failed for {node.name}: {note_err}")
+                return streams
             except Exception as exc:
                 last_err = exc
-                excluded = node.name
+                excluded.add(node.name)
+
                 _, event = self.storage.update_probe_result(ProbeResult(
                     node_name=node.name,
                     success=False,
                     error=f"gateway_connect_failed: {exc}"[:120],
                 ))
-                if event and event.to_state == HealthStatus.DEAD.value and self.router:
+
+                # R3: a connection-layer failure is a host-level signal, not a port-level
+                # one. The isolator decides whether this collapses the whole domain, but
+                # only once the node's own circuit breaker has confirmed a DEAD transition
+                # (a single failed dial is not a host failure).
+                domain_result: Dict[str, object] = {"action": "no_isolator"}
+                if self.isolator is not None:
+                    try:
+                        domain_result = self.isolator.report_unreachable(
+                            node.name,
+                            reason="gateway_connect_failed",
+                            confirmed_dead=bool(
+                                event and event.to_state == HealthStatus.DEAD.value
+                            ),
+                        )
+                    except Exception as isolation_err:
+                        print(f"[-] Failure-domain isolation error for {node.name}: {isolation_err}")
+
+                # Per-node circuit trip still drains that node's own bindings when the
+                # domain did not trip (e.g. a genuinely single broken listener).
+                if (
+                    domain_result.get("action") != "isolated"
+                    and event
+                    and event.to_state == HealthStatus.DEAD.value
+                    and self.router
+                ):
                     try:
                         self.router.rehome_leases_for_node(node.name)
                     except Exception as rehome_err:
                         print(f"[-] Error rehoming leases for {node.name} on gateway failure: {rehome_err}")
 
-        raise last_err if last_err else RuntimeError("Upstream connection failed")
+        self._record_attempts(max(attempts, 1))
+        try:
+            self.storage.incr_metric(
+                "ip_pool_retry_exhausted_total",
+                {"service": service or "default", "reason": "connect_failed"}
+            )
+        except Exception as metric_err:
+            print(f"[-] Failed to record retry-exhausted metric: {metric_err}")
+
+        # R2: the request is lost, but the ACCOUNT must not be. Move its durable binding
+        # onto a healthy node so the next request does not hit the same dead host.
+        rehome = {"rehomed": False, "reason": "no_attempts"}
+        if last_node_name and self.router:
+            try:
+                rehome = self.router.rehome_account_binding(
+                    account_id=account_id,
+                    failed_node_name=last_node_name,
+                    service=service,
+                    trigger="retry_exhausted",
+                )
+            except Exception as rebind_err:
+                print(f"[-] Account rebind after retry exhaustion failed for {account_id}: {rebind_err}")
+
+        if rehome.get("rehomed"):
+            raise UpstreamFailoverError(
+                ERR_BINDING_REHOMED,
+                f"Retry budget exhausted on {last_node_name}; binding moved to "
+                f"{rehome.get('to_node')}. Retry this request once.",
+                retry=1,
+            )
+        if rehome.get("reason") == "already_rehomed":
+            # A concurrent request for the same account already won the rebind. The durable
+            # binding is now off the failed node, so this caller should also retry once
+            # (reporting `no_healthy_target` here would wrongly tell the downstream to stop).
+            raise UpstreamFailoverError(
+                ERR_BINDING_REHOMED,
+                f"Binding for {account_id} was already moved to {rehome.get('node')}. "
+                f"Retry this request once.",
+                retry=1,
+            )
+
+        reason_detail = "no_healthy_target" if rehome.get("reason") == "no_healthy_target" else "unavailable"
+        raise UpstreamFailoverError(
+            ERR_NO_HEALTHY_TARGET,
+            f"No healthy target available after {attempts} attempt(s): {reason_detail}. "
+            f"Last error: {last_err}",
+        )
 
     async def handle_client(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
         peer = client_writer.get_extra_info("peername")
@@ -684,7 +881,18 @@ class ForwardProxyGateway:
                         force_rebind=route_ctx.force_rebind,
                     )
                 except NoPoolNodesError as pool_err:
-                    err_resp = f"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\r\n{pool_err}\r\n".encode()
+                    err_resp = f"HTTP/1.1 503 Service Unavailable\r\nX-TetherPool-Error: {ERR_POOL_EXHAUSTED}\r\nContent-Type: text/plain\r\n\r\n{pool_err}\r\n".encode()
+                    client_writer.write(err_resp)
+                    await client_writer.drain()
+                    client_writer.close()
+                    return
+                except UpstreamFailoverError as failover_err:
+                    retry_hdr = f", retry={failover_err.retry}" if failover_err.retry else ""
+                    err_resp = (
+                        f"HTTP/1.1 {failover_err.http_status} {failover_err.http_reason}\r\n"
+                        f"X-TetherPool-Error: {failover_err.code}{retry_hdr}\r\n"
+                        f"Content-Type: text/plain\r\n\r\n{failover_err.message}\r\n"
+                    ).encode()
                     client_writer.write(err_resp)
                     await client_writer.drain()
                     client_writer.close()
@@ -736,7 +944,18 @@ class ForwardProxyGateway:
                         force_rebind=route_ctx.force_rebind,
                     )
                 except NoPoolNodesError as pool_err:
-                    err_resp = f"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\r\n{pool_err}\r\n".encode()
+                    err_resp = f"HTTP/1.1 503 Service Unavailable\r\nX-TetherPool-Error: {ERR_POOL_EXHAUSTED}\r\nContent-Type: text/plain\r\n\r\n{pool_err}\r\n".encode()
+                    client_writer.write(err_resp)
+                    await client_writer.drain()
+                    client_writer.close()
+                    return
+                except UpstreamFailoverError as failover_err:
+                    retry_hdr = f", retry={failover_err.retry}" if failover_err.retry else ""
+                    err_resp = (
+                        f"HTTP/1.1 {failover_err.http_status} {failover_err.http_reason}\r\n"
+                        f"X-TetherPool-Error: {failover_err.code}{retry_hdr}\r\n"
+                        f"Content-Type: text/plain\r\n\r\n{failover_err.message}\r\n"
+                    ).encode()
                     client_writer.write(err_resp)
                     await client_writer.drain()
                     client_writer.close()
@@ -777,11 +996,37 @@ class ForwardProxyGateway:
             except Exception:
                 pass
 
+    async def _peer_monitor_loop(self):
+        """
+        R4: scans the EasyTier peer table once per interval. A missing peer means the whole
+        host is gone, which the isolator converts into one domain trip — measured in
+        seconds rather than the 15s HTTP-probe timeout that made the incident expensive.
+        """
+        assert self.peer_monitor is not None
+        while True:
+            try:
+                await asyncio.to_thread(self.peer_monitor.scan_once)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[-] EasyTier peer monitor error: {exc}")
+            await asyncio.sleep(EASYTIER_SCAN_INTERVAL_SEC)
+
     async def start(self):
         self.server = await asyncio.start_server(self.handle_client, self.host, self.port)
         print(f"[+] Unified Forward Proxy Gateway listening on {self.host}:{self.port}")
+        if self.peer_monitor is not None and EASYTIER_MONITOR_ENABLED:
+            self._peer_task = asyncio.create_task(self._peer_monitor_loop())
+            print("[+] EasyTier peer monitor started (whole-host fast detection)")
 
     async def stop(self):
+        if self._peer_task:
+            self._peer_task.cancel()
+            try:
+                await self._peer_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._peer_task = None
         if self.server:
             self.server.close()
             await self.server.wait_closed()
@@ -790,7 +1035,25 @@ class ForwardProxyGateway:
 async def main():
     storage = Storage()
     router = Router(storage)
-    gateway = ForwardProxyGateway(storage, router)
+    isolator = FailureDomainIsolator(storage, router)
+
+    mesh_overrides: Dict[str, str] = {}
+    raw_overrides = os.environ.get("EASYTIER_HOST_MAP", "").strip()
+    if raw_overrides:
+        # Format: "10.144.144.12=mesh-nl,10.144.144.21=aws-tokyo"
+        for pair in raw_overrides.split(","):
+            if "=" in pair:
+                mesh_ip, host_label = pair.split("=", 1)
+                mesh_overrides[mesh_ip.strip()] = host_label.strip()
+
+    peer_monitor = EasytierPeerMonitor(
+        storage=storage,
+        isolator=isolator,
+        cli_path=os.environ.get("EASYTIER_CLI", "easytier-cli"),
+        host_by_mesh_ip=mesh_overrides,
+    )
+
+    gateway = ForwardProxyGateway(storage, router, isolator=isolator, peer_monitor=peer_monitor)
     await gateway.start()
     try:
         await asyncio.Event().wait()

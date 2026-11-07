@@ -46,10 +46,22 @@ TetherPool 控制面提供高可用、异步非阻塞的 RESTful API，默认监
     "weight": 100,
     "tier": "premium",
     "configured_tier": "premium",
-    "relay_mode": "relay_fallback"
+    "relay_mode": "relay_fallback",
+    "fault_domain": "",
+    "provider_region": ""
   }
   ```
-  *(注：`tier` 可选 `premium` 或 `standard`；`relay_mode` 可选 `direct_only`, `relay_pref`, `relay_fallback`。API 创建的节点系统会自动打上 `api_managed` 标签，即使执行 `POST /v1/config/reload` 重新读取静态 YAML，动态注册的节点也绝不会被错误标记为 dead 或被修剪删除)*
+  *(注：`tier` 可选 `premium` 或 `standard`；`relay_mode` 可选 `direct_only`, `relay_pref`, `relay_fallback`。`fault_domain` 为**故障域 (fault domain)** 标识，同一宿主机上的所有监听端口应留空（自动回退为 `host`）或显式填同一个值，一个宿主机故障时它们会被一次性整体隔离；`provider_region` 为云厂商可用区标识（如 `leaseweb-nl-ams`），仅作观测用途。API 创建的节点系统会自动打上 `api_managed` 标签，即使执行 `POST /v1/config/reload` 重新读取静态 YAML，动态注册的节点也绝不会被错误标记为 dead 或被修剪删除)*
+- **`config/nodes.yaml` 中的对应写法**（可选，缺省时 `fault_domain` 回退为 `host`）：
+  ```yaml
+  - name: nl-warp-01
+    host: 10.144.144.12
+    port: 10881
+    fault_domain: mesh-nl      # 显式声明；省略则等于 host
+    provider_region: leaseweb-nl-ams
+    tier: standard
+    egress_type: warp_ipv6
+  ```
 - **成功响应**：`200 OK` (返回完整的 `ProxyNode` 对象)
 
 ---
@@ -235,6 +247,67 @@ TetherPool 控制面提供高可用、异步非阻塞的 RESTful API，默认监
 
 ---
 
+## 三·补充、绑定增量对账契约 (Binding Reconciliation — R5)
+
+> **背景**：2026-11-07 `mesh-nl` 整机掉线事故中，grok2api 通过"一次性静态导入"拿到了 511 个账号的节点映射，此后主机消失它也无从知晓，于是一直对着死节点重试。**静态导入是错误用法**，下游必须按下面的契约做增量对账。
+
+下游有两种合法接法，任选其一（推荐 1）：
+
+### 方案 1：零配置网关路由（推荐）
+下游不再关心"账号 → 哪个节点"，而是把代理地址固定指向网关，用账号名做认证前缀：
+```
+http://<account_id>:<gateway_password>@<gateway_host>:9101
+```
+节点绑定完全由 TetherPool 服务端维护；上游节点死亡时网关自动重试 3 次（`GATEWAY_MAX_ATTEMPTS`）并在重试耗尽后把该账号的持久绑定迁移到健康节点，下游只需一次重试即可，不需要感知节点列表。故障恢复期间网关返回：
+- `502 Bad Gateway` + `X-TetherPool-Error: binding_rehomed, retry=1` — 绑定已迁移，**立即重放一次**该请求即可成功。
+- `503 Service Unavailable` + `X-TetherPool-Error: pool_exhausted` — 池内已无可分配节点，属于全站故障，退避后再试。
+- `503 Service Unavailable` + `X-TetherPool-Error: no_healthy_target` — 该账号在目标地区/出口类型下没有可用替代节点，需人工扩容。
+
+### 方案 2：绑定纪元 (binding epoch) 增量拉取
+仍需要在自己进程内维护"账号→节点"映射的下游，按以下两步轮询，**禁止**一次性拉全量后长期信任：
+
+#### 2.0.1 查询当前绑定纪元
+- **方法**：`GET /v1/bindings/epoch?service=grok2api`
+- **说明**：极轻量端点，只返回一个单调递增整数。任何账号的绑定发生迁移（重编排、故障域隔离、手动改绑）都会让该业务的 epoch +1。调用间隔建议 30s，比拉全量导出便宜两个数量级。
+- **成功响应**：`200 OK`
+  ```json
+  {
+    "service": "grok2api",
+    "epoch": 42,
+    "changed_at": "2026-11-07T03:14:05.120000",
+    "last_change_reason": "domain_rehome"
+  }
+  ```
+  *(epoch 为 `0` 表示该业务尚无任何绑定变更记录，此时可安全地做首次全量对齐)*
+
+#### 2.0.2 拉取增量绑定
+- **方法**：`GET /v1/export/grok2api?since_epoch=42`
+- **说明**：**只**返回 `epoch > since_epoch` 的变更，且每个账号只出现一次——映射到它的**当前**节点，而不是中间跳转过的节点。下游把这些条目覆盖到自己缓存的映射上，随后把本地记录的 epoch 提升到响应里的 `epoch` 即可。响应里没有任何账号回滚/删除条目，因此天然幂等，可以安全重放。
+- **成功响应**：`200 OK`
+  ```json
+  {
+    "count": 511,
+    "nodes": [ { "name": "nl-warp-01", "url": "socks5://10.144.144.12:10881", "region": "netherlands", "egress_type": "warp_ipv6", "exit_ip": "" } ],
+    "assignments": { "grok_acc_101": { "name": "sg-huawei-warp-05", "url": "socks5://10.144.144.13:10885", "region": "singapore", "egress_type": "warp_ipv6", "exit_ip": "" } },
+    "epoch": 43,
+    "since_epoch": 42,
+    "changed_at": "2026-11-07T03:14:41.882000",
+    "last_change_reason": "domain_rehome",
+    "reason_breakdown": { "domain_rehome": 511 }
+  }
+  ```
+  - `assignments`：本次需要应用的增量映射（账号 → 当前节点），以它为权威。
+  - `nodes`：`assignments` 中涉及节点的去重列表，便于下游一次性预热连接池。
+  - `epoch` / `since_epoch`：对账后的新纪元与本次请求的起始纪元。
+  - `reason_breakdown`：各迁移原因的条目数（`auto_rehome`, `domain_rehome`, `retry_exhausted` 等），便于下游区分数以千计的"整机迁移"与零星换绑。
+- **错误响应**：`422 Unprocessable Entity`（`since_epoch` 为负或非整数）
+- **不带 `since_epoch`**：保持历史全量导出语义（健康节点列表），仅用于**首次冷启动对齐**。
+
+**t = 0 → t + 5s 的故障恢复时序**：EasyTier peer 消失（≈1s 内）→ 整机 25 个监听合并为**一次**域事件、511 个账号在**单个**事务里批量迁移（epoch 42→43）→ 下游下一次 `GET /v1/bindings/epoch` 看到 43，执行一次 `?since_epoch=42` 拉取 511 条增量，全部恢复。第一轮成功率 > 95%，后续 100%。
+
+
+---
+
 ## 四、账号风控与自愈管控 API (Battery Events & Circuit)
 
 ### 1. 业务异常反馈与自动换绑 (Battery Event Report)
@@ -314,6 +387,71 @@ TetherPool 控制面提供高可用、异步非阻塞的 RESTful API，默认监
 
 ### 3. Grok2api 格式导出
 - **方法**：`GET /v1/export/grok2api`
+- **Query 参数**：`since_epoch` (可选, ≥0)
+- **说明**：
+  - 不带 `since_epoch`：全量导出 `healthy` 节点的 `socks5://` 地址，仅适用于下游**首次冷启动对齐**。
+  - 带 `since_epoch=N`：增量对账，仅返回 epoch > N 期间绑定发生迁移的账号及其**当前**节点（详见「三·补充、绑定增量对账契约」）。长期运行的下游必须走增量模式。
+
+### 3.1 绑定纪元端点
+- **方法**：`GET /v1/bindings/epoch?service=grok2api`
+- **说明**：返回当前绑定纪元 `{service, epoch, changed_at, last_change_reason}`。
 
 ### 4. CPA 格式导出
 - **方法**：`GET /v1/export/cpa`
+
+---
+
+## 七、故障域与死节点自愈指标 (R3 / R7)
+
+以下指标由网关进程写入共享的 `runtime_metrics` 表，由控制面 `/metrics` 端点统一渲染，因此**只需抓取控制面一个端点**。
+
+| 指标名 | 类型 | 标签 | 含义 |
+|---|---|---|---|
+| `ip_pool_gateway_attempts_per_request` | histogram | `le` | 每次客户端请求实际尝试了多少个出口（1/2/3/4/+Inf） |
+| `ip_pool_retry_exhausted_total` | counter | `service`, `reason` | 网关重试预算耗尽的次数 |
+| `ip_pool_rehome_total` | counter | `service`, `trigger` | 账号持久绑定被迁移的次数（`trigger`: `circuit_dead`, `retry_exhausted`, …） |
+| `ip_pool_domain_trip_total` | counter | `domain`, `policy` | 整个故障域被隔离的次数（**一个主机掉线只应 +1**） |
+| `ip_pool_host_unreachable_seconds` | gauge | `host` | 该故障域当前已持续不可达的秒数，恢复时置 0 |
+
+关键告警建议：
+- `rate(ip_pool_retry_exhausted_total[5m]) > 0` 持续出现 → 有节点在"半死"状态（能建连但转发失败）。
+- `ip_pool_domain_trip_total` 单分钟突增 → 整机级故障，立即查看对应 `domain`。
+- `ip_pool_host_unreachable_seconds > 30` → 该主机上的账号迁移可能不充分，需要人工介入。
+
+---
+
+## 八、死节点自愈部署参数 (Deployment Parameters)
+
+### 网关进程 (`gateway/server.py`)
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `GATEWAY_HOST` | `127.0.0.1` | 网关监听地址 |
+| `GATEWAY_PORT` | `9101` | 网关监听端口 |
+| `GATEWAY_MAX_ATTEMPTS` | `3` | 单次客户端请求最多的出口尝试次数；请求一旦开始转发字节就锁定，绝不重放 |
+| `GATEWAY_RETRY_BACKOFF_MS` | `0` | 两次尝试之间的退避毫秒数 |
+| `GATEWAY_ATTEMPT_TIMEOUT` | `2.0` | 单次隧道建连（含 SOCKS5 握手）超时秒数；调小可加快失败切换 |
+
+**预算**：最坏耗时 ≈ `GATEWAY_MAX_ATTEMPTS × GATEWAY_ATTEMPT_TIMEOUT`。默认 `3 × 2.0 = 6s`，满足"单请求 < 6s"验收线。若网络 RTT 高，可下调 `GATEWAY_ATTEMPT_TIMEOUT` 到 `1.5`。
+
+### 故障域隔离器 (`core/failover.py`)
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `FAILURE_DOMAIN_TRIP` | `any` | 触发整域隔离所需的"不可达监听"比例策略：`any`（任一节点确认 DEAD 即整域隔离）、`quorum`（≥ 比例阈值）、`all`（全部不可达才隔离） |
+| `FAILURE_DOMAIN_QUORUM_RATIO` | `0.5` | `quorum` 策略下的比例阈值（0~1） |
+| `FAILURE_DOMAIN_COOLDOWN_SEC` | `60` | 同一故障域两次隔离事件之间的去抖窗口，避免抖动期重复批量迁移 |
+
+### EasyTier 秒级掉线检测
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `EASYTIER_MONITOR_ENABLED` | `1` | 是否启用 EasyTier peer 监视器（`0/false/no` 关闭） |
+| `EASYTIER_SCAN_INTERVAL_SEC` | `1.0` | peer 表扫描间隔秒数 |
+| `EASYTIER_PEER_MISS_SCRAPES` | `2` | 连续多少次扫描缺席才判定主机死亡（≈ `2 × 1s`，满足 < 5s 目标） |
+| `EASYTIER_CLI` | `easytier-cli` | `easytier-cli` 可执行文件路径 |
+| `EASYTIER_HOST_MAP` | — | 显式 mesh IP → 主机名映射，逗号分隔，如 `10.144.144.12=mesh-nl,10.144.144.13=mesh-sg`。只有**显式声明**或**曾在 peer 表出现过**的主机才会被判定掉线，避免把公网 IP / `127.0.0.1` 监听误判为 mesh 掉线；生产建议显式配置，以便网关重启后仍能在首个扫描周期发现已失联主机。右侧主机名应与节点的 `fault_domain`（未配置时即节点 `host`）一致；不一致时监视器会自动回退到该 IP 对应的实际故障域，不会漏判 |
+
+**行为说明**：EasyTier 是全互联 P2P 网格，peer 直连消失即代表整机失联，监视器会在 1~2 个扫描周期内把该 host 的所有监听一次性判定为 DEAD，**并只产生一个域事件、一次批量重编排**。空的 peer 表（CLI 故障/尚未同步）不会触发任何隔离，避免误杀全池。
+
+

@@ -111,6 +111,23 @@ curl -X POST http://10.144.144.9:9100/v1/battery/event \
 ```
 系统会瞬间将 `grok_user_01` 隔离重编排到另一个健康的独立出网节点，下次该账号通过网关发请求时即无缝走新出口。
 
+#### 死节点故障自愈契约（重要）
+- **推荐零配置**：继续使用上面的网关地址即可。上游节点死亡时网关会在每次请求内最多重试 `GATEWAY_MAX_ATTEMPTS`（默认 3）个不同出口，**重试耗尽后自动迁移该账号的持久绑定**；下游只需处理错误头：
+  - `502` + `X-TetherPool-Error: binding_rehomed, retry=1` → 绑定已迁移，立即重放一次请求即可成功。
+  - `503` + `X-TetherPool-Error: pool_exhausted` → 全池暂无可用节点，退避重试。
+  - `503` + `X-TetherPool-Error: no_healthy_target` → 该账号无可用替代节点，需要扩容。
+- **若下游必须自行维护"账号→节点"映射**：**禁止一次性静态导入后长期信任**（2026-11-07 `mesh-nl` 事故的根因）。应改为轮询绑定纪元：
+  ```bash
+  # 1) 轻量轮询纪元（建议 30s）
+  curl -s 'http://10.144.144.9:9100/v1/bindings/epoch?service=grok2api'
+  # {"service":"grok2api","epoch":43,"changed_at":"...","last_change_reason":"domain_rehome"}
+
+  # 2) 纪元变化时只拉增量，并覆盖到本地映射
+  curl -s 'http://10.144.144.9:9100/v1/export/grok2api?since_epoch=42'
+  # {"assignments":{"grok_user_01":{"name":"sg-huawei-warp-05","url":"socks5://..."}},"epoch":43,...}
+  ```
+  首次冷启动可以不带 `since_epoch` 做一次全量对齐。详见 [API.md](./API.md) 的「绑定增量对账契约」与「死节点自愈部署参数」两节。
+
 ---
 
 ### 2. CPA Manager Plus (自动化运营矩阵)
