@@ -1047,15 +1047,15 @@ class ForwardProxyGateway:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                print(f"[-] EasyTier peer monitor error: {exc}")
+                logger.warning("EasyTier peer monitor error: %s", exc)
             await asyncio.sleep(EASYTIER_SCAN_INTERVAL_SEC)
 
     async def start(self):
         self.server = await asyncio.start_server(self.handle_client, self.host, self.port)
-        print(f"[+] Unified Forward Proxy Gateway listening on {self.host}:{self.port}")
+        logger.info("Unified Forward Proxy Gateway listening on %s:%s", self.host, self.port)
         if self.peer_monitor is not None and EASYTIER_MONITOR_ENABLED:
             self._peer_task = asyncio.create_task(self._peer_monitor_loop())
-            print("[+] EasyTier peer monitor started (whole-host fast detection)")
+            logger.info("EasyTier peer monitor started (whole-host fast detection)")
 
     async def stop(self):
         if self._peer_task:

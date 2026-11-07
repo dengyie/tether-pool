@@ -389,6 +389,44 @@ class EasytierPeerMonitor:
             "ip_pool_host_unreachable_seconds", {"host": domain}, value
         )
 
+    @staticmethod
+    def _subnet_of(ip: str) -> str:
+        return ".".join(ip.split(".")[:3]) + "."
+
+    @staticmethod
+    def _is_private_ip(ip: str) -> bool:
+        parts = ip.split(".")
+        if len(parts) != 4 or not all(p.isdigit() for p in parts):
+            return False
+        a, b = int(parts[0]), int(parts[1])
+        return a == 10 or (a == 192 and b == 168) or (a == 172 and 16 <= b <= 31)
+
+    def seed_known_hosts(self, peers: List[Dict[str, str]]) -> None:
+        """
+        Seeds the known-participant set so an outage that predates this process is still
+        monitored.
+
+        `_seen_hosts` starts empty, which means a host that is *already* gone when the
+        gateway (re)starts is never watched — exactly the deploy-time case: the process
+        came up after `mesh-nl` had vanished, so its 179 listeners were going unmeasured
+        and would never have produced a domain trip. Participation is inferred from the
+        mesh subnet itself: any RFC1918 node host sharing a /24 with a peer that IS
+        present. Loopback and public-IP listeners (the 51 clash proxies on 127.0.0.1)
+        can never match, which keeps the "everything is dead" failure mode impossible.
+        """
+        prefixes = {
+            self._subnet_of(p["ipv4"]) for p in peers
+            if p.get("ipv4") and self._looks_like_ip(p["ipv4"])
+        }
+        if not prefixes:
+            return
+        for node in self.storage.list_nodes():
+            host = (node.host or "").strip()
+            if not self._looks_like_mesh_ip(host) or not self._is_private_ip(host):
+                continue
+            if self._subnet_of(host) in prefixes:
+                self._seen_hosts.add(host)
+
     def scan_once(self) -> Dict[str, Any]:
         """
         One scrape. Marks a mesh host unreachable after `miss_threshold` consecutive
@@ -403,6 +441,9 @@ class EasytierPeerMonitor:
         # as "every host vanished".
         if not peers:
             return {"ok": True, "peers": 0, "note": "empty peer table, no signal", "tripped": []}
+
+        if not self._seen_hosts:
+            self.seed_known_hosts(peers)
 
         present = {p["ipv4"] for p in peers if p.get("ipv4")}
         now = time.monotonic()

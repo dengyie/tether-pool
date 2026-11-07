@@ -476,6 +476,53 @@ def test_r4_peer_monitor_detects_missing_host_within_two_scans(storage):
         assert storage.get_node(n.name).status == HealthStatus.DEAD.value
 
 
+def test_r4_seeds_monitoring_for_host_already_missing_at_startup(storage):
+    """A host that vanished before the process started must still be monitored.
+
+    Deploy-time regression: `_seen_hosts` began empty, so a gateway restart during the
+    mesh-nl outage left its listeners unmonitored and unable to produce a domain trip.
+    Participation is seeded from the mesh subnet instead of only "was seen".
+    """
+    mesh_nodes = _make_pool(storage, region="netherlands", count=3, host="10.144.144.12",
+                            fault_domain="mesh-nl")
+    _make_pool(storage, region="tokyo", count=2, host="10.144.144.3", fault_domain="aws-tokyo")
+    router = Router(storage)
+    isolator = FailureDomainIsolator(storage, router)
+
+    # The peer table already lacks mesh-nl on the very first scrape.
+    peer_table = {"10.144.144.3": {"ipv4": "10.144.144.3", "hostname": "aws-tokyo"}}
+
+    def runner(args):
+        return "\n".join(
+            f"  {p['ipv4']}  DIRECT  1  {p['hostname']}" for p in peer_table.values()
+        )
+
+    monitor = EasytierPeerMonitor(storage, isolator, runner=runner)
+    monitor.miss_threshold = 2
+
+    assert monitor.scan_once()["tripped"] == []
+    tripped = monitor.scan_once()["tripped"]
+    assert len(tripped) == 1
+    assert tripped[0]["domain"] == "mesh-nl"
+    for n in mesh_nodes:
+        assert storage.get_node(n.name).status == HealthStatus.DEAD.value
+
+
+def test_r4_seeding_ignores_loopback_and_public_hosts(storage):
+    """Seeding must never turn loopback listeners or public-IP nodes into mesh hosts."""
+    _make_pool(storage, region="local", count=2, host="127.0.0.1", fault_domain="local")
+    _make_pool(storage, region="public", count=1, host="121.36.222.101",
+               fault_domain="public")
+    router = Router(storage)
+    isolator = FailureDomainIsolator(storage, router)
+    monitor = EasytierPeerMonitor(
+        storage, isolator, runner=lambda args: "  10.144.144.9  DIRECT  1  huawei-vps"
+    )
+    monitor.miss_threshold = 1
+    for _ in range(3):
+        assert monitor.scan_once()["tripped"] == []
+
+
 def test_r4_parse_peer_output_table_and_json():
     table = (
         "ipv4          hostname      cost  next_hop  path_len  loss\n"
