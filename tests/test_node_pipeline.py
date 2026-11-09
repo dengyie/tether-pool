@@ -23,8 +23,9 @@ def make_group(seq_start=52, count=3, protocol="http"):
         "egress_type": "clash_proxy",
         "tags": ["clash", "bridge", "t"],
         "relay_mode": "direct_only",
-        "relay": {"group": "🇺🇸T中转", "candidates": ["[自建] AWS"]},
-        "url_test_group": {"name": "T优选", "interval": 300, "tolerance": 50},
+        "dialer_proxy": "[自建] AWS",
+        "inject_into_groups": ["PROXY", "AUTO"],
+        "legacy_groups_cleanup": [],
         "bridge_ports": {"declared": "11053-11055", "realized": "11053-11055"},
         "gateway_route": "region=us-west&type=clash_proxy",
         "nodes": [
@@ -195,8 +196,9 @@ def test_heal_rebuilds_when_script_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(np, "SCRIPT_JS", spath)
     monkeypatch.setattr(np, "MERGE_YAML", mmerge)
     monkeypatch.setattr(np, "NODES_YAML", npath)
-    live_px = {n["name"]: {"dialer-proxy": "🇺🇸T中转"} for n in group["nodes"]}
-    live_px.update({"🇺🇸T中转": {}, "T优选": {}, "[自建] AWS": {}})
+    live_px = {n["name"]: {"dialer-proxy": "[自建] AWS"} for n in group["nodes"]}
+    members = ["[自建] AWS"] + [n["name"] for n in group["nodes"]]  # 模拟重组后: 注入生效
+    live_px.update({"[自建] AWS": {}, "PROXY": {"all": list(members)}, "AUTO": {"all": list(members)}})
     monkeypatch.setattr(np, "mihomo_get", lambda p, timeout=12: (200, {"proxies": live_px}))
     monkeypatch.setattr(np, "pool_nodes", lambda: {
         t: {"port": p, "status": "healthy"} for t, p in zip(tnames, [11053, 11054, 11055])})

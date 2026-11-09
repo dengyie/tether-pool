@@ -259,21 +259,20 @@ def clean_nodes(group: dict) -> list[dict]:
 
 def gen_group_js(group_name: str, group: dict) -> str:
     nodes_js = ",\n      ".join(json.dumps(n, ensure_ascii=False) for n in clean_nodes(group))
-    relay = group.get("relay") or {}
-    relay_candidates = json.dumps(relay.get("candidates", []), ensure_ascii=False)
-    utg = group.get("url_test_group", {})
-    fn = f"ensureNPGroup_{group_name}"
+    dialer = json.dumps(group.get("dialer_proxy"), ensure_ascii=False)
+    inject = json.dumps(group.get("inject_into_groups", []), ensure_ascii=False)
+    legacy = json.dumps(group.get("legacy_groups_cleanup", []), ensure_ascii=False)
     realized = group["bridge_ports"].get("realized", "")
+    fn = f"ensureNPGroup_{group_name}"
     return f"""// >>> NODE-PIPELINE:{group_name}:v1
 // 由 scripts/node_pipeline.py 管理(managed block), 手改会被 import/heal 覆盖。
-// 职责: 静态节点注入 + 中转 fallback 组(订阅缺候选时自动退直连) + url-test 组。
+// 设计: 固定中转(dialer-proxy 单节点, 不建中转组) + 节点注入现有组(不独立成组)。
 // TetherPool 桥接 listener 驻留在 Verge 冻结底座({realized}
 // → 本数组节点), Merge.yaml 内为同目标重建镜像(按代理去重, 勿重复加)。
 const NP_{group_name.upper()} = {{
-  clashPrefix: {json.dumps(group['clash_node_prefix'], ensure_ascii=False)},
-  urlTestGroup: {json.dumps(utg.get('name', group_name), ensure_ascii=False)},
-  relayGroup: {json.dumps(relay.get('group'), ensure_ascii=False)},
-  relayCandidates: {relay_candidates},
+  dialerProxy: {dialer},
+  injectIntoGroups: {inject},
+  legacyGroupsCleanup: {legacy},
   nodes: [
       {nodes_js}
   ],
@@ -286,28 +285,14 @@ function {fn}(config) {{
     proxies.map((proxy) => proxy?.name).filter(Boolean)
   );
 
-  let relayName = null;
-  if (spec.relayGroup && spec.relayCandidates.length > 0) {{
-    const members = spec.relayCandidates.filter((n) => names.has(n));
-    if (members.length > 0) {{
-      const relayGroups =
-        config["proxy-groups"] ||
-        (config["proxy-groups"] = []);
-      upsertGroup(relayGroups, {{
-        name: spec.relayGroup,
-        type: "fallback",
-        url: "https://www.gstatic.com/generate_204",
-        interval: 120,
-        lazy: false,
-        proxies: members,
-      }});
-      relayName = spec.relayGroup;
-    }}
-  }}
+  // 固定中转: dialer-proxy 指向单节点; 该节点不存在时退直连(防止悬空引用炸配置)
+  const relayFixed = spec.dialerProxy && names.has(spec.dialerProxy)
+    ? spec.dialerProxy
+    : null;
 
   for (const base of spec.nodes) {{
-    const node = relayName
-      ? {{ ...base, "dialer-proxy": relayName }}
+    const node = relayFixed
+      ? {{ ...base, "dialer-proxy": relayFixed }}
       : {{ ...base }};
     if (names.has(node.name)) {{
       const idx = proxies.findIndex((p) => p?.name === node.name);
@@ -319,17 +304,28 @@ function {fn}(config) {{
   }}
   config.proxies = proxies;
 
-  const urlTestGroups =
+  // 注入现有组 (PROXY/AUTO/...), 幂等追加; 组不存在(其它 profile)则跳过
+  const groups =
     config["proxy-groups"] ||
     (config["proxy-groups"] = []);
-  upsertGroup(urlTestGroups, {{
-    name: spec.urlTestGroup,
-    type: "url-test",
-    url: "https://www.gstatic.com/generate_204",
-    interval: 300,
-    tolerance: 50,
-    proxies: spec.nodes.map((n) => n.name),
-  }});
+  for (const gname of spec.injectIntoGroups || []) {{
+    const g = groups.find((x) => x?.name === gname);
+    if (!g) continue;
+    const members = asArray(g.proxies);
+    const missing = spec.nodes
+      .map((n) => n.name)
+      .filter((n) => !members.includes(n));
+    if (missing.length > 0) {{
+      g.proxies = [...members, ...missing];
+    }}
+  }}
+
+  // 清理历史遗留的自建组 (改为注入现有组前遗留的空壳)
+  if ((spec.legacyGroupsCleanup || []).length > 0) {{
+    config["proxy-groups"] = groups.filter(
+      (g) => !spec.legacyGroupsCleanup.includes(g?.name)
+    );
+  }}
 }}
 // <<< NODE-PIPELINE:{group_name}:v1"""
 
@@ -463,18 +459,26 @@ def cmd_check(args):
                 drift.append(f"{tname}(region)")
         all_ok &= layer("L3 nodes.yaml 注册", not drift, "一致" if not drift else str(drift[:4]))
 
-        # L4 manifest ↔ mihomo 活体 (中转组仅在候选存活时才要求 dialer-proxy)
+        # L4 manifest ↔ mihomo 活体 (固定中转: dialer 节点存活才要求; 注入组须包含全部节点)
         missing = [n["name"] for n in group["nodes"] if n["name"] not in live_names]
-        relay = group.get("relay", {}) or {}
-        relay_active = bool(relay.get("group")) and any(
-            c in live_names for c in relay.get("candidates", []))
+        dialer = group.get("dialer_proxy")
+        dialer_active = bool(dialer) and dialer in live_names
+        dp_expected = dialer if dialer_active else None
         dp_bad = [n["name"] for n in group["nodes"]
-                  if n["name"] in px and px[n["name"]].get("dialer-proxy") != (relay.get("group") if relay_active else None)]
-        utg = group.get("url_test_group", {}).get("name")
-        grp_ok = utg in live_names and (not relay_active or relay.get("group") in live_names)
+                  if n["name"] in px and px[n["name"]].get("dialer-proxy") != dp_expected]
+        inject_bad = []
+        for gname in group.get("inject_into_groups", []):
+            g = px.get(gname)
+            if not g:
+                inject_bad.append(f"{gname}(组缺)")
+                continue
+            members = set(g.get("all", []))
+            not_in = [n["name"] for n in group["nodes"] if n["name"] not in members]
+            if not_in:
+                inject_bad.append(f"{gname}(缺{len(not_in)}成员)")
         ports_up = [p for p in ports if p in live_listening]
-        all_ok &= layer("L4 mihomo 活体", not missing and not dp_bad and grp_ok and len(ports_up) == len(ports),
-                        f"节点缺{len(missing)} dialer偏移{len(dp_bad)} 组{'缺' if not grp_ok else '✓'} "
+        all_ok &= layer("L4 mihomo 活体", not missing and not dp_bad and not inject_bad and len(ports_up) == len(ports),
+                        f"节点缺{len(missing)} dialer偏移{len(dp_bad)} 注入{inject_bad or '✓'} "
                         f"listener {len(ports_up)}/{len(ports)}")
 
         # L5a manifest ↔ TetherPool 注册一致性 (计入 DRIFT)
@@ -595,8 +599,8 @@ def cmd_import(args):
     if args.group in manifest["groups"] and not args.replace:
         log(f"组 {args.group} 已存在于 manifest; 加 --replace 覆盖")
         return 1
-    if args.relay_group and not args.relay_candidates:
-        log("[-] --relay-group 必须与 --relay-candidates 成对给出 (否则会制造永久 DRIFT)")
+    if args.relay_node is not None and not args.relay_node.strip():
+        log("[-] --relay-node 不能为空串")
         return 1
 
     log(f"[1/7] 拉取订阅: {args.source}")
@@ -621,7 +625,7 @@ def cmd_import(args):
     seq_start = next_free_seq(ny_now, manifest)
     prefix = args.prefix or f"{args.group}-"
     clash_names = [f"{prefix}{i+1:02d}" for i in range(count)]
-    relay = {"group": args.relay_group, "candidates": args.relay_candidates} if args.relay_group else None
+    relay = args.relay_node
     group = {
         "source": args.source,
         "protocol": str(proxies[0].get("type", "http")).lower(),
@@ -633,8 +637,9 @@ def cmd_import(args):
         "egress_type": "clash_proxy",
         "tags": ["clash", "bridge", str(proxies[0].get("type", "http")).lower(), args.group],
         "relay_mode": "direct_only",
-        "relay": relay,
-        "url_test_group": {"name": args.url_test_group or f"{args.group}-auto", "interval": 300, "tolerance": 50},
+        "dialer_proxy": relay,
+        "inject_into_groups": args.inject_into_groups,
+        "legacy_groups_cleanup": args.legacy_groups_cleanup,
         "bridge_ports": {"declared": f"{declared[0]}-{declared[-1]}", "realized": ""},
         "gateway_route": f"region={args.region}&type=clash_proxy",
         "nodes": [
@@ -883,8 +888,11 @@ def main():
     p_imp.add_argument("--tier", default="standard", choices=["standard", "premium"])
     p_imp.add_argument("--prefix", default=None, help="mihomo 节点名前缀")
     p_imp.add_argument("--url-test-group", default=None)
-    p_imp.add_argument("--relay-group", default=None, help="中转 fallback 组名")
-    p_imp.add_argument("--relay-candidates", nargs="*", default=[])
+    p_imp.add_argument("--relay-node", default=None, help="固定中转节点名 (dialer-proxy 直指, 不建组)")
+    p_imp.add_argument("--inject-into-groups", nargs="*", default=["PROXY", "AUTO"],
+                       help="节点注入的现有组名列表")
+    p_imp.add_argument("--legacy-groups-cleanup", nargs="*", default=[],
+                       help="需清理的历史遗留组名")
     p_imp.add_argument("--replace", action="store_true")
     p_imp.add_argument("--dry-run", action="store_true")
     p_imp.add_argument("--restart-verge", action="store_true")
