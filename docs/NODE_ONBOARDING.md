@@ -73,7 +73,9 @@ node_pipeline.py heal --group pigeonw --realize --yes  # 出口↔端口映射�
 | 🎯ZCode | select | ZCode/z.ai → 日本 AWS 固定出口（含 5 条进程规则） | 9 条 | 脚本 |
 | GROK-REG | select | **Grok 注册流量隔离**（x.ai/grok.com），成员由 grok-register proxy_rotate 动态轮换（72 个） | 2 条（**2026-11-10 修复回归**：规则重建白名单漏了它，每次重组 x.ai/grok.com 分流被丢弃回落 PROXY） | 链式 groups/rules 文件（grok-register 管理） |
 
-> pigeonw 家宽 20 节点：不独立成组，注入 PROXY/AUTO；中转固定 `dialer-proxy → [自建] 🇺🇸VLESS-AWS-Oregon-Reality`。
+> pigeonw 家宽 20 节点：不独立成组，注入 **PROXY / AUTO / 🎯Claude / 🎯Google / 🎯OpenAI 共 5 组**（US 住宅 IP 对美区服务组是优质出口）；中转固定 `dialer-proxy → [自建] 🇺🇸VLESS-AWS-Oregon-Reality`（单节点，不建组，缺失自动退直连）。
+> **GROK-REG 不走脚本注入**：其成员由 `grok-register proxy_rotate` 整体重写（`_build_group_yaml`），家宽节点加入需配置到 grok-register 的 allowlist（独立集成）。
+> **语义不符不注入**：🌏港澳台优选（地区）、🏠家宽（home-win 专用）、MangoCF（自家域名直连兜底）、🎯ZCode（固定日本）、GLOBAL（组选择器）。
 
 ## 四、教训目录（每条都有当日事故实证）
 
