@@ -1,18 +1,22 @@
-# 🌐 TetherPool (`tetherpool`)
+<div align="center">
 
-> **Unified Global Dual-Stack IP Pool, Circuit Breaker & Forward Proxy Gateway**  
-> Enterprise-grade proxy pool orchestrating **108 independent exits** (100 Cloudflare WARP IPv6 + 8 Datacenter Native IPv4/IPv6) across 6 global regions over an encrypted EasyTier P2P mesh network. Featuring dual-mode operation (REST Control Plane on `:9100` + Unified Forward Proxy Gateway on `:9101`), 4-state circuit breaker with self-healing lease re-homing, and low-cardinality Prometheus observability.
+# TetherPool
 
-[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-106%20passed-brightgreen.svg)]()
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+**Unified Global Dual-Stack IP Pool, Circuit Breaker & Forward Proxy Gateway**
 
-[中文文档 (README.zh-CN.md)](README.zh-CN.md)
+[![License](https://img.shields.io/badge/license-MIT-green.svg?style=flat-square)](LICENSE)
+[![Python Version](https://img.shields.io/badge/python-3.10+-blue.svg?style=flat-square)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![Architecture](https://img.shields.io/badge/mesh-EasyTier%20P2P%20%7C%20Dual--Stack-orange.svg?style=flat-square)](#dual-mode-architecture-overview)
+[![Tests](https://img.shields.io/badge/tests-106%20passed-brightgreen.svg?style=flat-square)]()
+
+[English](./README.md) • [简体中文](./README.zh-CN.md)
+
+</div>
 
 ---
 
-## 📌 Dual-Mode Architecture Overview
+## Dual-Mode Architecture Overview
 
 ```
                       +-------------------------------------------------+

@@ -1,18 +1,22 @@
-# 🌐 TetherPool (`tetherpool`)
+<div align="center">
 
-> **跨国多节点双栈出口池、工业级四态断路器与本地统一正向代理网关**  
-> 统一编排纳管 **108 个独立公网出口**（100 个 Cloudflare WARP IPv6 + 8 个机房原生公网 IPv4/IPv6），基于 EasyTier 全网虚拟网格内网安全互通。采用「控制面 (`:9100`) + 统一正向网关 (`:9101`)」双模架构，具备四态断路器故障转移与租约平滑自愈、Prometheus 云原生低基数监控及现代嵌入式可视化控制台。
+# TetherPool
 
-[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-84%20passed-brightgreen.svg)]()
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+**跨国多节点双栈出口池、工业级四态断路器与本地统一正向代理网关**
 
-[English Documentation (README.md)](README.md)
+[![License](https://img.shields.io/badge/license-MIT-green.svg?style=flat-square)](LICENSE)
+[![Python Version](https://img.shields.io/badge/python-3.10+-blue.svg?style=flat-square)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![Architecture](https://img.shields.io/badge/mesh-EasyTier%20P2P%20%7C%20Dual--Stack-orange.svg?style=flat-square)](#双模架构全景)
+[![Tests](https://img.shields.io/badge/tests-106%20passed-brightgreen.svg?style=flat-square)]()
+
+[English Documentation (README.md)](README.md) • [简体中文](./README.zh-CN.md)
+
+</div>
 
 ---
 
-## 📌 双模架构全景
+## 双模架构全景
 
 ```
                       +-------------------------------------------------+
