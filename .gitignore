@@ -11,3 +11,7 @@ logs/
 
 # Test isolation artifacts (accidentally committed in e9b09c3)
 .pytest_tmp*/
+# node_pipeline: manifest 含 vendor 凭据, 仅存本地 (脱敏模板见 node_groups.example.yaml)
+config/node_groups.yaml
+config/*.bak-*
+*.bak-*

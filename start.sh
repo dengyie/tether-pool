@@ -81,7 +81,10 @@ start_services() {
         echo "[*] Forward Gateway already running with PID $(cat "$PID_GW")"
     else
         echo "[*] Starting Unified Forward Gateway on $GATEWAY_HOST:$GATEWAY_PORT..."
+        # GATEWAY_ATTEMPT_TIMEOUT: 单次上游拨号总预算。AWS 中转家宽链
+        # (网关→桥→mihomo→AWS→vendor) CONNECT 建立需 1.5–4s, 默认 2.0s 必超时。
         GATEWAY_HOST="$GATEWAY_HOST" GATEWAY_PORT="$GATEWAY_PORT" \
+            GATEWAY_ATTEMPT_TIMEOUT="${GATEWAY_ATTEMPT_TIMEOUT:-8}" \
             nohup "$VENV_PYTHON" gateway/server.py > "$LOG_GW" 2>&1 &
         echo $! > "$PID_GW"
         sleep 1

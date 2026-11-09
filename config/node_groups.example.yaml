@@ -1,0 +1,52 @@
+version: 1
+updated: '2026-11-10'
+groups:
+  pigeonw:
+    source: https://SUBSCRIPTION-URL/clash.yaml
+    protocol: http
+    clash_node_prefix: 🇺🇸PIGEONW-家宽-
+    tether_name_template: clash-{seq:03d}-pigeonw-{idx:02d}
+    region: us-west
+    tier: standard
+    egress_type: clash_proxy
+    tags:
+    - clash
+    - bridge
+    - http
+    - pigeonw
+    - residential
+    relay_mode: direct_only
+    relay:
+      group: 🇺🇸PIGEONW中转
+      type: fallback
+      candidates:
+      - '[自建] 🇺🇸VLESS-AWS-Oregon-Reality'
+      - '[自建] 🇺🇸TUIC-googlevps'
+      - '[自建] 🇺🇸AnyTLS-googlevps'
+    url_test_group:
+      name: US优选家宽
+      interval: 300
+      tolerance: 50
+    bridge_ports:
+      declared: 11053-11072
+      realized: 11053-11072
+    listener_prefix: tether-socks-
+    gateway_route: region=us-west&type=clash_proxy
+    nodes:
+    - idx: 1
+      name: 🇺🇸PIGEONW-家宽-01
+      server: 23.132.180.213
+      port: 62000
+      username: <USERNAME>
+      password: <PASSWORD>
+      exit_ip: 23.132.180.213
+      type: http
+frozen_base_insurance:
+  comment: 'Verge 冻结底座镜像: base 在时被按代理去重(零副作用), base 丢失时重新激活自动重建全部桥'
+  extra_listeners:
+  - name: tether-socks-052
+    type: socks
+    port: 11052
+    listen: 127.0.0.1
+    proxy: '[自建] 🇺🇸VLESS-AWS-Oregon-Reality'
+_note: 复制为 config/node_groups.yaml 并填入真实凭据; 该文件已被 gitignore, 严禁入库
