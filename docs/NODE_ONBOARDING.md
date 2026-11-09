@@ -57,6 +57,24 @@ node_pipeline.py heal --group pigeonw --realize --yes  # 出口↔端口映射�
 - L5 manifest ↔ TetherPool（注册/端口一致性）
 - 附带 **L5 探活健康度**：仅 WARN 不影响退出码（vendor 瞬时抖动属自愈范畴，不与一致性混淆）
 
+### 策略组全景表（2026-11-10 全量梳理 · 每个组都有明确职责，无孤儿）
+
+| 组 | 类型 | 用途（一句话） | 规则引用 | 来源/管理者 |
+|---|---|---|---|---|
+| PROXY | select | 主选择器（手动兜底出口） | 6 条（stun 等） | 订阅；pigeonw 家宽 20 节点已注入 |
+| AUTO | url-test | 全节点自动选优（PROXY/MangoCF 的回退成员） | 0（作为成员被引用） | 订阅；pigeonw 已注入 |
+| GLOBAL | select | mihomo 全局模式选择器 | 0（全局模式用） | 订阅 |
+| MangoCF | fallback | **自家域名 mangoqwq.com 直连兜底**（直连→AUTO→PROXY；面板/frp/doh/check-api 等自建服务） | 1 条（suffix mangoqwq.com，**53 hits 最活跃自建规则**） | 订阅；同时是死节点黑名单的**订阅指纹**（Script.js dropDeadNodes 门控），不可改名 |
+| 🏠家宽 | fallback | EdgeOne 大陆住宅出口要求站点（hygbzs/mulink） | 3 条 | 订阅+脚本 |
+| 🌏港澳台优选 | url-test | 港澳台特定 API（ai.muapi.cn 等全节点 403 规避） | 4 条 | 脚本 |
+| 🎯Claude | select | Claude 专属防封分流 | 27 条 | 订阅+脚本 |
+| 🎯Google | select | Google/Gmail/Gemini/YouTube | 3 条 RuleSet | 脚本 |
+| 🎯OpenAI | select | OpenAI/ChatGPT 分流 | 5 条 | 订阅+脚本 |
+| 🎯ZCode | select | ZCode/z.ai → 日本 AWS 固定出口（含 5 条进程规则） | 9 条 | 脚本 |
+| GROK-REG | select | **Grok 注册流量隔离**（x.ai/grok.com），成员由 grok-register proxy_rotate 动态轮换（72 个） | 2 条（**2026-11-10 修复回归**：规则重建白名单漏了它，每次重组 x.ai/grok.com 分流被丢弃回落 PROXY） | 链式 groups/rules 文件（grok-register 管理） |
+
+> pigeonw 家宽 20 节点：不独立成组，注入 PROXY/AUTO；中转固定 `dialer-proxy → [自建] 🇺🇸VLESS-AWS-Oregon-Reality`。
+
 ## 四、教训目录（每条都有当日事故实证）
 
 1. **Verge 冻结底座**：listener 的真实现驻留在 root 侧 service 配置，Verge 重组以其为底、按**目标代理**去重合并 Merge listeners。同名/同代理的 Merge 条目是零副作用的**重建保险**（底座丢失时下次重新激活自动重建）；异名同代理会被去重丢弃。
