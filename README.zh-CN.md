@@ -5,12 +5,14 @@
 **跨国多节点双栈出口池、工业级四态断路器与本地统一正向代理网关**
 
 [![License](https://img.shields.io/badge/license-MIT-green.svg?style=flat-square)](LICENSE)
-[![Python Version](https://img.shields.io/badge/python-3.10+-blue.svg?style=flat-square)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.10+-3776AB.svg?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![Architecture](https://img.shields.io/badge/mesh-EasyTier%20P2P%20%7C%20Dual--Stack-orange.svg?style=flat-square)](#双模架构全景)
+[![EasyTier](https://img.shields.io/badge/Mesh-EasyTier%20P2P-FF6600.svg?style=flat-square)](https://github.com/EasyTier/EasyTier)
+[![Prometheus](https://img.shields.io/badge/Metrics-Prometheus-E6522C.svg?style=flat-square&logo=prometheus&logoColor=white)](https://prometheus.io/)
+[![SQLite](https://img.shields.io/badge/Database-SQLite%20WAL-003B57.svg?style=flat-square&logo=sqlite&logoColor=white)](https://sqlite.org/)
 [![Tests](https://img.shields.io/badge/tests-106%20passed-brightgreen.svg?style=flat-square)]()
 
-[English Documentation (README.md)](README.md) • [简体中文](./README.zh-CN.md)
+[English Documentation (README.md)](README.md) · [简体中文](./README.zh-CN.md)
 
 </div>
 
@@ -64,29 +66,29 @@
    - **100 个 Cloudflare WARP IPv6 出口**：东京 (loc=JP)、新加坡 (loc=SG)、荷兰 (loc=NL) 和印度 (loc=IN) 4 大边缘节点各 25 个独立出口。
    - **8 个机房原生公网出口**：6 个原生 IPv4 与 2 个原生 IPv6，覆盖东京、新加坡、荷兰、印度、香港与美西。
 2. **优质/劣质代理双分池架构 (Quality Tiering)**：
-   - 🌟 **优质代理池 (`premium`)**：准入标准高，专纳自建原生机房出口、低延迟 (<350ms)、纯净独享 IP、零熔断的优质出口。
-   - 📦 **劣质/标准代理池 (`standard`)**：容纳第三方聚合代理、WARP 大批量出口、高延迟或通用出口。
+   - **优质代理池 (`premium`)**：准入标准高，专纳自建原生机房出口、低延迟 (<350ms)、纯净独享 IP、零熔断的优质出口。
+   - **劣质/标准代理池 (`standard`)**：容纳第三方聚合代理、WARP 大批量出口、高延迟或通用出口。
    - **默认普通优先 (`standard_first`) 策略**：默认请求优先消耗普通/劣质池，保护高价值自建优质 IP；账号注册或高权重调用传入 `tier=premium` 享受优质通道。
    - **多因子质量评估引擎 (`core/quality.py`)**：结合节点来源 (自建+40/WARP+25/第三方+15)、RTT 延迟 (最高+30)、健康度与公网 Egress 认证，预留 Scamalytics/IPQS 风控情报扣分。
 3. **零公网端口暴露（Mesh 纵深防御）**：
    - 所有代理端口（`:10801~10905`）100% 仅监听在 EasyTier 网格内网 IP（`10.144.144.x`），外网零端口暴露。
-3. **控制面与统一正向网关双模**：
+4. **控制面与统一正向网关双模**：
    - **控制面 (`:9100`)**：提供 REST 租约调度、现代 Web 控制台 (`/dashboard`)、Prometheus 指标 (`/metrics`) 与断路器治理。
    - **统一正向代理网关 (`:9101`)**：基于 `asyncio` 构建的本地透明代理，支持通过 HTTP 请求头（`X-Account-Id`、`X-Region`、`X-Egress-Type`、`Proxy-Authorization`）无感路由出站。
-4. **工业级四态断路器与自愈重签**：
+5. **工业级四态断路器与自愈重签**：
    - 节点经历 `HEALTHY`（闭合）-> `DEGRADED`（单次探测抖动）-> `DEAD`（连续熔断并进入指数退避冷却）-> `HALF_OPEN`（试探金丝雀探活）。
    - 节点熔断时，其名下绑定的账号租约自动秒级平滑重签（Re-home）至同区域健康的备用节点。
-5. **云原生低基数可观测性**：
+6. **云原生低基数可观测性**：
    - 标准 Prometheus OpenMetrics 导出器，严格按区域、协议、状态聚合，拒绝在指标 Label 中暴露动态 IP 或 URL。
 
 ---
 
-## 🚀 快速上手
+## 快速上手
 
 ### 1. 环境准备
 ```bash
-git clone https://github.com/dengyie/tetherpool.git
-cd tetherpool
+git clone https://github.com/dengyie/tether-pool.git
+cd tether-pool
 
 python3 -m venv .venv
 source .venv/bin/activate
@@ -126,7 +128,7 @@ pip install -r requirements.txt
 
 ---
 
-## 🧭 正向网关调用示例 (`:9101`)
+## 正向网关调用示例 (`:9101`)
 
 ### 1. HTTPS CONNECT 隧道 (指定东京出口)
 ```bash
@@ -145,7 +147,7 @@ curl -x http://bob:secret@127.0.0.1:9101 \
 
 ---
 
-## 📡 REST API 接口定义 (`:9100`)
+## REST API 接口定义 (`:9100`)
 
 | 动词 | 端点 | 功能说明 |
 |---|---|---|
@@ -165,7 +167,7 @@ curl -x http://bob:secret@127.0.0.1:9101 \
 
 ---
 
-## 📂 项目目录结构
+## 项目目录结构
 
 ```
 ip-pool/
@@ -200,5 +202,5 @@ ip-pool/
 
 ---
 
-## 📄 开源许可证
+## 开源许可证
 MIT License.
