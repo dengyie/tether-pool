@@ -1,8 +1,5 @@
 <div align="center">
 
-> ⚠️ **本仓库已归档 (ARCHIVED)** — 该项目已迁移并继续开发于 **[dengyie/tether-pool](https://github.com/dengyie/tether-pool)**（生产部署与最新代码均以彼处为准；生产机历史快照见其 `prod-legacy` 分支）。本仓库保留仅为历史参考, 请勿在此提交 PR/Issue。
->
-> ---
 # TetherPool
 
 **Unified Global Dual-Stack IP Pool, Circuit Breaker & Forward Proxy Gateway**
