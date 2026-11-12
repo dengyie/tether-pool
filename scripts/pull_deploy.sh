@@ -18,8 +18,15 @@ cd "$(dirname "$0")/.."
 
 PREV=$(git rev-parse HEAD)
 echo "[1/6] git pull (当前 $PREV)"
-if ! git pull --ff-only origin main >/dev/null 2>&1; then
-    echo "[-] pull 失败 (远端分叉或网络) — 保持原状, 未动任何服务"
+# 境内云主机 → github.com 的 TLS 常被掐断 (GnuTLS -110 等), 三次退避重试
+pull_ok=0
+for i in 1 2 3; do
+    if git pull --ff-only origin main >/dev/null 2>&1; then pull_ok=1; break; fi
+    echo "      pull 第 $i 次失败 (网络抖动), $((i * 5))s 后重试..."
+    sleep $((i * 5))
+done
+if [ "$pull_ok" != "1" ]; then
+    echo "[-] pull 3 次均失败 — 保持原状, 未动任何服务 (稍后重跑即可)"
     exit 1
 fi
 NEW=$(git rev-parse HEAD)
