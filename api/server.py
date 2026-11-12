@@ -3,6 +3,7 @@ api/server.py - FastAPI service for the IP Pool System
 """
 
 import os
+import time
 import yaml
 import asyncio
 from contextlib import asynccontextmanager
@@ -54,6 +55,9 @@ cpa_adapter = CpaAdapter(storage)
 # Single-flight guard so overlapping sweeps (startup + manual trigger) cannot
 # both hammer the pool at once.
 _probe_lock = asyncio.Lock()
+_last_probe_trigger_at: float = 0.0
+_probe_pending: bool = False  # 已排队但尚未跑完的 sweep (sweep 排队时长可能超过合并窗口)
+PROBE_TRIGGER_COALESCE_SECONDS = 15  # 同窗口重复触发合并 (含 start.sh 确认式重试)
 
 
 def load_initial_nodes():
@@ -120,22 +124,37 @@ def load_initial_nodes():
     return len(nodes_data)
 
 
+async def _scheduled_probe_sweep():
+    """One scheduled-sweep tick (extracted from the loop so tests can drive it).
+
+    与手动触发共享 `_probe_pending`（P3-2 根修）：定时 sweep 排队/运行期间手动
+    POST /v1/probe 被合并；反之定时 tick 看到已有 pending 的手动触发时跳过——
+    双向互斥，任何时刻最多一个全量探活在排队/执行，不会背靠背重复扫全池。
+    """
+    global _probe_pending
+    if _probe_pending or _probe_lock.locked():
+        print("[*] Probe sweep already queued/in progress; skipping this tick.")
+        return
+    _probe_pending = True
+    try:
+        async with _probe_lock:
+            print("[*] Starting scheduled full pool probe...")
+            results = await prober.probe_all(concurrency=25)
+            healthy = sum(1 for r in results if r.success)
+            print(f"[+] Scheduled probe finished: {healthy}/{len(results)} nodes healthy.")
+            pruned = storage.prune_event_tables(keep_days=PROBE_HISTORY_KEEP_DAYS)
+            pruned_total = {k: v for k, v in pruned.items() if v}
+            if pruned_total:
+                detail = ", ".join(f"{k}={v}" for k, v in pruned_total.items())
+                print(f"[+] Pruned stale event rows (>{PROBE_HISTORY_KEEP_DAYS}d): {detail}")
+    finally:
+        _probe_pending = False
+
+
 async def background_probe_loop():
     while True:
         try:
-            if _probe_lock.locked():
-                print("[*] Probe sweep already in progress; skipping this tick.")
-            else:
-                async with _probe_lock:
-                    print("[*] Starting scheduled full pool probe...")
-                    results = await prober.probe_all(concurrency=25)
-                    healthy = sum(1 for r in results if r.success)
-                    print(f"[+] Scheduled probe finished: {healthy}/{len(results)} nodes healthy.")
-                    pruned = storage.prune_event_tables(keep_days=PROBE_HISTORY_KEEP_DAYS)
-                    pruned_total = {k: v for k, v in pruned.items() if v}
-                    if pruned_total:
-                        detail = ", ".join(f"{k}={v}" for k, v in pruned_total.items())
-                        print(f"[+] Pruned stale event rows (>{PROBE_HISTORY_KEEP_DAYS}d): {detail}")
+            await _scheduled_probe_sweep()
         except Exception as e:
             print(f"[-] Scheduled probe error: {e}")
         await asyncio.sleep(PROBE_INTERVAL_SECONDS)
@@ -415,7 +434,9 @@ def acquire_node(
     tier: Optional[str] = Query(None, description="Optional quality tier constraint (premium or standard)"),
     tier_policy: Optional[str] = Query(None, description="Optional tier routing policy (standard_first, premium_first, premium_only, standard_only)"),
     force_rebind: bool = Query(False, description="Force re-allocating a new node"),
-    service: Optional[str] = Query(None, description="Service namespace (defaults to 'default')")
+    service: Optional[str] = Query(None, description="Service namespace (defaults to 'default')"),
+    region_strict: bool = Query(False, description="Treat region as a hard constraint: never relax it to another region (empty candidate set instead)"),
+    bind_persist: bool = Query(False, description="Persist the selected node even when the stored binding only failed this call's constraint filter (reason=constraint_rebind)")
 ):
     """
     Acquires (or returns) the account's sticky binding.
@@ -424,6 +445,13 @@ def acquire_node(
     already has a healthy binding that does not match them, the constrained node is
     returned without overwriting the stored binding. Use `force_rebind=true` to
     deliberately re-point the account.
+
+    `region_strict=true` stops the ladder from relaxing `region`: with no candidate in
+    the requested region the call returns 503 instead of a cross-region fallback.
+
+    `bind_persist=true` persists the constrained selection (reason `constraint_rebind`)
+    and stores the call's constraint set with the binding, so auto_rehome keeps the
+    account inside its promised region.
     """
     lease = router.acquire_for_account(
         account_id=account_id,
@@ -432,7 +460,9 @@ def acquire_node(
         tier=tier,
         tier_policy=tier_policy,
         force_rebind=force_rebind,
-        service=service
+        service=service,
+        region_strict=region_strict,
+        bind_persist=bind_persist
     )
     if not lease:
         raise HTTPException(status_code=503, detail="No available proxy node matching criteria")
@@ -440,14 +470,56 @@ def acquire_node(
 
 
 @app.post("/v1/probe")
-async def trigger_probe(background_tasks: BackgroundTasks):
+async def trigger_probe(
+    background_tasks: BackgroundTasks,
+    force: bool = Query(False, description="Force-probe DEAD nodes even inside circuit cooldown (fast recovery after bridge-core restart)")
+):
+    """Trigger a full pool probe.
+
+    确定性语义 (2026-11-12 根修): 排队等待 `_probe_lock` 而不是撞锁静默丢弃——
+    重启后的 force 探活必须必然执行 (此前与后台扫描循环共锁 + 双侧静默跳过,
+    start.sh 启动尾的触发会被首轮全量扫描吞掉)。同窗口内的重复触发合并去重,
+    防御未鉴权端点被刷成探活风暴。
+    """
+    global _last_probe_trigger_at, _probe_pending
+    now = time.monotonic()
+    was_locked = _probe_lock.locked()
+    # 合并条件 = 「15s 窗口内已触发过」或「已排队/在跑的 sweep 尚未结束」。
+    # 只看时间窗会漏掉排队时长超过窗口的 sweep (排队任务同样满足去重目的)。
+    if _probe_pending or now - _last_probe_trigger_at < PROBE_TRIGGER_COALESCE_SECONDS:
+        # clamp ≥0: pending=True 而时间窗已过时，差值为负 —— 报给调用方/日志的
+        # 剩余窗口只能表达「还有多久可再触发」，负数无意义 (P3-3)。
+        remaining = round(max(0.0, PROBE_TRIGGER_COALESCE_SECONDS - (now - _last_probe_trigger_at)), 1)
+        print(f"[probe] trigger coalesced (force={force}, pending={_probe_pending}, "
+              f"window remaining={remaining}s, queued_behind_sweep={was_locked})")
+        return {
+            "message": "Probe trigger coalesced (a recent trigger is already queued)",
+            "force": force,
+            "coalesced": True,
+            "queued_behind_running_sweep": was_locked,
+            "window_remaining_seconds": remaining,
+        }
+    _last_probe_trigger_at = now
+    _probe_pending = True
+
     async def _run_probe():
-        if _probe_lock.locked():
-            return
-        async with _probe_lock:
-            await prober.probe_all(concurrency=25)
+        try:
+            async with _probe_lock:
+                print(f"[probe] sweep starting (force={force}, queued_behind_sweep={was_locked})")
+                results = await prober.probe_all(concurrency=25, force=force)
+                healthy = sum(1 for r in results if r.success)
+                print(f"[probe] sweep finished: {healthy}/{len(results)} healthy (force={force})")
+        finally:
+            global _probe_pending  # noqa: F811 — 闭包内重新声明为模块全局
+            _probe_pending = False
+
     background_tasks.add_task(_run_probe)
-    return {"message": "Full pool probe triggered in background"}
+    return {
+        "message": "Full pool probe queued in background",
+        "force": force,
+        "coalesced": False,
+        "queued_behind_running_sweep": was_locked,
+    }
 
 
 @app.post("/v1/probe/test_node", response_model=ProbeResult)

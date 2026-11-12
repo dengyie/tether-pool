@@ -580,8 +580,11 @@ async def test_r6_binding_rehomed_semantics(storage):
 
     gateway.connect_upstream_adaptive = always_fail
     with pytest.raises(UpstreamFailoverError) as exc:
+        # No region filter: a constrained call now persists a bind-time constraint, and
+        # a region-pinned rehome must NOT leave its region (2026-11-12 requirements).
+        # Availability-first cross-region rebind is the unconstrained behaviour.
         await gateway._open_upstream(
-            account_id="acct-r6", region="netherlands", egress_type=WARP,
+            account_id="acct-r6", region=None, egress_type=WARP,
             service="grok2api", target_host="example.com", target_port=443,
         )
     assert exc.value.code == ERR_BINDING_REHOMED
