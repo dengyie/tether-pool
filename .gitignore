@@ -22,3 +22,8 @@ config/teleapi-bridge/
 bin/mihomo
 # 自建中转节点凭据 (import_standalone.py relay 注入源), 见 NODE_ONBOARDING.md §六
 config/relay-nodes.local.yaml
+# 节点池注册表 = 部署侧运行时状态 (各主机自有: 生产 VPS 池 / Mac 桥核池互不相同),
+# 与代码分离; 新宿主从 config/nodes.example.yaml 起步, 生产池备份见 prod-legacy 分支
+config/nodes.yaml
+# 本地运维备份 (含 DB 全量, 永不入库)
+backups/

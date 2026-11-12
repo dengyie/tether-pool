@@ -1,0 +1,36 @@
+# config/nodes.example.yaml — 节点池注册表模板（部署侧状态示例）
+#
+# config/nodes.yaml 是【每台部署主机自己的运行时状态】（如同 data/ip_pool.db）：
+# 生产 VPS 池、Mac 桥核池各持一份，内容不同且互不同步，已加入 .gitignore。
+# 新宿主部署：复制本模板为 config/nodes.yaml 后按需增删节点（或从部署机备份恢复）；
+# 运行期也可直接 POST /v1/nodes 增删。schema 字段见下方示例。
+version: '1.0'
+settings:
+  probe_interval_seconds: 300
+  probe_timeout_seconds: 8
+  probe_target_v4: https://api.ipify.org
+  probe_target_v6: https://api64.ipify.org
+  service_probe_url: https://x.com
+nodes:
+# 自建原生出口（机房直出）
+- name: aws-tokyo-native-v4
+  host: 10.144.144.3
+  port: 10801
+  protocol: socks5h
+  region: tokyo
+  egress_type: native_ipv4
+  tags: [self_hosted, native, aws, tokyo]
+  weight: 100
+  tier: premium
+# 桥核转发出口（本机 mihomo listener，显式故障域防连带）
+- name: clash-001-pigeonw-01
+  host: 127.0.0.1
+  port: 11053
+  protocol: socks5h
+  region: us-west
+  egress_type: clash_proxy
+  tags: [clash, bridge, residential]
+  weight: 100
+  tier: standard
+  relay_mode: direct_only
+  fault_domain: mac-bridge-core
