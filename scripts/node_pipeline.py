@@ -219,7 +219,16 @@ def backup(path: Path, tag: str = "pipeline"):
 
 
 def js_check_or_rollback(path: Path, bak: Path | None):
-    """node --check 失败则从备份回滚并抛错 (防止坏 JS 部署到 Verge)."""
+    """node --check 失败则从备份回滚并抛错 (防止坏 JS 部署到 Verge).
+
+    宿主没有 node 时 (如只跑 TetherPool 控制面的 Linux VPS, Verge/Script.js
+    是 Mac 侧的资源) 语法校验无从谈起, 跳过即可 — 不能让一次无害的部署
+    在文件已落盘后因为缺解释器而崩溃 (2026-11-12 huawei-vps 部署实测)。
+    """
+    import shutil
+    if shutil.which("node") is None:
+        log("  [js-check] ⚠️ 宿主无 node, 跳过语法校验 (非 Verge 宿主属预期)")
+        return
     r = subprocess.run(["node", "--check", str(path)], capture_output=True, text=True)
     if r.returncode != 0:
         if bak and bak.exists():
@@ -330,9 +339,18 @@ function {fn}(config) {{
 // <<< NODE-PIPELINE:{group_name}:v1"""
 
 
+def is_standalone(group: dict) -> bool:
+    """standalone 桥核组 (bridge_core.type=standalone-mihomo, 如 teleapi):
+    节点只入 TetherPool, 不写 Clash Verge (Script.js/Merge.yaml/mihomo 活体)."""
+    return (group.get("bridge_core") or {}).get("type") == "standalone-mihomo"
+
+
 def gen_main_call_js(manifest: dict) -> str:
+    # standalone 组没有 ensureNPGroup_<name> 函数, 主调用块绝不能引用它
+    # (否则 JS ReferenceError 使整个宿主脚本失效, 连带 pigeonw 等受管组全灭)。
     calls = "\n".join(
-        f"  ensureNPGroup_{gname}(config);" for gname in manifest["groups"])
+        f"  ensureNPGroup_{gname}(config);" for gname, g in manifest["groups"].items()
+        if not is_standalone(g))
     return f"""{MAIN_BEGIN.format()}
   // 节点流水线: 所有受管组(节点注入/中转/url-test)统一入口。
 {calls}
@@ -418,18 +436,36 @@ def warn(name: str, detail: str = ""):
 def cmd_check(args):
     manifest = load_manifest()
     all_ok = True
-    script = read_script()
     nodes_yaml = yaml.safe_load(open(NODES_YAML, encoding="utf-8")) or {}
     pool_registry = pool_nodes()
     live_listening = listening_ports()
-    _, body = mihomo_get("/proxies")
-    px = body.get("proxies", {})
+
+    # Verge 侧依赖惰性拉取: 全 standalone 环境无 Verge 也必须能跑 check;
+    # 有受管组但 Verge 不可达时降级为 L2/L4 DRIFT(语义正确), 不再直接崩溃。
+    has_verge_groups = any(not is_standalone(g) for g in manifest["groups"].values())
+    script = None
+    if has_verge_groups:
+        try:
+            script = read_script()
+        except Exception as e:  # noqa: BLE001 — 缺文件/权限问题统一降级为 DRIFT
+            log(f"[check] ⚠️ Script.js 不可读 ({e}) — 受管组 L2 将报 DRIFT")
+    try:
+        _, body = mihomo_get("/proxies")
+        px = body.get("proxies", {})
+    except Exception as e:  # noqa: BLE001
+        px = {}
+        if has_verge_groups:
+            log(f"[check] ⚠️ mihomo 活体不可达 ({e}) — 受管组 L4 将报节点缺失")
     live_names = set(px.keys())
 
     for gname, group in manifest["groups"].items():
         log(f"\n== 组 {gname} ==")
         tnames = tether_names(group)
         ports = realized_ports(group)
+        # standalone 桥核组 (bridge_core.type=standalone-mihomo, 如 teleapi):
+        # 节点只入 TetherPool, 不写 Clash Verge (Script.js/mihomo 活体) — L2 豁免,
+        # L4 只验自有核 listener 在位; L1/L3/L5 照常。
+        standalone = is_standalone(group)
 
         # L1 manifest 内部完备性 (server 必填; username/password 成对出现 — 兼容无认证代理)
         complete = all(
@@ -439,14 +475,20 @@ def cmd_check(args):
                         f"{len(group['nodes'])} nodes" if complete else "缺 server 或凭据不成对")
 
         # L2 manifest ↔ Script.js 托管块 (全字段)
-        drift = js_block_drift(gname, group, script)
-        all_ok &= layer("L2 Script.js 托管块", not drift,
-                        "节点全字段一致" if not drift else f"漂移: {drift[:4]}")
+        if standalone:
+            log("  [SKIP ] L2 Script.js 托管块 — standalone 桥核组 (仅 TetherPool, 无 Verge 注入)")
+        elif script is None:
+            all_ok &= layer("L2 Script.js 托管块", False, "Script.js 不可读 — 需恢复宿主脚本")
+        else:
+            drift = js_block_drift(gname, group, script)
+            all_ok &= layer("L2 Script.js 托管块", not drift,
+                            "节点全字段一致" if not drift else f"漂移: {drift[:4]}")
 
         # L3 manifest ↔ nodes.yaml
         by_name = {n.get("name"): n for n in nodes_yaml.get("nodes", [])}
+        node_region = {n["idx"]: n.get("region") for n in group["nodes"] if n.get("region")}
         drift = []
-        for tname, port in zip(tnames, ports):
+        for i, (tname, port) in enumerate(zip(tnames, ports)):
             entry = by_name.get(tname)
             if not entry:
                 drift.append(f"{tname}(缺失)")
@@ -455,31 +497,37 @@ def cmd_check(args):
                 drift.append(f"{tname}(port {entry.get('port')}≠{port})")
             if entry.get("relay_mode") != group.get("relay_mode", "direct_only"):
                 drift.append(f"{tname}(relay_mode)")
-            if entry.get("region") != group["region"]:
-                drift.append(f"{tname}(region)")
+            expected_region = node_region.get(group["nodes"][i]["idx"], group["region"])
+            if entry.get("region") != expected_region:
+                drift.append(f"{tname}(region {entry.get('region')}≠{expected_region})")
         all_ok &= layer("L3 nodes.yaml 注册", not drift, "一致" if not drift else str(drift[:4]))
 
         # L4 manifest ↔ mihomo 活体 (固定中转: dialer 节点存活才要求; 注入组须包含全部节点)
-        missing = [n["name"] for n in group["nodes"] if n["name"] not in live_names]
-        dialer = group.get("dialer_proxy")
-        dialer_active = bool(dialer) and dialer in live_names
-        dp_expected = dialer if dialer_active else None
-        dp_bad = [n["name"] for n in group["nodes"]
-                  if n["name"] in px and px[n["name"]].get("dialer-proxy") != dp_expected]
-        inject_bad = []
-        for gname in group.get("inject_into_groups", []):
-            g = px.get(gname)
-            if not g:
-                inject_bad.append(f"{gname}(组缺)")
-                continue
-            members = set(g.get("all", []))
-            not_in = [n["name"] for n in group["nodes"] if n["name"] not in members]
-            if not_in:
-                inject_bad.append(f"{gname}(缺{len(not_in)}成员)")
-        ports_up = [p for p in ports if p in live_listening]
-        all_ok &= layer("L4 mihomo 活体", not missing and not dp_bad and not inject_bad and len(ports_up) == len(ports),
-                        f"节点缺{len(missing)} dialer偏移{len(dp_bad)} 注入{inject_bad or '✓'} "
-                        f"listener {len(ports_up)}/{len(ports)}")
+        if standalone:
+            ports_up = [p for p in ports if p in live_listening]
+            all_ok &= layer("L4 自有桥核 listener", len(ports_up) == len(ports),
+                            f"listener {len(ports_up)}/{len(ports)} 在位 ({ports[0]}–{ports[-1]})")
+        else:
+            missing = [n["name"] for n in group["nodes"] if n["name"] not in live_names]
+            dialer = group.get("dialer_proxy")
+            dialer_active = bool(dialer) and dialer in live_names
+            dp_expected = dialer if dialer_active else None
+            dp_bad = [n["name"] for n in group["nodes"]
+                      if n["name"] in px and px[n["name"]].get("dialer-proxy") != dp_expected]
+            inject_bad = []
+            for gname in group.get("inject_into_groups", []):
+                g = px.get(gname)
+                if not g:
+                    inject_bad.append(f"{gname}(组缺)")
+                    continue
+                members = set(g.get("all", []))
+                not_in = [n["name"] for n in group["nodes"] if n["name"] not in members]
+                if not_in:
+                    inject_bad.append(f"{gname}(缺{len(not_in)}成员)")
+            ports_up = [p for p in ports if p in live_listening]
+            all_ok &= layer("L4 mihomo 活体", not missing and not dp_bad and not inject_bad and len(ports_up) == len(ports),
+                            f"节点缺{len(missing)} dialer偏移{len(dp_bad)} 注入{inject_bad or '✓'} "
+                            f"listener {len(ports_up)}/{len(ports)}")
 
         # L5a manifest ↔ TetherPool 注册一致性 (计入 DRIFT)
         pool_drift = []
@@ -779,10 +827,15 @@ def cmd_heal(args):
     manifest = load_manifest()
     gname = args.group
     group = manifest["groups"][gname]
+    standalone = is_standalone(group)
     fixed = []
 
+    # standalone 组不进 Verge: 跳过宿主脚本恢复/重建与 Merge.yaml 镜像,
+    # 只对齐 nodes.yaml 与 realize 端口映射。
     js_skip_reason = None
-    if not SCRIPT_JS.exists():
+    if standalone:
+        js_skip_reason = "standalone 桥核组 — 无 Verge 注入, 跳过 Script.js/Merge.yaml"
+    elif not SCRIPT_JS.exists():
         baks = sorted(VERGE_DIR.joinpath("profiles").glob("Script.js.bak-*"))
         if baks:
             import shutil
@@ -793,8 +846,8 @@ def cmd_heal(args):
             js_skip_reason = ("Script.js 缺失且无备份 (profiles/Script.js.bak-*) — "
                               "请先恢复宿主脚本(含 main/ensureHomeMeshNode 锚点)再重跑 heal")
 
-    script = read_script()
-    drift = js_block_drift(gname, group, script)
+    script = None if standalone else read_script()
+    drift = [] if standalone else js_block_drift(gname, group, script)
     if js_skip_reason is None and (drift or args.force_js):
         log(f"[heal] 重建 Script.js 托管块 (漂移: {drift[:4] if drift else 'force'})")
         bak = backup(SCRIPT_JS, f"heal-{gname}")
@@ -818,35 +871,46 @@ def cmd_heal(args):
     need_node_fix = any(
         (n := by_name.get(t)) is None or n.get("port") != p or n.get("relay_mode") != "direct_only"
         for t, p in zip(tnames, ports))
+    node_region = {n["idx"]: n.get("region") for n in group["nodes"] if n.get("region")}
+    if not need_node_fix and node_region:
+        # 节点级 region 覆盖组默认时, 还要比对 region 本身 (standalone/多地区组)
+        need_node_fix = any(
+            (e := by_name.get(t)) is not None
+            and e.get("region") != node_region.get(group["nodes"][i]["idx"], group["region"])
+            for i, (t, _p) in enumerate(zip(tnames, ports)))
     if need_node_fix:
-        log("[heal] 对齐 nodes.yaml (端口/relay_mode)")
+        log("[heal] 对齐 nodes.yaml (端口/relay_mode/region)")
         backup(NODES_YAML, f"heal-{gname}")
-        for t, p in zip(tnames, ports):
+        for i, (t, p) in enumerate(zip(tnames, ports)):
             entry = by_name.get(t)
+            expected_region = node_region.get(group["nodes"][i]["idx"], group["region"])
             if entry is None:
                 ny["nodes"].append({"name": t, "host": "127.0.0.1", "port": p,
-                                    "protocol": "socks5h", "region": group["region"],
+                                    "protocol": "socks5h", "region": expected_region,
                                     "egress_type": "clash_proxy", "tags": group["tags"] + ["pipeline"],
                                     "weight": 100, "tier": group["tier"], "relay_mode": "direct_only"})
             else:
                 entry["port"] = p
                 entry["relay_mode"] = "direct_only"
+                if node_region:
+                    entry["region"] = expected_region
         atomic_write_text(NODES_YAML, yaml.dump(ny, allow_unicode=True, sort_keys=False, width=200))
         fixed.append("nodes.yaml")
 
-    merge = yaml.safe_load(open(MERGE_YAML, encoding="utf-8")) or {}
-    have_insurance = {str(l.get("proxy")) for l in merge.get("listeners", [])}
-    missing_insurance = [n["name"] for n in group["nodes"] if n["name"] not in have_insurance]
-    if missing_insurance:
-        log("[heal] 补 Merge.yaml 重建镜像 listeners")
-        backup(MERGE_YAML, f"heal-{gname}")
-        ports_decl = declared_ports(group)
-        new_ls = [{"name": f"pipe-{gname}-{i+1:03d}", "type": "socks",
-                   "port": ports_decl[i], "listen": "127.0.0.1", "proxy": n["name"]}
-                  for i, n in enumerate(group["nodes"]) if n["name"] not in have_insurance]
-        merge["listeners"] = (merge.get("listeners") or []) + new_ls
-        atomic_write_text(MERGE_YAML, yaml.dump(merge, allow_unicode=True, sort_keys=False))
-        fixed.append("Merge.yaml")
+    if not standalone:
+        merge = yaml.safe_load(open(MERGE_YAML, encoding="utf-8")) or {}
+        have_insurance = {str(l.get("proxy")) for l in merge.get("listeners", [])}
+        missing_insurance = [n["name"] for n in group["nodes"] if n["name"] not in have_insurance]
+        if missing_insurance:
+            log("[heal] 补 Merge.yaml 重建镜像 listeners")
+            backup(MERGE_YAML, f"heal-{gname}")
+            ports_decl = declared_ports(group)
+            new_ls = [{"name": f"pipe-{gname}-{i+1:03d}", "type": "socks",
+                       "port": ports_decl[i], "listen": "127.0.0.1", "proxy": n["name"]}
+                      for i, n in enumerate(group["nodes"]) if n["name"] not in have_insurance]
+            merge["listeners"] = (merge.get("listeners") or []) + new_ls
+            atomic_write_text(MERGE_YAML, yaml.dump(merge, allow_unicode=True, sort_keys=False))
+            fixed.append("Merge.yaml")
 
     if fixed:
         if args.yes or (sys.stdin.isatty() and input("应用 TetherPool 重启? [y/N] ").lower() == "y"):
@@ -866,10 +930,14 @@ def cmd_heal(args):
     live = listening_ports()
     ports_up = [p for p in ports if p in live]
     if len(ports_up) != len(ports):
-        log(f"[heal] ⚠️ Verge 底座 listener 缺失 {len(ports) - len(ports_up)} 个 — "
-            f"需在 Clash Verge 重新激活配置后重跑 heal")
-        if args.restart_verge:
-            restart_verge_app()
+        if standalone:
+            log(f"[heal] ⚠️ 桥核 listener 缺失 {len(ports) - len(ports_up)} 个 — "
+                f"检查桥核进程 (start.sh status / logs/teleapi-bridge.log)")
+        else:
+            log(f"[heal] ⚠️ Verge 底座 listener 缺失 {len(ports) - len(ports_up)} 个 — "
+                f"需在 Clash Verge 重新激活配置后重跑 heal")
+            if args.restart_verge:
+                restart_verge_app()
     rc = cmd_check(argparse.Namespace())
     log(("[heal] 已修复: " + ", ".join(fixed)) if fixed else "[heal] 无需修复")
     return rc

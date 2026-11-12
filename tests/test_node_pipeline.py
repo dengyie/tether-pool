@@ -203,6 +203,7 @@ def test_heal_rebuilds_when_script_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(np, "pool_nodes", lambda: {
         t: {"port": p, "status": "healthy"} for t, p in zip(tnames, [11053, 11054, 11055])})
     monkeypatch.setattr(np, "listening_ports", lambda *a, **k: {11053, 11054, 11055})
+    monkeypatch.setattr(np, "restart_tetherpool", lambda: True)
 
     rc = np.cmd_heal(argparse.Namespace(group="t", yes=True, force_js=False, restart_verge=False, realize=False))
     assert rc == 0
@@ -250,3 +251,66 @@ def test_realize_group_no_drift_is_noop(tmp_path, monkeypatch):
     rc, changed = np.realize_group(manifest, "t", [11053, 11054, 11055])
     assert rc == 0 and not changed
     assert "realized_map" not in yaml.safe_load(open(mpath))["groups"]["t"]["bridge_ports"]
+
+
+# ---------------------------------------------------------------- check 容错
+
+def _write_verge_group_env(tmp_path, monkeypatch, standalone_only=False):
+    """搭建 check/heal 的离线环境: manifest + nodes.yaml + mock 池/活体."""
+    group = make_group()
+    if standalone_only:
+        group["bridge_core"] = {"type": "standalone-mihomo"}
+        group.pop("dialer_proxy", None)
+        group.pop("inject_into_groups", None)
+    manifest = {"groups": {"t": group}}
+    mpath = tmp_path / "node_groups.yaml"
+    mpath.write_text(yaml.dump(manifest))
+    npath = tmp_path / "nodes.yaml"
+    tnames = np.tether_names(group)
+    ports = list(range(11053, 11053 + len(tnames)))
+    npath.write_text(yaml.dump({"nodes": [
+        {"name": t, "host": "127.0.0.1", "port": p, "region": "us-west",
+         "relay_mode": "direct_only"} for t, p in zip(tnames, ports)]}))
+    monkeypatch.setattr(np, "MANIFEST_PATH", mpath)
+    monkeypatch.setattr(np, "NODES_YAML", npath)
+    monkeypatch.setattr(np, "pool_nodes", lambda: {
+        t: {"port": p, "status": "healthy"} for t, p in zip(tnames, ports)})
+    monkeypatch.setattr(np, "listening_ports", lambda *a, **k: set(ports))
+    return group, tnames, ports
+
+
+def test_check_degrades_not_crashes_when_verge_broken(tmp_path, monkeypatch, capsys):
+    """有受管组且 Verge 不可达: check 必须降级为 L2/L4 DRIFT (退出码 2), 不崩."""
+    group, tnames, ports = _write_verge_group_env(tmp_path, monkeypatch)
+    spath = tmp_path / "Script.js"
+    spath.write_text("function main(config) { return config; }")
+
+    def boom(*a, **k):
+        raise RuntimeError("mihomo socket down")
+    monkeypatch.setattr(np, "SCRIPT_JS", spath)
+    monkeypatch.setattr(np, "MERGE_YAML", tmp_path / "Merge.yaml")
+    monkeypatch.setattr(np, "read_script", boom)
+    monkeypatch.setattr(np, "mihomo_get", boom)
+
+    rc = np.cmd_check(argparse.Namespace())
+    assert rc == 2, "受管组在 Verge 不可达时应报 DRIFT 而非崩溃"
+    out = capsys.readouterr().out
+    assert "Script.js 不可读" in out and "mihomo 活体不可达" in out
+    assert "[DRIFT]" in out
+
+
+def test_check_standalone_only_needs_no_verge(tmp_path, monkeypatch, capsys):
+    """全 standalone 环境 (无 Verge): read_script/mihomo_get 都不可用, check 仍应全绿."""
+    group, tnames, ports = _write_verge_group_env(tmp_path, monkeypatch, standalone_only=True)
+    spath = tmp_path / "Script.js"  # 不创建
+
+    def boom(*a, **k):
+        raise RuntimeError("no verge here")
+    monkeypatch.setattr(np, "SCRIPT_JS", spath)
+    monkeypatch.setattr(np, "read_script", boom)
+    monkeypatch.setattr(np, "mihomo_get", boom)
+
+    rc = np.cmd_check(argparse.Namespace())
+    assert rc == 0, "全 standalone 环境不依赖 Verge, check 应全绿"
+    out = capsys.readouterr().out
+    assert "[SKIP ] L2" in out and "自有桥核 listener" in out

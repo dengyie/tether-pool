@@ -15,3 +15,10 @@ logs/
 config/node_groups.yaml
 config/*.bak-*
 *.bak-*
+# teleapi standalone bridge core: vendor 凭据 + 大二进制仅存本地
+# (mihomo 二进制从 Clash Verge 复制: cp "/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo" bin/mihomo)
+config/teleapi-bridge.yaml
+config/teleapi-bridge/
+bin/mihomo
+# 自建中转节点凭据 (import_standalone.py relay 注入源), 见 NODE_ONBOARDING.md §六
+config/relay-nodes.local.yaml

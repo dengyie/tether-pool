@@ -57,15 +57,14 @@ node_pipeline.py heal --group pigeonw --realize --yes  # 出口↔端口映射�
 - L5 manifest ↔ TetherPool（注册/端口一致性）
 - 附带 **L5 探活健康度**：仅 WARN 不影响退出码（vendor 瞬时抖动属自愈范畴，不与一致性混淆）
 
-### 策略组全景表（2026-11-10 全量梳理 · 每个组都有明确职责，无孤儿）
+### 策略组全景表（2026-11-10 全量梳理 · 10 组明确职责，无孤儿；MangoCF 已退役）
 
 | 组 | 类型 | 用途（一句话） | 规则引用 | 来源/管理者 |
 |---|---|---|---|---|
 | PROXY | select | 主选择器（手动兜底出口） | 6 条（stun 等） | 订阅；pigeonw 家宽 20 节点已注入 |
-| AUTO | url-test | 全节点自动选优（PROXY/MangoCF 的回退成员） | 0（作为成员被引用） | 订阅；pigeonw 已注入 |
+| AUTO | url-test | 全节点自动选优（PROXY 的回退成员） | 0（作为成员被引用） | 订阅；pigeonw 已注入 |
 | GLOBAL | select | mihomo 全局模式选择器 | 0（全局模式用） | 订阅 |
-| MangoCF | fallback | **自家域名 mangoqwq.com 直连兜底**（直连→AUTO→PROXY；面板/frp/doh/check-api 等自建服务） | 1 条（suffix mangoqwq.com，**53 hits 最活跃自建规则**） | 订阅；同时是死节点黑名单的**订阅指纹**（Script.js dropDeadNodes 门控），不可改名 |
-| 🏠家宽 | fallback | EdgeOne 大陆住宅出口要求站点（hygbzs/mulink） | 3 条 | 订阅+脚本 |
+| 🏠家宽 | fallback | EdgeOne 大陆住宅出口要求站点（hybgzs/mulink） | 3 条 | 订阅+脚本（首选 `[自建] 🏠home-win-mesh`，已移除 `🏠home-win-CF`） |
 | 🌏港澳台优选 | url-test | 港澳台特定 API（ai.muapi.cn 等全节点 403 规避） | 4 条 | 脚本 |
 | 🎯Claude | select | Claude 专属防封分流 | 27 条 | 订阅+脚本 |
 | 🎯Google | select | Google/Gmail/Gemini/YouTube | 3 条 RuleSet | 脚本 |
@@ -73,9 +72,10 @@ node_pipeline.py heal --group pigeonw --realize --yes  # 出口↔端口映射�
 | 🎯ZCode | select | ZCode/z.ai → 日本 AWS 固定出口（含 5 条进程规则） | 9 条 | 脚本 |
 | GROK-REG | select | **Grok 注册流量隔离**（x.ai/grok.com），成员由 grok-register proxy_rotate 动态轮换（72 个） | 2 条（**2026-11-10 修复回归**：规则重建白名单漏了它，每次重组 x.ai/grok.com 分流被丢弃回落 PROXY） | 链式 groups/rules 文件（grok-register 管理） |
 
+> **注（MangoCF 退役）**：2026-11-10 订阅源端已升级至 REV 14，彻底移除 `MangoCF` 策略组与 `mangoqwq.com` 专项路由规则（所有公开/Cloudflare 橙标子域统一回落 `MATCH,PROXY` 走优质代理出口）；Script.js 指纹已解耦为 `🏠家宽` + `🎯Claude` + `🎯OpenAI`。
 > pigeonw 家宽 20 节点：不独立成组，注入 **PROXY / AUTO / 🎯Claude / 🎯Google / 🎯OpenAI 共 5 组**（US 住宅 IP 对美区服务组是优质出口）；中转固定 `dialer-proxy → [自建] 🇺🇸VLESS-AWS-Oregon-Reality`（单节点，不建组，缺失自动退直连）。
 > **GROK-REG 不走脚本注入**：其成员由 `grok-register proxy_rotate` 整体重写（`_build_group_yaml`），家宽节点加入需配置到 grok-register 的 allowlist（独立集成）。
-> **语义不符不注入**：🌏港澳台优选（地区）、🏠家宽（home-win 专用）、MangoCF（自家域名直连兜底）、🎯ZCode（固定日本）、GLOBAL（组选择器）。
+> **语义不符不注入**：🌏港澳台优选（地区）、🏠家宽（home-win 专用）、🎯ZCode（固定日本）、GLOBAL（组选择器）。
 
 ## 四、教训目录（每条都有当日事故实证）
 
@@ -101,3 +101,51 @@ node_pipeline.py heal --group pigeonw --realize --yes  # 出口↔端口映射�
 | 单测 | `tests/test_node_pipeline.py` 15 用例（gen↔parse 往返 / upsert 幂等与坏状态规范化 / 命名补零 / 端口规划 / 漂移判定 / realize 回写 / Script.js 缺失自动恢复） |
 | 网关路由 | `region=us-west&type=clash_proxy` |
 | 验证基线 | check 5/5 PASS · 出口 IP 20/20 · google/x/claude 20/20 · 60 并发 60/60 · 网关绑定一致+粘性 ✓ · pytest 11/11 |
+
+---
+
+## 六、standalone 桥核变体（仅入池 · 不写 Clash Verge · 2026-11-12 teleapi 批次）
+
+> **适用**：vendor 分享只要求入 TetherPool（业务经 `:9101` 网关消费），**明确不进本地 Clash Verge / tebi / pxed**。与 §二 的 Verge 注入型组在 manifest 中共存，互不影响；`check` 按组自动分流。
+
+### 架构与文件
+
+```
+TetherPool 网关 :9101 (socks5 拨号, 零代码改动)
+  └─ 127.0.0.1:11101–11239  ← ip-pool 自有 mihomo 桥核 (bin/mihomo, 每节点一个 socks listener)
+       └─ http → brd.superproxy.io:44445 (Bright Data ISP, username 内嵌 -ip- 固定出口)
+```
+
+| 件 | 说明 |
+|---|---|
+| `bin/mihomo` | 自 Clash Verge 复制（`cp "/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo" bin/mihomo`），gitignore 不入仓 |
+| `config/teleapi-bridge.yaml` | 桥核配置：139 个 http proxy + 139 个 socks listener；**含 vendor 凭据，gitignore** |
+| `config/teleapi-bridge/` | 桥核运行目录（cache.db） |
+| `start.sh` + `scripts/bridge_keeper.sh` | keeper 守护的生命周期（崩溃 2s 重生；⚠️ keeper 必须可执行 `chmod +x`，否则 nohup 静默 exit 127）；与 api/gateway 同启停，PID `data/teleapi-bridge.pid` 记 keeper；启动尾自动 `POST /v1/probe?force=true` 清熔断债 |
+| manifest `bridge_core` 字段 | `{type: standalone-mihomo, binary, config, home, log, pid, managed_by, note}`；`check` 据此分流 |
+
+### 标准工具（standalone 组两阶段导入 · 2026-11-12 入仓）
+
+```bash
+# 阶段 1: 解析 vendor clash yaml → manifest + nodes.yaml + config/<group>-bridge.yaml (mihomo -t 校验)
+python3 scripts/import_standalone.py import <订阅url|本地.yaml> --group NAME     [--region us-west] [--filter-type http] [--filter-server brd.superproxy.io] [--dry-run]
+# 阶段 2: start.sh restart (keeper 拉桥核 + 自动 force probe) 后, 探活回写
+python3 scripts/import_standalone.py realize --group NAME
+```
+
+- fault_domain 默认 `mac-<group>`（与 Verge 域隔离）；`--replace` 覆盖；节点级 region 细分（如 teleapi 的城市→国家码）在导入后按 manifest 记录调整。
+- 老批次（teleapi）由一次性脚本导入，本工具为沉淀后的标准入口。
+
+### 接入要点（teleapi 战果与差异）
+
+1. **region 逐节点标注**：vendor 称「US-静态」但城市混杂（109 美国 / 30 非美）——按城市映射 `region`（美国→`us-west`，非美→sg/tw/jp/gb… 国家码），防污染 `region=us-west&type=clash_proxy` 路由；manifest nodes[] 增加 `region/city/vendor_name` 供 triage。
+2. **check 分流**：`bridge_core.type=standalone-mihomo` 组 → L2 SKIP（无 Script.js 托管块）、L4 改验自有核 listener 在位（复用 `listening_ports()`）；L1/L3/L5 照常。L3 region 比对支持 manifest 节点级 `region` 覆盖组默认。
+3. **realized_map 必须全量恒等**（死口也占位）：`realized_ports()` 按 idx 查 map，缺项 KeyError。
+4. **vendor 域名策略**：Bright Data zone 对 google/x.com 域名封锁（000），Oregon 中转与直连**同败**——链路无关，勿浪费时间调 dialer；grok.com/chatgpt.com 200、claude.ai 403（可达口径 {200,403,405} 内）。
+5. **中转杠杆**：Mac 直拨 brd 实测 200/0.9s 无跨 GFW RST，默认不挂 `dialer-proxy`（免 SPOF）；直拨劣化时 `import_standalone.py relay --group <g> --mode on` 在自有核给 proxies 接线 `dialer-proxy`（已实证不破坏 `-ip-` 固定出口，2026-11-12 BRD 限流事故激活）。中转节点定义不在桥核配置时，从 **`config/relay-nodes.local.yaml`**（gitignored，自建凭据仅本地，`relay_nodes:` 列表、clash proxy schema、`name` 精确匹配）读取注入；缺失时报错退出不猜测。`--mode off` 可逆。
+6. **3 死口处置**：vendor 407/超时节点保持注册，断路器标记 degraded 自愈；`import_audit`（alive_first_probe/dead_ports）记入 manifest 供凭据轮换后 heal。
+7. **listener 计数陷阱**：`netstat | grep '127.0.0.1\.111'` 前缀漏匹配 11200+ 段；一律用 `listening_ports()` 正则。
+
+### 验证基线（2026-11-12）
+
+`check` 全绿（pigeonw 五层无回归 + teleapi L1/L3/L4/L5 PASS）· 出口↔固定 IP 136/139 零漂移 · 网关 `region=us-west&type=clash_proxy` 粘性 ✓ · pytest 15/15
