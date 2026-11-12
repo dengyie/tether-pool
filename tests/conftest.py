@@ -36,6 +36,16 @@ def isolate_api_storage(tmp_path, monkeypatch):
     monkeypatch.setattr(api.server, "metrics_collector", isolated_metrics)
     monkeypatch.setattr(api.server, "cpa_adapter", isolated_cpa)
 
+    # Prevent accidental subprocess calls from disturbing live daemons during tests
+    try:
+        import scripts.node_pipeline as np
+        monkeypatch.setattr(np, "restart_tetherpool", lambda: True)
+        monkeypatch.setattr(np, "restart_verge_app", lambda *a, **k: None)
+    except ImportError:
+        # 仅忽略模块导入失败 (node_pipeline 的可选系统依赖); 其他异常必须穿透,
+        # 局部 except 掩盖真回归会延迟问题暴露。
+        pass
+
     yield isolated_storage
 
 

@@ -78,6 +78,11 @@ class Storage:
                     assigned_at TEXT NOT NULL,
                     rebind_count INTEGER DEFAULT 0,
                     last_rebind_reason TEXT DEFAULT '',
+                    bound_region TEXT DEFAULT '',
+                    bound_region_strict INTEGER DEFAULT 0,
+                    bound_egress_type TEXT DEFAULT '',
+                    bound_tier TEXT DEFAULT '',
+                    bound_tier_policy TEXT DEFAULT '',
                     FOREIGN KEY (node_name) REFERENCES nodes(name)
                 );
 
@@ -125,6 +130,11 @@ class Storage:
                     allocated_at TEXT NOT NULL,
                     rebind_count INTEGER DEFAULT 0,
                     last_rebind_reason TEXT DEFAULT '',
+                    bound_region TEXT DEFAULT '',
+                    bound_region_strict INTEGER DEFAULT 0,
+                    bound_egress_type TEXT DEFAULT '',
+                    bound_tier TEXT DEFAULT '',
+                    bound_tier_policy TEXT DEFAULT '',
                     PRIMARY KEY (service, account_id),
                     FOREIGN KEY (node_name) REFERENCES nodes(name)
                 );
@@ -188,7 +198,14 @@ class Storage:
             lease_cols = [r["name"] for r in conn.execute("PRAGMA table_info(leases)").fetchall()]
             for col, col_type, default_val in [
                 ("rebind_count", "INTEGER", "0"),
-                ("last_rebind_reason", "TEXT", "''")
+                ("last_rebind_reason", "TEXT", "''"),
+                # Binding-constraint set persisted with the lease mirror (auto_rehome must
+                # respect the constraints the credential declared when the binding was made).
+                ("bound_region", "TEXT", "''"),
+                ("bound_region_strict", "INTEGER", "0"),
+                ("bound_egress_type", "TEXT", "''"),
+                ("bound_tier", "TEXT", "''"),
+                ("bound_tier_policy", "TEXT", "''"),
             ]:
                 if col not in lease_cols:
                     conn.execute(f"ALTER TABLE leases ADD COLUMN {col} {col_type} DEFAULT {default_val}")
@@ -196,7 +213,12 @@ class Storage:
             alloc_cols = [r["name"] for r in conn.execute("PRAGMA table_info(account_allocations)").fetchall()]
             for col, col_type, default_val in [
                 ("rebind_count", "INTEGER", "0"),
-                ("last_rebind_reason", "TEXT", "''")
+                ("last_rebind_reason", "TEXT", "''"),
+                ("bound_region", "TEXT", "''"),
+                ("bound_region_strict", "INTEGER", "0"),
+                ("bound_egress_type", "TEXT", "''"),
+                ("bound_tier", "TEXT", "''"),
+                ("bound_tier_policy", "TEXT", "''"),
             ]:
                 if col not in alloc_cols:
                     conn.execute(f"ALTER TABLE account_allocations ADD COLUMN {col} {col_type} DEFAULT {default_val}")
@@ -759,7 +781,12 @@ class Storage:
 
     # --- Universal Account Allocation & Distribution ---
 
-    def batch_save_allocations(self, records: List[Tuple[str, str, str, str]], reason: str = "bind"):
+    def batch_save_allocations(
+        self,
+        records: List[Tuple[str, str, str, str]],
+        reason: str = "bind",
+        constraints_by_account: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None
+    ):
         """
         Atomically upserts account allocations: List of (service, account_id, node_name, allocated_at).
         When a binding's node changes, its rebind counter is incremented, the legacy lease
@@ -769,10 +796,17 @@ class Storage:
 
         `reason` labels transitions (`bind`, `auto_rehome`, `domain_rehome`, ...) so the
         incremental export can report why accounts moved.
+
+        `constraints_by_account` optionally carries the credential's constraint set
+        (region / region_strict / egress_type / tier / tier_policy) keyed by
+        (service, account_id); rows it covers get those bound_* columns written, all
+        other rows PRESERVE their existing bound_* values (rehome sweeps must never
+        rewrite the constraints an account was pinned with).
         """
         if not records:
             return
         now_str = datetime.now().isoformat()
+        constraints_by_account = constraints_by_account or {}
         with self._get_conn() as conn:
             # Pre-image lookup so rebind counts and change logs reflect real transitions.
             # Later duplicates win, matching the upsert ordering executemany applies.
@@ -787,9 +821,25 @@ class Storage:
                 ).fetchone()
                 pre_images[key] = row["node_name"] if row else None
 
+            def _c(key: Tuple[str, str]) -> Tuple[int, str, int, str, str, str]:
+                c = constraints_by_account.get(key)
+                if not c:
+                    return (0, "", 0, "", "", "")
+                return (
+                    1,
+                    c.get("region") or "",
+                    1 if c.get("region_strict") else 0,
+                    c.get("egress_type") or "",
+                    c.get("tier") or "",
+                    c.get("tier_policy") or "",
+                )
+
             conn.executemany("""
-                INSERT INTO account_allocations (service, account_id, node_name, allocated_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO account_allocations (
+                    service, account_id, node_name, allocated_at,
+                    bound_region, bound_region_strict, bound_egress_type, bound_tier, bound_tier_policy
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(service, account_id) DO UPDATE SET
                     node_name = excluded.node_name,
                     allocated_at = excluded.allocated_at,
@@ -798,8 +848,26 @@ class Storage:
                                         ELSE account_allocations.rebind_count END,
                     last_rebind_reason = CASE WHEN account_allocations.node_name != excluded.node_name
                                               THEN ?
-                                              ELSE account_allocations.last_rebind_reason END
-            """, [(*record, reason) for record in records])
+                                              ELSE account_allocations.last_rebind_reason END,
+                    bound_region = CASE WHEN ?=1 THEN ? ELSE account_allocations.bound_region END,
+                    bound_region_strict = CASE WHEN ?=1 THEN ? ELSE account_allocations.bound_region_strict END,
+                    bound_egress_type = CASE WHEN ?=1 THEN ? ELSE account_allocations.bound_egress_type END,
+                    bound_tier = CASE WHEN ?=1 THEN ? ELSE account_allocations.bound_tier END,
+                    bound_tier_policy = CASE WHEN ?=1 THEN ? ELSE account_allocations.bound_tier_policy END
+            """, [
+                (
+                    service, account_id, node_name, allocated_at,
+                    _c((service, account_id))[1], _c((service, account_id))[2],
+                    _c((service, account_id))[3], _c((service, account_id))[4], _c((service, account_id))[5],
+                    reason,
+                    _c((service, account_id))[0], _c((service, account_id))[1],
+                    _c((service, account_id))[0], _c((service, account_id))[2],
+                    _c((service, account_id))[0], _c((service, account_id))[3],
+                    _c((service, account_id))[0], _c((service, account_id))[4],
+                    _c((service, account_id))[0], _c((service, account_id))[5],
+                )
+                for service, account_id, node_name, allocated_at in records
+            ])
 
             # Advance each service's epoch once per call and append one change row per move.
             changed = [
@@ -825,22 +893,51 @@ class Storage:
                     # A first bind is not a rebind; a move is. If the account has several
                     # services, any pre-existing binding makes this a rebind.
                     lease_moves[a] = (new, 1 if old is not None else 0)
+                # The mirror is account-keyed while constraints are (service, account)-keyed;
+                # prebuild the per-account lookup once (first service wins in insertion
+                # order) instead of scanning the map for every lease row.
+                first_c_by_acc: Dict[str, Tuple[int, str, int, str, str, str]] = {}
+                if constraints_by_account:
+                    for (s, a) in constraints_by_account.keys():
+                        if a not in first_c_by_acc:
+                            first_c_by_acc[a] = _c((s, a))
                 conn.executemany("""
-                    INSERT INTO leases (account_id, node_name, assigned_at, rebind_count, last_rebind_reason)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO leases (account_id, node_name, assigned_at, rebind_count, last_rebind_reason,
+                                        bound_region, bound_region_strict, bound_egress_type, bound_tier, bound_tier_policy)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(account_id) DO UPDATE SET
                         node_name = excluded.node_name,
                         assigned_at = excluded.assigned_at,
                         rebind_count = leases.rebind_count + CASE WHEN leases.node_name != excluded.node_name THEN 1 ELSE 0 END,
-                        last_rebind_reason = CASE WHEN leases.node_name != excluded.node_name THEN excluded.last_rebind_reason ELSE leases.last_rebind_reason END
-                """, [(acc, node, now_str, initial, reason) for acc, (node, initial) in lease_moves.items()])
+                        last_rebind_reason = CASE WHEN leases.node_name != excluded.node_name THEN excluded.last_rebind_reason ELSE leases.last_rebind_reason END,
+                        bound_region = CASE WHEN ?=1 THEN ? ELSE leases.bound_region END,
+                        bound_region_strict = CASE WHEN ?=1 THEN ? ELSE leases.bound_region_strict END,
+                        bound_egress_type = CASE WHEN ?=1 THEN ? ELSE leases.bound_egress_type END,
+                        bound_tier = CASE WHEN ?=1 THEN ? ELSE leases.bound_tier END,
+                        bound_tier_policy = CASE WHEN ?=1 THEN ? ELSE leases.bound_tier_policy END
+                """, [
+                    (acc, node, now_str, initial, reason,
+                     _lc[1], _lc[2], _lc[3], _lc[4], _lc[5],
+                     _lc[0], _lc[1],
+                     _lc[0], _lc[2],
+                     _lc[0], _lc[3],
+                     _lc[0], _lc[4],
+                     _lc[0], _lc[5],
+                     )
+                    for acc, (node, initial) in lease_moves.items()
+                    for _lc in (first_c_by_acc.get(acc, (0, "", 0, "", "", "")),)
+                ])
 
     def find_allocation_by_account(self, account_id: str, service: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Finds active allocation for an account, optionally scoped by service.
+        The bound_* columns carry the constraint set the credential declared at bind
+        time; auto_rehome reads them to keep the binding inside its promised region.
         """
         query = """
             SELECT a.service, a.account_id, a.node_name, a.allocated_at,
+                   a.bound_region, a.bound_region_strict, a.bound_egress_type,
+                   a.bound_tier, a.bound_tier_policy,
                    n.host, n.port, n.protocol, n.region, n.egress_type, n.exit_ip, n.status
             FROM account_allocations a
             JOIN nodes n ON a.node_name = n.name
@@ -855,6 +952,32 @@ class Storage:
         with self._get_conn() as conn:
             row = conn.execute(query, params).fetchone()
             return dict(row) if row else None
+
+    def update_allocation_constraints(self, service: str, account_id: str, constraints: Dict[str, Any]) -> bool:
+        """
+        Overwrites the bound_* constraint set of one allocation (called by the router when
+        a constrained request detects that the stored set differs from the current call).
+        Unconstrained values are written as '' / 0; the ROUTER decides whether an update
+        is worth a write — this method itself is a plain overwrite.
+        """
+        with self._get_conn() as conn:
+            cur = conn.execute("""
+                UPDATE account_allocations SET
+                    bound_region = ?,
+                    bound_region_strict = ?,
+                    bound_egress_type = ?,
+                    bound_tier = ?,
+                    bound_tier_policy = ?
+                WHERE service = ? AND account_id = ?
+            """, (
+                constraints.get("region") or "",
+                1 if constraints.get("region_strict") else 0,
+                constraints.get("egress_type") or "",
+                constraints.get("tier") or "",
+                constraints.get("tier_policy") or "",
+                service, account_id
+            ))
+            return cur.rowcount > 0
 
     def update_allocation_node(self, service: str, account_id: str, new_node_name: str) -> bool:
         now_str = datetime.now().isoformat()
@@ -990,10 +1113,12 @@ class Storage:
             return {r["exit_key"]: r["cnt"] for r in rows}
 
     def get_allocations_for_node(self, node_name: str) -> List[Dict[str, Any]]:
-        """All service/account bindings currently pointing at a node."""
+        """All service/account bindings currently pointing at a node (with their bound constraint set)."""
         with self._get_conn() as conn:
             rows = conn.execute(
-                "SELECT service, account_id, node_name FROM account_allocations WHERE node_name = ?",
+                "SELECT service, account_id, node_name, bound_region, bound_region_strict, "
+                "bound_egress_type, bound_tier, bound_tier_policy "
+                "FROM account_allocations WHERE node_name = ?",
                 (node_name,)
             ).fetchall()
             return [dict(r) for r in rows]

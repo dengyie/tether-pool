@@ -97,6 +97,10 @@ class MetricsCollector:
                 "# HELP ip_pool_rehome_total Account binding rehomes per service and trigger",
                 "# TYPE ip_pool_rehome_total counter",
             ),
+            "ip_pool_rehome_blocked_total": (
+                "# HELP ip_pool_rehome_blocked_total Rehome sweeps that kept an account on its (broken) node because the credential's bound constraint set had no healthy candidate in scope",
+                "# TYPE ip_pool_rehome_blocked_total counter",
+            ),
             "ip_pool_domain_trip_total": (
                 "# HELP ip_pool_domain_trip_total Whole failure-domain isolation trips",
                 "# TYPE ip_pool_domain_trip_total counter",

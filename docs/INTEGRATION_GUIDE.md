@@ -62,6 +62,10 @@ TetherPool 对外提供两个核心服务端口（部署于中心节点，如 Ea
 | `tier_<level>` | `premium`, `standard` | 指定质量分层（优质池/普通池） | `__tier_premium` |
 | `policy_<pol>` | `standard_first`, `premium_first`, `premium_only`, `standard_only` | 跨池分级降级策略 | `__policy_premium_first` |
 | `rebind_true` | (标志位) | 强制换绑该账号的新出口节点 | `__rebind_true` |
+| `region_strict_true` | (标志位) | 区域硬约束：候选集只在 `region_<loc>` 内筛选，不跨区降级；无可用节点时返回 503 `pool_exhausted`。默认关闭 | `__region_us-west__region_strict_true` |
+| `bind_persist_true` | (标志位) | 持久化换绑：当本次调用的约束与现有绑定节点冲突时，将新绑定写回数据库（`constraint_rebind`）；不带此标志的换绑请求保持临时性、不落库。默认关闭 | `__region_singapore__bind_persist_true` |
+
+> **约束语义（2026-11-12）**：凭据携带的约束集（region / region_strict / egress / tier / policy）在绑定时持久化（`account_allocations.bound_*` 列）。节点故障后的 auto_rehome 只会在约束集内迁移；约束区域内无健康候选时保持原绑定不动并计入 `ip_pool_rehome_blocked_total` 指标（`rehome_blocked`），绝不迁移到约束区域外。
 
 > **示例**：
 > - 账号 `bot_user_01` 绑定东京节点：`bot_user_01__region_tokyo:tetherpool@10.144.144.9:9101`

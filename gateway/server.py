@@ -57,6 +57,7 @@ logger = logging.getLogger("tetherpool.gateway")
 INTERNAL_ROUTING_HEADERS = frozenset({
     "x-account-id",
     "x-region",
+    "x-region-strict",
     "x-egress-type",
     "x-tier",
     "x-tier-policy",
@@ -64,6 +65,7 @@ INTERNAL_ROUTING_HEADERS = frozenset({
     "x-target-service",
     "x-rebind",
     "x-force-rebind",
+    "x-bind-persist",
     "proxy-authorization",
     "proxy-connection",
     "connection",
@@ -306,7 +308,8 @@ async def pump_streams(r1: asyncio.StreamReader, w1: asyncio.StreamWriter, r2: a
 class ParsedCredentials:
     """
     Parametric credential parse result. Supports 4-item tuple unpacking for full backward
-    compatibility, as well as property access for tier, tier_policy, and force_rebind.
+    compatibility, as well as property access for tier, tier_policy, force_rebind,
+    region_strict and bind_persist.
     """
     def __init__(
         self,
@@ -316,7 +319,9 @@ class ParsedCredentials:
         service: Optional[str] = None,
         tier: Optional[str] = None,
         tier_policy: Optional[str] = None,
-        force_rebind: bool = False
+        force_rebind: bool = False,
+        region_strict: bool = False,
+        bind_persist: bool = False
     ):
         self.account_id = account_id
         self.region = region
@@ -325,6 +330,8 @@ class ParsedCredentials:
         self.tier = tier
         self.tier_policy = tier_policy
         self.force_rebind = force_rebind
+        self.region_strict = region_strict
+        self.bind_persist = bind_persist
 
     def __iter__(self):
         yield self.account_id
@@ -339,14 +346,11 @@ class ParsedCredentials:
     def __len__(self):
         return 4
 
-    def as_tuple(self) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], bool]:
-        return (self.account_id, self.region, self.egress_type, self.service, self.tier, self.tier_policy, self.force_rebind)
-
 
 class RoutingContext:
     """
     Gateway request routing context. Supports 4-item unpacking for backward compatibility,
-    as well as properties for tier, tier_policy, and force_rebind.
+    as well as properties for tier, tier_policy, force_rebind, region_strict and bind_persist.
     """
     def __init__(
         self,
@@ -356,7 +360,9 @@ class RoutingContext:
         service: Optional[str] = None,
         tier: Optional[str] = None,
         tier_policy: Optional[str] = None,
-        force_rebind: bool = False
+        force_rebind: bool = False,
+        region_strict: bool = False,
+        bind_persist: bool = False
     ):
         self.account_id = account_id
         self.region = region
@@ -365,6 +371,8 @@ class RoutingContext:
         self.tier = tier
         self.tier_policy = tier_policy
         self.force_rebind = force_rebind
+        self.region_strict = region_strict
+        self.bind_persist = bind_persist
 
     def __iter__(self):
         yield self.account_id
@@ -382,7 +390,7 @@ class RoutingContext:
 
 def parse_proxy_credentials(raw_user: str) -> ParsedCredentials:
     """
-    Parses parametric proxy username into (account_id, region, egress_type, service, tier, tier_policy, force_rebind).
+    Parses parametric proxy username into (account_id, region, egress_type, service, tier, tier_policy, ...).
     Supported formats:
     1. Plain account ID: 'bot_user_01'
     2. Double-underscore tags: 'bot_01__type_warp_ipv6__region_tokyo__tier_premium__service_grok2api__rebind_true'
@@ -400,6 +408,8 @@ def parse_proxy_credentials(raw_user: str) -> ParsedCredentials:
     tier = None
     tier_policy = None
     force_rebind = False
+    region_strict = False
+    bind_persist = False
 
     # Format 3: Query-string format
     if "?" in raw_user:
@@ -422,6 +432,10 @@ def parse_proxy_credentials(raw_user: str) -> ParsedCredentials:
                     tier_policy = v.lower()
                 elif k in ("rebind", "force_rebind", "rebalance"):
                     force_rebind = v.lower() in ("true", "1", "yes")
+                elif k in ("region_strict", "strict_region"):
+                    region_strict = v.lower() in ("true", "1", "yes")
+                elif k in ("bind_persist", "bind_persist_true"):
+                    bind_persist = v.lower() in ("true", "1", "yes")
 
     # Format 2: Double-underscore format (e.g. acc_001__type_warp_ipv6__region_tokyo__tier_premium__rebind_true)
     elif "__" in raw_user:
@@ -429,7 +443,14 @@ def parse_proxy_credentials(raw_user: str) -> ParsedCredentials:
         account_id = parts[0]
         for p in parts[1:]:
             p_lower = p.lower()
-            if p_lower.startswith("type_"):
+            # Flag tokens must be matched BEFORE the `region_` value prefix, otherwise
+            # `region_strict_true` is swallowed as region="strict_true".
+            if p_lower in ("region_strict_true", "strict_region_true", "region_strict",
+                           "strict_region", "region_strict=true", "strict_region=true"):
+                region_strict = True
+            elif p_lower in ("bind_persist_true", "bind_persist", "bind_persist=true"):
+                bind_persist = True
+            elif p_lower.startswith("type_"):
                 egress_type = p[5:]
             elif p_lower.startswith("egress_"):
                 egress_type = p[7:]
@@ -474,6 +495,10 @@ def parse_proxy_credentials(raw_user: str) -> ParsedCredentials:
                     tier_policy = v.lower()
                 elif k in ("rebind", "force_rebind"):
                     force_rebind = v.lower() in ("true", "1", "yes")
+                elif k in ("region_strict", "strict_region"):
+                    region_strict = v.lower() in ("true", "1", "yes")
+                elif k in ("bind_persist",):
+                    bind_persist = v.lower() in ("true", "1", "yes")
 
     # Sanitize and unquote account_id
     account_id = urllib.parse.unquote(account_id.strip()) if account_id else f"anon_{uuid.uuid4().hex[:8]}"
@@ -490,7 +515,9 @@ def parse_proxy_credentials(raw_user: str) -> ParsedCredentials:
         service=service,
         tier=tier,
         tier_policy=tier_policy,
-        force_rebind=force_rebind
+        force_rebind=force_rebind,
+        region_strict=region_strict,
+        bind_persist=bind_persist
     )
 
 
@@ -611,6 +638,8 @@ class ForwardProxyGateway:
         auth_tier = None
         auth_policy = None
         auth_force_rebind = False
+        auth_region_strict = False
+        auth_bind_persist = False
 
         if not account_id and "proxy-authorization" in headers_dict:
             auth_val = headers_dict["proxy-authorization"].strip()
@@ -626,6 +655,8 @@ class ForwardProxyGateway:
                     auth_tier = parsed.tier
                     auth_policy = parsed.tier_policy
                     auth_force_rebind = parsed.force_rebind
+                    auth_region_strict = parsed.region_strict
+                    auth_bind_persist = parsed.bind_persist
                 except Exception:
                     pass
 
@@ -648,6 +679,16 @@ class ForwardProxyGateway:
         if rebind_hdr:
             force_rebind = rebind_hdr.strip().lower() in ("true", "1", "yes")
 
+        strict_hdr = headers_dict.get("x-region-strict")
+        region_strict = auth_region_strict
+        if strict_hdr:
+            region_strict = strict_hdr.strip().lower() in ("true", "1", "yes")
+
+        persist_hdr = headers_dict.get("x-bind-persist")
+        bind_persist = auth_bind_persist
+        if persist_hdr:
+            bind_persist = persist_hdr.strip().lower() in ("true", "1", "yes")
+
         return RoutingContext(
             account_id=account_id,
             region=region,
@@ -655,7 +696,9 @@ class ForwardProxyGateway:
             service=service,
             tier=tier,
             tier_policy=tier_policy,
-            force_rebind=force_rebind
+            force_rebind=force_rebind,
+            region_strict=region_strict,
+            bind_persist=bind_persist
         )
 
     async def connect_upstream_adaptive(
@@ -747,6 +790,8 @@ class ForwardProxyGateway:
         tier: Optional[str] = None,
         tier_policy: Optional[str] = None,
         force_rebind: bool = False,
+        region_strict: bool = False,
+        bind_persist: bool = False,
     ):
         """
         Opens the upstream SOCKS5 tunnel for an account, bounded by `max_attempts` (R1).
@@ -780,6 +825,8 @@ class ForwardProxyGateway:
                 service=service,
                 force_rebind=force_rebind or (attempt > 0),
                 exclude_nodes=excluded,
+                region_strict=region_strict,
+                bind_persist=bind_persist,
             )
             if not lease:
                 # The pool itself cannot serve this request; retrying cannot help.
@@ -968,6 +1015,8 @@ class ForwardProxyGateway:
                         tier=route_ctx.tier,
                         tier_policy=route_ctx.tier_policy,
                         force_rebind=route_ctx.force_rebind,
+                        region_strict=route_ctx.region_strict,
+                        bind_persist=route_ctx.bind_persist,
                     )
                 except NoPoolNodesError as pool_err:
                     err_resp = f"HTTP/1.1 503 Service Unavailable\r\nX-TetherPool-Error: {ERR_POOL_EXHAUSTED}\r\nContent-Type: text/plain\r\n\r\n{pool_err}\r\n".encode()
@@ -1031,6 +1080,8 @@ class ForwardProxyGateway:
                         tier=route_ctx.tier,
                         tier_policy=route_ctx.tier_policy,
                         force_rebind=route_ctx.force_rebind,
+                        region_strict=route_ctx.region_strict,
+                        bind_persist=route_ctx.bind_persist,
                     )
                 except NoPoolNodesError as pool_err:
                     err_resp = f"HTTP/1.1 503 Service Unavailable\r\nX-TetherPool-Error: {ERR_POOL_EXHAUSTED}\r\nContent-Type: text/plain\r\n\r\n{pool_err}\r\n".encode()

@@ -133,7 +133,7 @@ class Prober:
         async def _worker(node: ProxyNode) -> ProbeResult:
             async with sem:
                 try:
-                    return await self.probe_node(node, force=force)
+                    return await self.probe_node(node, retries=1, force=force)
                 except Exception as exc:
                     return ProbeResult(
                         node_name=node.name,

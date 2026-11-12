@@ -167,6 +167,8 @@ TetherPool 控制面提供高可用、异步非阻塞的 RESTful API，默认监
   - `tier` (string, 可选): 质量分层 (`premium`, `standard`)
   - `tier_policy` (string, 可选): 分级策略 (`standard_first`, `premium_first`, `premium_only`, `standard_only`)
   - `force_rebind` (bool, 可选, 默认 `false`): 强制换绑新节点
+  - `region_strict` (bool, 可选, 默认 `false`): 区域硬约束 —— 候选集只在 `region` 内筛选，不跨区降级；无可用节点时返回 `503` + `X-TetherPool-Error: pool_exhausted`
+  - `bind_persist` (bool, 可选, 默认 `false`): 当换绑请求与现有绑定冲突时持久化新绑定（`constraint_rebind`）；不带此标志的冲突换绑保持临时性、不落库
   - `service` (string, 可选, 默认 `"default"`): 业务命名空间
 - **成功响应**：`200 OK`
   ```json
@@ -203,6 +205,8 @@ TetherPool 控制面提供高可用、异步非阻塞的 RESTful API，默认监
   - `tier` (string, 可选)
   - `tier_policy` (string, 可选)
   - `force_rebind` (bool, 可选)
+  - `region_strict` (bool, 可选, 默认 `false`): 区域硬约束，见 `/v1/acquire`
+  - `bind_persist` (bool, 可选, 默认 `false`): 冲突换绑持久化，见 `/v1/acquire`
 - **成功响应**：`200 OK`
   ```json
   {
