@@ -240,9 +240,15 @@ class Router:
             # 软排除降级 (目标级兜底): 绑定节点健康、只是被本请求的目标类健康集
             # 排除, 且候选被排除空 —— 宁可返回绑定节点 (该类流量可能失败, 但绝不
             # None/503; 绑定节点对其他目标类仍然可用, 探活恢复后自然无感)。
+            # 降级必须先过本调用的约束过滤: region/egress/tier 钉定是对凭据的
+            # 承诺, 宁可 503 也不跨区违约 (与 binding_conflict 路径同语义)。
             if steer_transient and alloc:
                 bound = self.storage.get_node(alloc["node_name"])
-                if bound and bound.status == HealthStatus.HEALTHY.value:
+                if (
+                    bound
+                    and bound.status == HealthStatus.HEALTHY.value
+                    and _node_matches_constraints(bound)
+                ):
                     return LeaseInfo(
                         account_id=account_id,
                         node_name=bound.name,

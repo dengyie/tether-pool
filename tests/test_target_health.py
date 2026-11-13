@@ -153,3 +153,26 @@ def test_without_transient_flag_persists_rebind(temp_router):
     # 既有语义保持: 无 exclude_transient 的排除重试走 R2 持久重绑
     alloc = storage.find_allocation_by_account("acc_legacy")
     assert alloc["node_name"] == lease.node_name
+
+
+def test_degrade_respects_call_constraints(temp_router):
+    """降级不得违约: region 钉定的调用, 即使候选被排除空, 也绝不跨区返回
+    绑定节点 —— 宁可 None/503 (与 binding_conflict 路径同语义)。"""
+    router, storage = temp_router
+    _bind(router, storage, "acc_pinned", "pigeonw-01")  # us-west 绑定
+    for n in ("warp-alt-01", "warp-alt-02"):
+        storage.update_node_status(n, HealthStatus.DEAD.value)
+
+    lease = router.acquire_for_account(
+        "acc_pinned",
+        region="tokyo",  # 调用钉定 tokyo; pigeonw 是 us-west
+        exclude_nodes={"pigeonw-01"},
+        exclude_transient=True,
+    )
+    assert lease is None, "跨区降级违约被拒绝"
+
+    # 对照: 无 region 钉定时同样的局面正常降级到绑定节点
+    lease2 = router.acquire_for_account(
+        "acc_pinned", exclude_nodes={"pigeonw-01"}, exclude_transient=True
+    )
+    assert lease2 is not None and lease2.node_name == "pigeonw-01"
