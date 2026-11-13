@@ -176,3 +176,82 @@ def test_degrade_respects_call_constraints(temp_router):
         "acc_pinned", exclude_nodes={"pigeonw-01"}, exclude_transient=True
     )
     assert lease2 is not None and lease2.node_name == "pigeonw-01"
+
+
+# ---------------------------------------------------------------------------
+# 4. 滑窗判定 (治振颤偏坏) — review P3 修复
+# ---------------------------------------------------------------------------
+
+def test_tracker_pure_oscillation_never_bad():
+    """f/o/f/o 50% 振颤: 连败路不触发, 满窗失败率 50% < 75% —— 不判坏。"""
+    t = TargetHealthTracker(bad_streak=2, bad_ttl_seconds=300)
+    for ok in (False, True, False, True):
+        t.record("n1", "google", ok)
+    assert not t.is_bad("n1", "google")
+
+
+def test_tracker_rate_path_catches_flaky_bad():
+    """f/f/o/f: 连败路失效 (尾对不是双双失败), 滑窗 75% 失败 -> 判坏。"""
+    t = TargetHealthTracker(bad_streak=2, bad_ttl_seconds=300)
+    for ok in (False, False, True, False):
+        t.record("n1", "google", ok)
+    assert t.is_bad("n1", "google"), "滑窗路应捕获振颤偏坏"
+
+
+def test_tracker_latest_success_always_recovers():
+    """恢复永远优先于惩罚: 满窗 3 败但最新一次成功 -> 不坏。"""
+    t = TargetHealthTracker(bad_streak=2, bad_ttl_seconds=300)
+    for ok in (False, False, False, True):
+        t.record("n1", "google", ok)
+    assert not t.is_bad("n1", "google")
+
+
+# ---------------------------------------------------------------------------
+# 5. review P3 修复: legacy lease 分支 steer 同语义 + steered 旗标
+# ---------------------------------------------------------------------------
+
+def test_exclude_transient_legacy_lease_steers_without_persist(temp_router):
+    router, storage = temp_router
+    # 仅 lease 镜像, 无 universal allocation -> 走 1b 分支
+    storage.set_lease("acc_legacy", "pigeonw-01")
+    assert storage.find_allocation_by_account("acc_legacy") is None
+
+    lease = router.acquire_for_account(
+        "acc_legacy", exclude_nodes={"pigeonw-01"}, exclude_transient=True
+    )
+    assert lease is not None
+    assert lease.node_name in ("warp-alt-01", "warp-alt-02")
+    assert lease.steered is True, "steer lease 必须带旗标供网关计量"
+    assert storage.get_lease("acc_legacy").node_name == "pigeonw-01", "lease 行不动"
+
+
+def test_steer_flag_on_universal_path(temp_router):
+    router, storage = temp_router
+    _bind(router, storage, "acc_flag", "pigeonw-01")
+    lease = router.acquire_for_account(
+        "acc_flag", exclude_nodes={"pigeonw-01"}, exclude_transient=True
+    )
+    assert lease.steered is True
+    # 非 steer 路径旗标保持 False (sticky / R2 重绑)
+    lease2 = router.acquire_for_account("acc_flag")
+    assert lease2.steered is False
+
+
+def test_gateway_counts_and_renders_steers():
+    """网关 steer 计量: /metrics 渲染 + relay summary 携带 (review P3 修复)。"""
+    import tempfile
+    from gateway.server import ForwardProxyGateway
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        storage = Storage(db_path=f.name)
+    try:
+        gateway = ForwardProxyGateway(storage, Router(storage), host="127.0.0.1", port=0)
+        gateway.target_steers["google"] = 3
+        gateway.target_steers["openai"] = 1
+        body = gateway.render_metrics().decode()
+        assert 'tetherpool_gateway_target_steers_total{class="google"} 3' in body
+        assert 'tetherpool_gateway_target_steers_total{class="openai"} 1' in body
+        summary = gateway.relay_summary()
+        assert summary["target_steers"] == {"google": 3, "openai": 1}
+    finally:
+        os.remove(f.name)

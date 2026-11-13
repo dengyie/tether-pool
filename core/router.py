@@ -140,6 +140,7 @@ class Router:
         # 1. Check existing lease if not forcing rebind
         alloc = self.storage.find_allocation_by_account(account_id, service=svc)
         steer_transient = False
+        steer_sticky_node: Optional[str] = None
         if not force_rebind:
             # 1a. Universal Allocation Engine bindings check first
             if alloc:
@@ -189,6 +190,7 @@ class Router:
                     # 目标类健康集排除 —— 记旗, 候选选择照常进行, 但最后不落库
                     # (见 step 5 前的拦截)。绑定原地保留。
                     steer_transient = True
+                    steer_sticky_node = node.name
 
             # 1b. Legacy lease table check — only for accounts that have NO universal
             # allocation at all. `batch_save_allocations` now maintains this mirror in the
@@ -206,6 +208,15 @@ class Router:
                     if _node_matches_constraints(node):
                         return existing
                     binding_conflict = True
+                elif (
+                    node
+                    and node.status == HealthStatus.HEALTHY.value
+                    and node.name in excluded
+                    and exclude_transient
+                ):
+                    # 软排除对 legacy 镜像账户同语义: 临时改道, lease 行不动。
+                    steer_transient = True
+                    steer_sticky_node = node.name
 
         # A forced rebind must actually change nodes; the deterministic CRC32 hash below
         # would otherwise re-select the current sticky node (the documented
@@ -242,8 +253,8 @@ class Router:
             # None/503; 绑定节点对其他目标类仍然可用, 探活恢复后自然无感)。
             # 降级必须先过本调用的约束过滤: region/egress/tier 钉定是对凭据的
             # 承诺, 宁可 503 也不跨区违约 (与 binding_conflict 路径同语义)。
-            if steer_transient and alloc:
-                bound = self.storage.get_node(alloc["node_name"])
+            if steer_transient and steer_sticky_node:
+                bound = self.storage.get_node(steer_sticky_node)
                 if (
                     bound
                     and bound.status == HealthStatus.HEALTHY.value
@@ -256,7 +267,8 @@ class Router:
                         exit_ip=bound.exit_ip,
                         region=bound.region,
                         egress_type=bound.egress_type,
-                        assigned_at=alloc["allocated_at"],
+                        # legacy 镜像路径下 alloc 为 None, 直接取当前时间
+                        assigned_at=(alloc or {}).get("allocated_at") or datetime.now().isoformat(),
                         tier=bound.tier
                     )
             return None
@@ -306,6 +318,7 @@ class Router:
         # 不写 set_lease / account_allocations —— 绑定原地保留, 上游恢复后
         # 下一请求自动回到原绑定节点。
         if steer_transient:
+            ephemeral_lease.steered = True
             return ephemeral_lease
 
         # 5. Persist lease and synchronize with account_allocations (constraint set rides

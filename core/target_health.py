@@ -52,36 +52,56 @@ def classify_target(target_host: str) -> Optional[str]:
 
 class TargetHealthTracker:
     """
-    In-memory per-(node, target-class) health with hysteresis:
+    In-memory per-(node, target-class) health with hysteresis (滑窗 + 连败双路):
 
-    - 判坏需要连续 ``bad_streak`` 次探活失败 (防单次网络抖动造成假阳性排除)
-    - 一次成功立即清除 (快速恢复)
+    - 连败路: 最近 ``bad_streak`` 次全失败 -> 立即判坏 (稳态故障快速保护)
+    - 滑窗路: 满窗 (4 次) 内失败 >=3 (75%) 且最新一次失败 -> 判坏 —— 治理
+      f/o/f/f 这类振颤偏坏节点 (纯 f/o/f/o 50% 振颤仍不判坏, 防假阳性)
+    - 最新一次成功 -> 立即不坏 (快速恢复, 恢复永远优先于惩罚)
     - bad 记录带 TTL: 探活循环若崩溃, 排除不至于永久化
     """
+
+    WINDOW = 4
+    RATE_BAD_FAILS = 3
 
     def __init__(self, bad_streak: int = 2, bad_ttl_seconds: float = 300.0):
         self.bad_streak = max(1, bad_streak)
         self.bad_ttl_seconds = bad_ttl_seconds
-        # (node, class) -> (streak, last_ok: bool, last_ts, last_error)
-        self._state: Dict[Tuple[str, str], Tuple[int, bool, float, str]] = {}
+        # (node, class) -> {"window": deque(maxlen=4), "ts": float, "err": str}
+        self._state: Dict[Tuple[str, str], Dict] = {}
 
     def record(self, node_name: str, cls: str, ok: bool, error: str = "", now: Optional[float] = None) -> None:
         now = time.time() if now is None else now
-        streak, _ok, _ts, _err = self._state.get((node_name, cls), (0, True, 0.0, ""))
-        if ok:
-            self._state.pop((node_name, cls), None)
-        else:
-            self._state[(node_name, cls)] = (streak + 1, False, now, error)
+        entry = self._state.get((node_name, cls))
+        if entry is None:
+            from collections import deque
+            entry = {"window": deque(maxlen=self.WINDOW), "ts": now, "err": ""}
+            self._state[(node_name, cls)] = entry
+        entry["window"].append(bool(ok))
+        entry["ts"] = now
+        entry["err"] = "" if ok else (error or "probe failed")
+
+    def _entry_bad(self, entry: Dict, now: float) -> bool:
+        if now - entry["ts"] > self.bad_ttl_seconds:
+            return False
+        window = list(entry["window"])
+        if not window or window[-1]:
+            return False  # 最新一次成功 -> 立即恢复
+        if len(window) >= self.bad_streak and all(not r for r in window[-self.bad_streak:]):
+            return True  # 连败路
+        if (
+            len(window) == self.WINDOW
+            and sum(1 for r in window if not r) >= self.RATE_BAD_FAILS
+        ):
+            return True  # 滑窗路 (振颤偏坏)
+        return False
 
     def is_bad(self, node_name: str, cls: str, now: Optional[float] = None) -> bool:
         entry = self._state.get((node_name, cls))
         if not entry:
             return False
-        streak, _ok, ts, _err = entry
         now = time.time() if now is None else now
-        if now - ts > self.bad_ttl_seconds:
-            return False
-        return streak >= self.bad_streak
+        return self._entry_bad(entry, now)
 
     def bad_nodes(self, cls: str, now: Optional[float] = None) -> Set[str]:
         if not cls:
@@ -100,4 +120,4 @@ class TargetHealthTracker:
 
     def error_of(self, node_name: str, cls: str) -> str:
         entry = self._state.get((node_name, cls))
-        return entry[3] if entry else ""
+        return entry["err"] if entry else ""

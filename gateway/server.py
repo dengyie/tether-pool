@@ -581,6 +581,9 @@ class ForwardProxyGateway:
         )
         self._target_probe_task = None
         self._target_last_bad: Dict[str, int] = {}
+        # steer 计量 (按目标类累计): 兜底实际改道了多少请求, /metrics 与 relay
+        # summary 都能看到 —— "探活绿但业务死"期间的救流量直接可查。
+        self.target_steers: Dict[str, int] = {}
 
     # Cap on distinct labels per relay map; extra keys collapse into "other".
     RELAY_LABEL_CAP = 2000
@@ -626,6 +629,7 @@ class ForwardProxyGateway:
             "top_accounts": top_accounts,
             "top_nodes": top_nodes,
             "target_bad": self.target_health.bad_counts(),
+            "target_steers": dict(self.target_steers),
         }
 
     def render_metrics(self) -> bytes:
@@ -639,6 +643,10 @@ class ForwardProxyGateway:
         lines.append("# TYPE tetherpool_gateway_relay_by_node_total counter")
         for node, count in sorted(self.relay_nodes.items()):
             lines.append('tetherpool_gateway_relay_by_node_total{node="%s"} %d' % (node, count))
+        lines.append("# HELP tetherpool_gateway_target_steers_total Requests steered away from target-class-bad exits (cumulative).")
+        lines.append("# TYPE tetherpool_gateway_target_steers_total counter")
+        for cls, count in sorted(self.target_steers.items()):
+            lines.append('tetherpool_gateway_target_steers_total{class="%s"} %d' % (cls, count))
         return ("\n".join(lines) + "\n").encode()
 
     def _extract_routing_headers(self, headers_dict: Dict[str, str], client_ip: str) -> RoutingContext:
@@ -873,6 +881,8 @@ class ForwardProxyGateway:
                     region_strict=region_strict,
                     bind_persist=bind_persist,
                 )
+            if lease and attempt == 0 and target_cls and lease.steered:
+                self.target_steers[target_cls] = self.target_steers.get(target_cls, 0) + 1
             if not lease:
                 # The pool itself cannot serve this request; retrying cannot help.
                 self._record_attempts(max(attempts, 1))
@@ -1212,11 +1222,12 @@ class ForwardProxyGateway:
                 if summary["relays"]:
                     logger.info(
                         "relay summary %ss: relays=%d total=%d accounts=%d nodes=%d "
-                        "top_accounts=%s top_nodes=%s target_bad=%s",
+                        "top_accounts=%s top_nodes=%s target_bad=%s target_steers=%s",
                         int(self.relay_report_interval), summary["relays"],
                         summary["total"], summary["accounts"], summary["nodes"],
                         summary["top_accounts"], summary["top_nodes"],
                         summary.get("target_bad") or {},
+                        summary.get("target_steers") or {},
                     )
             except asyncio.CancelledError:
                 raise

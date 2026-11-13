@@ -110,6 +110,9 @@ class LeaseInfo(BaseModel):
     rebind_count: int = 0
     last_rebind_reason: str = ""
     binding_epoch: int = 0
+    # 目标级兜底旗标 (2026-11-14): 绑定节点被目标类健康集软排除, 本 lease 是
+    # 改道候选节点的临时结果 —— 绑定未动, 网关据此计量 steer 事件。
+    steered: bool = False
 
 
 class BindingEpochInfo(BaseModel):
