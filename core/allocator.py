@@ -19,7 +19,7 @@ from core.models import (
 )
 from core.storage import Storage
 from core.locks import BINDING_WRITE_LOCK
-from core.router import node_isp, _build_ban_excluded_networks, _ip_in_excluded_nets
+from core.ban import node_isp, ip_in_excluded_nets, collect_ban_exclusions
 
 
 class ConsistentHashRing:
@@ -67,11 +67,18 @@ class AllocationEngine:
         egress_preference: Optional[str] = None,
         region: Optional[str] = None,
         tier: Optional[str] = None,
-        tier_policy: Optional[str] = None
+        tier_policy: Optional[str] = None,
+        region_strict: bool = False
     ) -> List[ProxyNode]:
         """
         Retrieves healthy eligible proxy nodes.
         Prioritizes specified egress type, region, and tier policy, with graceful fallback ladders.
+
+        region_strict=True hardens the region filter (same semantics as Router's
+        `_get_candidates_for_tier_policy`): the final cross-region fallback rung is
+        discarded, so an exhausted region yields an empty candidate set (caller
+        answers 503) instead of a silent foreign-region node. 需求 §4.2: region
+        是对凭据的硬承诺, 宁可 503 也不跨区违约。
         """
         policy = tier_policy.lower() if tier_policy else (TierPolicy.PREMIUM_FIRST.value if tier == Tier.PREMIUM.value else TierPolicy.STANDARD_FIRST.value)
 
@@ -120,6 +127,11 @@ class AllocationEngine:
             nodes = [n for n in self.storage.list_nodes(region=region, egress_type=egress_preference) if n.status != HealthStatus.DEAD.value]
             if not nodes:
                 nodes = [n for n in self.storage.list_nodes() if n.status != HealthStatus.DEAD.value]
+
+        # region_strict: 丢弃第三级跨区兜底带来的外区节点 (region 是硬承诺,
+        # 候选剔空 -> 调用方 503, 与 Router region_strict 同语义)。
+        if region_strict and region:
+            nodes = [n for n in nodes if n.region == region]
 
         # Ensure no DEAD node ever passes through
         nodes = [n for n in nodes if n.status != HealthStatus.DEAD.value]
@@ -375,7 +387,8 @@ class AllocationEngine:
         # opt-in 硬过滤, 候选耗尽 -> RuntimeError (调用方 503)。
         avoid_banned: bool = False,
         avoid_cidrs: Optional[List[str]] = None,
-        avoid_same_isp: bool = False
+        avoid_same_isp: bool = False,
+        region_strict: bool = False
     ) -> AccountAllocationItem:
         """
         On-demand acquisition for a single account.
@@ -384,7 +397,8 @@ class AllocationEngine:
         with BINDING_WRITE_LOCK:
             return self._acquire_single(
                 service, account_id, egress_preference, region, tier, tier_policy, force_rebalance, gateway_base,
-                avoid_banned=avoid_banned, avoid_cidrs=avoid_cidrs, avoid_same_isp=avoid_same_isp
+                avoid_banned=avoid_banned, avoid_cidrs=avoid_cidrs, avoid_same_isp=avoid_same_isp,
+                region_strict=region_strict
             )
 
     def _acquire_single(
@@ -399,24 +413,22 @@ class AllocationEngine:
         gateway_base: str = "http://127.0.0.1:9101",
         avoid_banned: bool = False,
         avoid_cidrs: Optional[List[str]] = None,
-        avoid_same_isp: bool = False
+        avoid_same_isp: bool = False,
+        region_strict: bool = False
     ) -> AccountAllocationItem:
-        # quarantine 集合组装: 节点名让 fast path 视为 mismatch, /24 与 isp 集在候选过滤生效
-        ban_node_names: set = set()
-        ban_excluded_nets = []
-        ban_excluded_isps: set = set()
-        if avoid_banned or avoid_cidrs or avoid_same_isp:
-            quarantines = self.storage.get_active_quarantines(service=service) if avoid_banned else []
-            ban_node_names = {q.node_name for q in quarantines}
-            for q in quarantines:
-                if q.isp:
-                    ban_excluded_isps.add(q.isp)
-            ban_excluded_nets = _build_ban_excluded_networks(quarantines, avoid_cidrs)
+        # quarantine 集合组装: 节点名让 fast path 视为 mismatch, /24 与 isp 集在
+        # 候选过滤生效。与 Router 共用 core/ban.collect_ban_exclusions (单一事实源)。
+        ban_node_names, ban_excluded_nets, ban_excluded_isps = collect_ban_exclusions(
+            self.storage, service,
+            avoid_banned=avoid_banned,
+            avoid_cidrs=avoid_cidrs,
+            avoid_same_isp=avoid_same_isp,
+        )
 
         def _ban_node_ok(n: ProxyNode) -> bool:
             if n.name in ban_node_names:
                 return False
-            if _ip_in_excluded_nets(n.exit_ip, ban_excluded_nets):
+            if ip_in_excluded_nets(n.exit_ip, ban_excluded_nets):
                 return False
             if avoid_same_isp and ban_excluded_isps:
                 isp = node_isp(n)
@@ -468,7 +480,8 @@ class AllocationEngine:
             egress_preference=egress_preference,
             region=region,
             tier=tier,
-            tier_policy=tier_policy
+            tier_policy=tier_policy,
+            region_strict=region_strict
         )
         # 封禁感知硬过滤 (需求 §5.2/§5.3): 被封节点名、同 /24、同 ISP 剔除。
         if ban_node_names or ban_excluded_nets or (avoid_same_isp and ban_excluded_isps):

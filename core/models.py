@@ -3,7 +3,7 @@ core/models.py - Domain models for IP Pool System
 """
 
 from enum import Enum
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Union
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -232,7 +232,8 @@ class BanRecord(BaseModel):
     exit_ip: Optional[str] = None
     isp: Optional[str] = None
     reason: str
-    evidence: str = "{}"
+    # 出参为反序列化后的对象 (落库为 json 字符串); 历史坏行兜底原样字符串
+    evidence: Union[Dict[str, object], str] = Field(default_factory=dict)
     quarantined_until: Optional[str] = None
     released_at: Optional[str] = None
     created_at: str

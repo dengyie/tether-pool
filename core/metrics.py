@@ -109,6 +109,10 @@ class MetricsCollector:
                 "# HELP ip_pool_ban_events_total Ban reports received per service and reason (ban-aware allocation)",
                 "# TYPE ip_pool_ban_events_total counter",
             ),
+            "ip_pool_quarantine_gauge_errors_total": (
+                "# HELP ip_pool_quarantine_gauge_errors_total Failed scrape-time reads of active quarantines (quarantine gauge unavailable, review F7)",
+                "# TYPE ip_pool_quarantine_gauge_errors_total counter",
+            ),
         }
         for name, (help_line, type_line) in counters.items():
             emitted = False
@@ -159,18 +163,25 @@ class MetricsCollector:
 
         # Gauge: active quarantines per service (ban-aware allocation, 2026-11-14)。
         # scrape 时从 ban_events 表现算, 不进 runtime_metrics (实时性优先, 量级个位数)。
+        # 按节点去重: 同节点多 reason 产生多行, gauge 语义是"被隔离的节点数"(review F7)。
         try:
             active_quarantines = self.storage.get_active_quarantines()
         except Exception:
+            # 隔离系统自身故障必须可见, 静默归零会掩盖问题 (review F7):
+            # 计数器尽力上报, 失败也不许炸掉整个 /metrics。
+            try:
+                self.storage.incr_metric("ip_pool_quarantine_gauge_errors_total")
+            except Exception:
+                pass
             active_quarantines = []
         if active_quarantines:
-            per_service: Dict[str, int] = {}
+            per_service: Dict[str, set] = {}
             for q in active_quarantines:
-                per_service[q.service] = per_service.get(q.service, 0) + 1
+                per_service.setdefault(q.service, set()).add(q.node_name)
             lines.append("# HELP ip_pool_quarantine_active Currently quarantined (banned) nodes per service")
             lines.append("# TYPE ip_pool_quarantine_active gauge")
             for svc in sorted(per_service):
-                lines.append(f'ip_pool_quarantine_active{{service="{svc}"}} {per_service[svc]}')
+                lines.append(f'ip_pool_quarantine_active{{service="{svc}"}} {len(per_service[svc])}')
             lines.append("")
 
         return lines

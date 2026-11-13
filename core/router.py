@@ -3,7 +3,6 @@ core/router.py - Routing and proxy assignment engine with Circuit-Aware Lease Re
 Anti-Sybil Cooldown for Registration Bots, and Relay Bridge Resolution
 """
 
-import ipaddress
 import os
 import zlib
 from typing import Optional, List, Dict, Any, Tuple
@@ -12,55 +11,14 @@ from core.models import (
     ProxyNode, LeaseInfo, EgressType, HealthStatus, Tier, TierPolicy,
     RegistrationLease, BatteryEventReport, BatteryEventType, RelayMode
 )
+from core.ban import (
+    node_isp,
+    build_ban_excluded_networks,
+    ip_in_excluded_nets,
+    collect_ban_exclusions,
+)
 from core.storage import Storage
 from core.locks import BINDING_WRITE_LOCK
-
-
-def node_isp(node: ProxyNode) -> str:
-    """ISP 元数据走 tags 约定 (需求 §5.3): 节点 tags 中 isp=<name> (小写)。
-    无该 tag 的节点不参与 avoid_same_isp 判定、也不因此被排除。"""
-    for tag in (node.tags or []):
-        if tag.lower().startswith("isp="):
-            return tag.split("=", 1)[1].strip().lower()
-    return ""
-
-
-def _ipv4_slash24(exit_ip: Optional[str]) -> Optional[str]:
-    """家宽 /24 归并键 (需求 §5.2: 同段≈同线路, 误判成本高)。非 IPv4 返回 None。"""
-    if not exit_ip:
-        return None
-    try:
-        addr = ipaddress.ip_address(exit_ip)
-    except ValueError:
-        return None
-    return f"{addr}/24" if addr.version == 4 else None
-
-
-def _build_ban_excluded_networks(quarantines, avoid_cidrs: Optional[List[str]]) -> List[Any]:
-    """被封 exit_ip 的 /24 + 显式 avoid_cidr 网段 (非法 CIDR 跳过, 不炸请求)。"""
-    nets: List[Any] = []
-    for q in quarantines:
-        try:
-            if q.exit_ip:
-                nets.append(ipaddress.ip_network(f"{q.exit_ip}/24", strict=False))
-        except ValueError:
-            continue
-    for cidr in avoid_cidrs or []:
-        try:
-            nets.append(ipaddress.ip_network(cidr, strict=False))
-        except ValueError:
-            continue
-    return nets
-
-
-def _ip_in_excluded_nets(exit_ip: Optional[str], nets: List[Any]) -> bool:
-    if not exit_ip or not nets:
-        return False
-    try:
-        addr = ipaddress.ip_address(exit_ip)
-    except ValueError:
-        return False
-    return any(addr in net for net in nets)
 
 
 class Router:
@@ -194,18 +152,13 @@ class Router:
         # 用户拍板 2026-11-14: 不做全局自动排除)。节点名放独立集合 (不并入
         # excluded —— 网关 R1 累积重试依赖 excluded 触发持久重绑, ban 过滤是
         # per-call 临时性, 两者语义必须分开); /24 与 isp 集在候选过滤阶段生效。
-        ban_excluded_names: set = set()
-        ban_excluded_nets: List[Any] = []
-        ban_excluded_isps: set = set()
-        if avoid_banned:
-            quarantines = self.storage.get_active_quarantines(service=svc)
-            ban_excluded_names = {q.node_name for q in quarantines}
-            for q in quarantines:
-                if q.isp:
-                    ban_excluded_isps.add(q.isp)
-            ban_excluded_nets = _build_ban_excluded_networks(quarantines, avoid_cidrs)
-        elif avoid_cidrs:
-            ban_excluded_nets = _build_ban_excluded_networks([], avoid_cidrs)
+        # 组装逻辑与 Allocator 共用 core/ban.collect_ban_exclusions (单一事实源)。
+        ban_excluded_names, ban_excluded_nets, ban_excluded_isps = collect_ban_exclusions(
+            self.storage, svc,
+            avoid_banned=avoid_banned,
+            avoid_cidrs=avoid_cidrs,
+            avoid_same_isp=avoid_same_isp,
+        )
 
         # Determine effective tier policy
         # Default is standard_first (protects self-hosted/premium IPs).
@@ -370,7 +323,7 @@ class Router:
             def _ban_filtered(c: ProxyNode) -> bool:
                 if c.name in ban_excluded_names:
                     return False
-                if _ip_in_excluded_nets(c.exit_ip, ban_excluded_nets):
+                if ip_in_excluded_nets(c.exit_ip, ban_excluded_nets):
                     return False
                 if avoid_same_isp and ban_excluded_isps:
                     isp = node_isp(c)

@@ -22,7 +22,8 @@ from core.models import (
 )
 from core.storage import Storage
 from core.prober import Prober
-from core.router import Router, node_isp
+from core.router import Router
+from core.ban import node_isp
 from core.metrics import MetricsCollector
 from core.allocator import AllocationEngine
 from core.quality import IPQualityEvaluator
@@ -746,7 +747,12 @@ QUARANTINE_FLOOD_RATIO = 0.30  # 单 service 每日 quarantine > 池健康节点
 
 
 def _resolve_ban_node(report: BanReportRequest) -> ProxyNode:
-    """node_id 缺省时按 service+account 找当前绑定节点 (allocation -> lease)。"""
+    """node_id 缺省时按 service+account 找当前绑定节点 (allocation -> legacy lease)。
+
+    lease 兜底与 Router 1b 同守卫 (2026-11-14 review F2 根因修复): 该 account
+    在全库存在任意 allocation 镜像时, lease 行的 service 归属不明 (leases 表无
+    service 维度), 不得猜测后塞进本 service 的 quarantine —— 跨 service 泄漏
+    比解析失败更糟。仅纯 legacy 账户 (无任何 allocation) 才信 lease。"""
     if report.node_id:
         node = storage.get_node(report.node_id)
         if not node:
@@ -757,11 +763,12 @@ def _resolve_ban_node(report: BanReportRequest) -> ProxyNode:
         node = storage.get_node(alloc["node_name"])
         if node:
             return node
-    lease = storage.get_lease(report.account)
-    if lease:
-        node = storage.get_node(lease.node_name)
-        if node:
-            return node
+    if storage.find_allocation_by_account(report.account) is None:
+        lease = storage.get_lease(report.account)
+        if lease:
+            node = storage.get_node(lease.node_name)
+            if node:
+                return node
     raise HTTPException(status_code=400, detail="No node_id given and no binding found for service+account")
 
 
@@ -773,7 +780,10 @@ def report_ban(report: BanReportRequest):
     判封门 (§5.1): unusual_activity_3012 且 evidence.body_kind != html -> 只记录不隔离。
     限流 (§8): 单 service 每小时 <= 30 次, 超出 429。
     """
-    now_iso = datetime.now().isoformat()
+    # scope 契约诚实 (review F8): P0 只实现 service 维度, 其他值显式拒绝而非静默
+    # 当 service 处理 —— 消费方传 scope=global 期待全局隔离时必须得到明确失败。
+    if report.scope and report.scope != "service":
+        raise HTTPException(status_code=422, detail=f"scope '{report.scope}' is not implemented; this build only supports scope=service")
     # 限流: 计数含只记录的上报 (消费方 bug 打穿控制面同样要挡)
     if storage.count_bans_since(report.service, (datetime.now() - timedelta(hours=1)).isoformat()) >= BAN_RATE_LIMIT_PER_HOUR:
         raise HTTPException(status_code=429, detail=f"ban report rate limit exceeded ({BAN_RATE_LIMIT_PER_HOUR}/hour for service {report.service})")
@@ -850,6 +860,7 @@ def acquire_account_allocation(
     account_id: str = Query(..., description="Unique account ID or email"),
     egress_preference: Optional[str] = Query("warp_ipv6", description="Preferred egress type"),
     region: Optional[str] = Query(None, description="Optional region preference"),
+    region_strict: bool = Query(False, description="Treat region as a hard constraint: never relax it to another region (empty candidate set / 503 instead). 需求 §4.2 硬边界"),
     tier: Optional[str] = Query(None, description="Optional tier filter: premium or standard"),
     tier_policy: Optional[str] = Query(None, description="Optional tier policy: standard_first, premium_first, premium_only, standard_only"),
     force_rebalance: bool = Query(False, description="Force reallocating to a different node"),
@@ -861,6 +872,8 @@ def acquire_account_allocation(
     On-demand allocation for a single account with load-aware capacity distribution.
     Ban-aware (2026-11-14): avoid_banned/avoid_cidr/avoid_same_isp are opt-in hard
     filters — exhausted candidates answer 503, constraints are never relaxed.
+    region_strict=true stops the ladder from relaxing `region` to another region
+    (same semantics as POST /v1/acquire; an exhausted region answers 503).
     """
     try:
         result = allocator.acquire_single(
@@ -873,14 +886,18 @@ def acquire_account_allocation(
             force_rebalance=force_rebalance,
             avoid_banned=avoid_banned,
             avoid_cidrs=[c.strip() for c in avoid_cidr.split(",") if c.strip()] if avoid_cidr else None,
-            avoid_same_isp=avoid_same_isp
+            avoid_same_isp=avoid_same_isp,
+            region_strict=region_strict
         )
         # 防汛告警 (需求 §5.5): 该 service 的 active quarantine 打穿健康池 30% 时
         # 响应加 warning (语义照常返回, 告警走 metrics + 此字段)。
-        quarantined_count = len(storage.get_active_quarantines(service=service))
-        healthy_count = storage.get_stats().healthy_nodes
-        if healthy_count and quarantined_count > healthy_count * QUARANTINE_FLOOD_RATIO:
-            result.warning = "quarantine_flood"
+        # 仅 ban-aware 调用才付这两条查询的成本 (review F4) —— 无 avoid 参数的
+        # 热路径不查。计数按节点去重 (同节点多 reason 的多行只算一个节点, review F7)。
+        if avoid_banned or avoid_same_isp or avoid_cidr:
+            quarantined_count = len({q.node_name for q in storage.get_active_quarantines(service=service)})
+            healthy_count = storage.get_stats().healthy_nodes
+            if healthy_count and quarantined_count > healthy_count * QUARANTINE_FLOOD_RATIO:
+                result.warning = "quarantine_flood"
         return result
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
@@ -912,7 +929,10 @@ def get_account_allocation_status(
     if alloc and alloc.get("node_name"):
         node = storage.get_node(alloc["node_name"])
         bound_at = alloc.get("allocated_at")
-    if node is None:
+    if node is None and storage.find_allocation_by_account(account) is None:
+        # lease 兜底与 _resolve_ban_node 同守卫 (review F2): 该 account 在别的
+        # service 有 allocation 时, lease 的 service 归属不明, 宁可 node_id=None
+        # 也不跨 service 泄漏绑定。
         lease = storage.get_lease(account)
         if lease:
             node = storage.get_node(lease.node_name)

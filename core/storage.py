@@ -783,6 +783,15 @@ class Storage:
     # --- Ban Quarantine (ban-aware allocation, 2026-11-14 需求单) ---
 
     def _ban_row_to_record(self, r: sqlite3.Row) -> BanRecord:
+        # evidence 落库时是 json.dumps 的字符串, 出参反序列化回对象 —— 消费方
+        # 不必二次 parse (2026-11-14 review F8)。历史坏行兜底原样字符串。
+        raw_evidence = r["evidence"] or "{}"
+        try:
+            evidence: object = json.loads(raw_evidence)
+            if not isinstance(evidence, dict):
+                evidence = raw_evidence
+        except (ValueError, TypeError):
+            evidence = raw_evidence
         return BanRecord(
             id=r["id"],
             ban_id=r["ban_id"],
@@ -792,7 +801,7 @@ class Storage:
             exit_ip=r["exit_ip"],
             isp=r["isp"],
             reason=r["reason"],
-            evidence=r["evidence"] or "{}",
+            evidence=evidence,
             quarantined_until=r["quarantined_until"],
             released_at=r["released_at"],
             created_at=r["created_at"],
@@ -820,6 +829,10 @@ class Storage:
         now_str = now.isoformat()
         until_str = (now + timedelta(hours=quarantine_hours)).isoformat() if quarantine_hours > 0 else None
         with self._get_conn() as conn:
+            # BEGIN IMMEDIATE 提前拿写锁: 幂等 SELECT 与 INSERT 必须在同一写事务里,
+            # 否则两线程可在 SELECT(空)->INSERT 间隙各插一行, 产生双 active 行
+            # (ban_id 分叉、gauge 虚高)。busy_timeout 兜住等待方。
+            conn.execute("BEGIN IMMEDIATE")
             if quarantine_hours > 0:
                 row = conn.execute("""
                     SELECT * FROM ban_events
