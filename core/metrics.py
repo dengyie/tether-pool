@@ -2,7 +2,7 @@
 core/metrics.py - Cloud-native Prometheus / OpenMetrics generator for IP Pool
 """
 
-from typing import List
+from typing import List, Dict
 from core.storage import Storage
 
 
@@ -105,6 +105,10 @@ class MetricsCollector:
                 "# HELP ip_pool_domain_trip_total Whole failure-domain isolation trips",
                 "# TYPE ip_pool_domain_trip_total counter",
             ),
+            "ip_pool_ban_events_total": (
+                "# HELP ip_pool_ban_events_total Ban reports received per service and reason (ban-aware allocation)",
+                "# TYPE ip_pool_ban_events_total counter",
+            ),
         }
         for name, (help_line, type_line) in counters.items():
             emitted = False
@@ -151,6 +155,22 @@ class MetricsCollector:
             for item in gauge_items:
                 labels = ",".join(f'{k}="{v}"' for k, v in sorted(item["labels"].items()))
                 lines.append(f'{gauge_name}{{{labels}}} {item["value"]:.3f}')
+            lines.append("")
+
+        # Gauge: active quarantines per service (ban-aware allocation, 2026-11-14)。
+        # scrape 时从 ban_events 表现算, 不进 runtime_metrics (实时性优先, 量级个位数)。
+        try:
+            active_quarantines = self.storage.get_active_quarantines()
+        except Exception:
+            active_quarantines = []
+        if active_quarantines:
+            per_service: Dict[str, int] = {}
+            for q in active_quarantines:
+                per_service[q.service] = per_service.get(q.service, 0) + 1
+            lines.append("# HELP ip_pool_quarantine_active Currently quarantined (banned) nodes per service")
+            lines.append("# TYPE ip_pool_quarantine_active gauge")
+            for svc in sorted(per_service):
+                lines.append(f'ip_pool_quarantine_active{{service="{svc}"}} {per_service[svc]}')
             lines.append("")
 
         return lines

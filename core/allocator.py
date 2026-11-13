@@ -19,6 +19,7 @@ from core.models import (
 )
 from core.storage import Storage
 from core.locks import BINDING_WRITE_LOCK
+from core.router import node_isp, _build_ban_excluded_networks, _ip_in_excluded_nets
 
 
 class ConsistentHashRing:
@@ -369,7 +370,12 @@ class AllocationEngine:
         tier: Optional[str] = None,
         tier_policy: Optional[str] = None,
         force_rebalance: bool = False,
-        gateway_base: str = "http://127.0.0.1:9101"
+        gateway_base: str = "http://127.0.0.1:9101",
+        # 封禁感知分配 (ban-aware allocation 2026-11-14): 与 Router 同语义,
+        # opt-in 硬过滤, 候选耗尽 -> RuntimeError (调用方 503)。
+        avoid_banned: bool = False,
+        avoid_cidrs: Optional[List[str]] = None,
+        avoid_same_isp: bool = False
     ) -> AccountAllocationItem:
         """
         On-demand acquisition for a single account.
@@ -377,7 +383,8 @@ class AllocationEngine:
         """
         with BINDING_WRITE_LOCK:
             return self._acquire_single(
-                service, account_id, egress_preference, region, tier, tier_policy, force_rebalance, gateway_base
+                service, account_id, egress_preference, region, tier, tier_policy, force_rebalance, gateway_base,
+                avoid_banned=avoid_banned, avoid_cidrs=avoid_cidrs, avoid_same_isp=avoid_same_isp
             )
 
     def _acquire_single(
@@ -389,13 +396,47 @@ class AllocationEngine:
         tier: Optional[str] = None,
         tier_policy: Optional[str] = None,
         force_rebalance: bool = False,
-        gateway_base: str = "http://127.0.0.1:9101"
+        gateway_base: str = "http://127.0.0.1:9101",
+        avoid_banned: bool = False,
+        avoid_cidrs: Optional[List[str]] = None,
+        avoid_same_isp: bool = False
     ) -> AccountAllocationItem:
+        # quarantine 集合组装: 节点名让 fast path 视为 mismatch, /24 与 isp 集在候选过滤生效
+        ban_node_names: set = set()
+        ban_excluded_nets = []
+        ban_excluded_isps: set = set()
+        if avoid_banned or avoid_cidrs or avoid_same_isp:
+            quarantines = self.storage.get_active_quarantines(service=service) if avoid_banned else []
+            ban_node_names = {q.node_name for q in quarantines}
+            for q in quarantines:
+                if q.isp:
+                    ban_excluded_isps.add(q.isp)
+            ban_excluded_nets = _build_ban_excluded_networks(quarantines, avoid_cidrs)
+
+        def _ban_node_ok(n: ProxyNode) -> bool:
+            if n.name in ban_node_names:
+                return False
+            if _ip_in_excluded_nets(n.exit_ip, ban_excluded_nets):
+                return False
+            if avoid_same_isp and ban_excluded_isps:
+                isp = node_isp(n)
+                if isp and isp in ban_excluded_isps:
+                    return False
+            return True
+
+        # fast path 是否仅因封禁排除被跳过: 是 -> 本次改道是 per-call 过滤结果,
+        # 与 Router binding_conflict 同语义, 不得落库迁移绑定 (opt-in 语义)。
+        ban_skipped_existing = False
+
         if not force_rebalance:
             existing = self.storage.get_allocation(service, account_id)
             if existing:
                 node = self.storage.get_node(existing["node_name"])
-                if node and node.status == HealthStatus.HEALTHY.value:
+                if node and node.status == HealthStatus.HEALTHY.value and not _ban_node_ok(node):
+                    # 绑定节点健康但被本次 ban 过滤拒绝: 记旗, 候选选择照常,
+                    # 结果临时返回、绑定原地保留 (与 Router._acquire_for_account 对齐)。
+                    ban_skipped_existing = True
+                elif node and node.status == HealthStatus.HEALTHY.value and _ban_node_ok(node):
                     matches = True
                     if egress_preference and node.egress_type != egress_preference:
                         matches = False
@@ -429,6 +470,9 @@ class AllocationEngine:
             tier=tier,
             tier_policy=tier_policy
         )
+        # 封禁感知硬过滤 (需求 §5.2/§5.3): 被封节点名、同 /24、同 ISP 剔除。
+        if ban_node_names or ban_excluded_nets or (avoid_same_isp and ban_excluded_isps):
+            nodes = [n for n in nodes if _ban_node_ok(n)]
         if not nodes:
             raise RuntimeError("No eligible nodes available for allocation")
 
@@ -444,7 +488,8 @@ class AllocationEngine:
         )
 
         now_str = datetime.now().isoformat()
-        self.storage.batch_save_allocations([(service, account_id, least_loaded_node.name, now_str)])
+        if not ban_skipped_existing:
+            self.storage.batch_save_allocations([(service, account_id, least_loaded_node.name, now_str)])
 
         gw_url = self._build_gateway_proxy_url(account_id, gateway_base, least_loaded_node.egress_type, least_loaded_node.region, service=service, tier=least_loaded_node.tier)
         return AccountAllocationItem(
@@ -457,5 +502,6 @@ class AllocationEngine:
             egress_type=least_loaded_node.egress_type,
             service=service,
             allocated_at=now_str,
-            tier=least_loaded_node.tier
+            tier=least_loaded_node.tier,
+            isp=node_isp(least_loaded_node) or None
         )

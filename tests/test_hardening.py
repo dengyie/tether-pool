@@ -316,6 +316,9 @@ def test_prune_event_tables_bounds_every_append_only_table(storage):
     # A bind appends a binding_changes row (R5), which is append-only and must also be
     # bounded by the same retention window.
     storage.batch_save_allocations([("svc", "acc-ret", "ret-node", "2026-11-04T00:00:00")])
+    # ban_events (ban-aware allocation 2026-11-14) is append-only too: same window.
+    storage.record_ban("svc", "acc-ret", "ret-node", "198.51.100.7", None,
+                       "edge_405_html", {}, 0)
 
     pruned = storage.prune_event_tables(keep_days=0)
 
@@ -324,7 +327,9 @@ def test_prune_event_tables_bounds_every_append_only_table(storage):
         "circuit_events": 1,
         "battery_events": 1,
         "binding_changes": 1,
+        "ban_events": 0,  # 固定 30 天窗 (归因审计数据), 不随 keep_days=0 清空
     }
+    assert storage.prune_ban_events(keep_days=0) == 1
     with storage._get_conn() as conn:
-        for table in ("probe_history", "circuit_events", "battery_events", "binding_changes"):
+        for table in ("probe_history", "circuit_events", "battery_events", "binding_changes", "ban_events"):
             assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0

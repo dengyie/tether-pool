@@ -185,6 +185,59 @@ class IpCooldownRecord(BaseModel):
     created_at: str
 
 
+class BanReason(str, Enum):
+    EDGE_405_HTML = "edge_405_html"                      # 边缘 HTML 页 = IP 级封禁权威信号
+    UNUSUAL_ACTIVITY_3012 = "unusual_activity_3012"      # 应用层 JSON，默认只记录不隔离
+    RATE_LIMITED_429_BURST = "rate_limited_429_burst"
+
+
+class BanReportRequest(BaseModel):
+    """封禁上报（需求 2026-11-14, zcode-hub 消费方）。
+
+    body_kind=html 的边缘页是判 IP 封的权威信号；应用层 JSON 3012 在 zcode
+    语境多为「请求形状不对」，API 层对它强制 quarantine_hours=0（只记录）。
+    """
+    service: str = Field(..., min_length=1)
+    account: str = Field(..., min_length=1)
+    node_id: Optional[str] = None                        # 缺省 = 该账号当前绑定节点
+    reason: str = Field(..., min_length=1)
+    evidence: Dict[str, object] = Field(default_factory=dict)
+    quarantine_hours: int = Field(24, ge=0, le=24 * 30)
+    scope: str = "service"                               # P0 仅 service 维度生效
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, v: str) -> str:
+        v_clean = v.strip().lower()
+        if v_clean not in (r.value for r in BanReason):
+            raise ValueError(f"Invalid ban reason: '{v}'. Must be one of {[r.value for r in BanReason]}")
+        return v_clean
+
+
+class BanReportResponse(BaseModel):
+    ban_id: str
+    node_id: str
+    exit_ip: Optional[str] = None
+    isp: Optional[str] = None
+    quarantine_until: Optional[str] = None
+    idempotent: bool = False
+
+
+class BanRecord(BaseModel):
+    id: Optional[int] = None
+    ban_id: str
+    service: str
+    account: str
+    node_name: str
+    exit_ip: Optional[str] = None
+    isp: Optional[str] = None
+    reason: str
+    evidence: str = "{}"
+    quarantined_until: Optional[str] = None
+    released_at: Optional[str] = None
+    created_at: str
+
+
 class BatteryEventType(str, Enum):
     RATE_LIMITED_429 = "rate_limited_429"
     BANNED_401 = "banned_401"
@@ -217,6 +270,10 @@ class AccountAllocationItem(BaseModel):
     service: str
     allocated_at: str
     tier: Optional[str] = None
+    # ban-aware allocation 扩展 (2026-11-14)：isp 来自节点 tags 的 isp=<name> 约定
+    # （无 tags 时为 None）；warning 仅在 quarantine_flood 等降级场景非空。
+    isp: Optional[str] = None
+    warning: Optional[str] = None
 
 
 class BatchAllocationRequest(BaseModel):

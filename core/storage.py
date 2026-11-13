@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from core.models import (
     ProxyNode, ProbeResult, LeaseInfo, PoolStats, HealthStatus,
     CircuitEvent, RelayMode, IpCooldownRecord, BatteryEventReport,
-    Tier, BindingChangeRecord
+    Tier, BindingChangeRecord, BanRecord
 )
 from core.circuit import CircuitBreaker
 from core.quality import IPQualityEvaluator
@@ -130,6 +130,21 @@ class Storage:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS ban_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ban_id TEXT NOT NULL UNIQUE,
+                    service TEXT NOT NULL,
+                    account TEXT NOT NULL,
+                    node_name TEXT NOT NULL,
+                    exit_ip TEXT,
+                    isp TEXT,
+                    reason TEXT NOT NULL,
+                    evidence TEXT DEFAULT '{}',
+                    quarantined_until TEXT,
+                    released_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS account_allocations (
                     service TEXT NOT NULL,
                     account_id TEXT NOT NULL,
@@ -179,6 +194,8 @@ class Storage:
                 CREATE INDEX IF NOT EXISTS idx_circuit_events_time ON circuit_events(created_at);
                 CREATE INDEX IF NOT EXISTS idx_cooldown_lookup ON ip_cooldowns(exit_ip, target_service, cooled_until);
                 CREATE INDEX IF NOT EXISTS idx_battery_events_acc ON battery_events(account_id);
+                CREATE INDEX IF NOT EXISTS idx_ban_events_lookup ON ban_events(service, node_name, reason, quarantined_until);
+                CREATE INDEX IF NOT EXISTS idx_ban_events_active ON ban_events(service, quarantined_until);
                 CREATE INDEX IF NOT EXISTS idx_allocations_service ON account_allocations(service);
                 CREATE INDEX IF NOT EXISTS idx_allocations_node ON account_allocations(node_name);
             """)
@@ -763,6 +780,133 @@ class Storage:
             cur = conn.execute("DELETE FROM ip_cooldowns WHERE cooled_until <= ?", (now_str,))
             return cur.rowcount
 
+    # --- Ban Quarantine (ban-aware allocation, 2026-11-14 需求单) ---
+
+    def _ban_row_to_record(self, r: sqlite3.Row) -> BanRecord:
+        return BanRecord(
+            id=r["id"],
+            ban_id=r["ban_id"],
+            service=r["service"],
+            account=r["account"],
+            node_name=r["node_name"],
+            exit_ip=r["exit_ip"],
+            isp=r["isp"],
+            reason=r["reason"],
+            evidence=r["evidence"] or "{}",
+            quarantined_until=r["quarantined_until"],
+            released_at=r["released_at"],
+            created_at=r["created_at"],
+        )
+
+    def record_ban(
+        self,
+        service: str,
+        account: str,
+        node_name: str,
+        exit_ip: Optional[str],
+        isp: Optional[str],
+        reason: str,
+        evidence: Optional[Dict[str, object]] = None,
+        quarantine_hours: int = 24,
+    ) -> Tuple[BanRecord, bool]:
+        """落库 ban 事件并返回 (record, idempotent)。
+
+        幂等语义（需求 §4.1）：同 (service, node_name, reason) 存在未解除且未过期
+        的隔离行时返回原行（ban_id 不变、时长不叠加），quarantine_hours=0 仅记录
+        （quarantined_until=NULL，永不进入 active 集）。
+        """
+        import uuid
+        now = datetime.now()
+        now_str = now.isoformat()
+        until_str = (now + timedelta(hours=quarantine_hours)).isoformat() if quarantine_hours > 0 else None
+        with self._get_conn() as conn:
+            if quarantine_hours > 0:
+                row = conn.execute("""
+                    SELECT * FROM ban_events
+                    WHERE service = ? AND node_name = ? AND reason = ?
+                      AND quarantined_until IS NOT NULL AND quarantined_until > ?
+                      AND released_at IS NULL
+                    ORDER BY id DESC LIMIT 1
+                """, (service, node_name, reason, now_str)).fetchone()
+                if row:
+                    return self._ban_row_to_record(row), True
+            ban_id = f"ban-{uuid.uuid4().hex[:12]}"
+            cur = conn.execute("""
+                INSERT INTO ban_events (ban_id, service, account, node_name, exit_ip, isp, reason, evidence, quarantined_until, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                ban_id, service, account, node_name, exit_ip, isp, reason,
+                json.dumps(evidence or {}, ensure_ascii=False, sort_keys=True),
+                until_str, now_str,
+            ))
+            row = conn.execute("SELECT * FROM ban_events WHERE id = ?", (cur.lastrowid,)).fetchone()
+            return self._ban_row_to_record(row), False
+
+    def get_active_quarantines(self, service: Optional[str] = None) -> List[BanRecord]:
+        now_str = datetime.now().isoformat()
+        query = """
+            SELECT * FROM ban_events
+            WHERE quarantined_until IS NOT NULL AND quarantined_until > ? AND released_at IS NULL
+        """
+        params = [now_str]
+        if service:
+            query += " AND service = ?"
+            params.append(service)
+        query += " ORDER BY quarantined_until ASC"
+        with self._get_conn() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [self._ban_row_to_record(r) for r in rows]
+
+    def list_bans(self, service: Optional[str] = None, limit: int = 100) -> List[BanRecord]:
+        query = "SELECT * FROM ban_events"
+        params: List[object] = []
+        if service:
+            query += " WHERE service = ?"
+            params.append(service)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(int(limit))
+        with self._get_conn() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [self._ban_row_to_record(r) for r in rows]
+
+    def count_bans_since(self, service: str, since_iso: str) -> int:
+        """限流用：该 service 自 since 以来的 ban 上报条数（含只记录的）。"""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM ban_events WHERE service = ? AND created_at > ?",
+                (service, since_iso),
+            ).fetchone()
+            return int(row["cnt"]) if row else 0
+
+    def release_quarantine(self, service: str, node_name: str) -> int:
+        """人工解除（P1）：置 released_at，返回解除的行数。"""
+        now_str = datetime.now().isoformat()
+        with self._get_conn() as conn:
+            cur = conn.execute("""
+                UPDATE ban_events SET released_at = ?
+                WHERE service = ? AND node_name = ? AND released_at IS NULL
+                  AND quarantined_until IS NOT NULL AND quarantined_until > ?
+            """, (now_str, service, node_name, now_str))
+            return cur.rowcount
+
+    def clean_expired_quarantines(self) -> int:
+        now_str = datetime.now().isoformat()
+        with self._get_conn() as conn:
+            cur = conn.execute("""
+                UPDATE ban_events SET released_at = ?
+                WHERE quarantined_until IS NOT NULL AND quarantined_until <= ? AND released_at IS NULL
+            """, (now_str, now_str))
+            return cur.rowcount
+
+    def prune_ban_events(self, keep_days: int = 30) -> int:
+        """ban_events 保留窗: 注意注册进 prune_event_tables 时用固定 30 天
+        (封禁历史是归因审计数据, 比其他 event 表的 7 天窗口长)。直接调用时可
+        传 keep_days=0 清空 (测试/运维)。"""
+        cutoff = (datetime.now() - timedelta(days=keep_days)).isoformat()
+        with self._get_conn() as conn:
+            cur = conn.execute("DELETE FROM ban_events WHERE created_at < ?", (cutoff,))
+            return cur.rowcount
+
     # --- Battery Lifecycle Events ---
 
     def record_battery_event(self, report: BatteryEventReport) -> int:
@@ -1164,12 +1308,17 @@ class Storage:
             return cur.rowcount
 
     def prune_event_tables(self, keep_days: int = 7) -> Dict[str, int]:
-        """Applies the same retention window to every append-only event table."""
+        """Applies the same retention window to every append-only event table.
+
+        ban_events 固定 30 天窗 (归因审计数据, 不随 keep_days 收窄), 但始终在
+        返回值里出现, 便于监控核对。
+        """
         return {
             "probe_history": self.prune_probe_history(keep_days),
             "circuit_events": self.prune_circuit_events(keep_days),
             "battery_events": self.prune_battery_events(keep_days),
             "binding_changes": self.prune_binding_changes(keep_days),
+            "ban_events": self.prune_ban_events(keep_days=30),
         }
 
     def mark_nodes_missing_as_dead(self, keep_names: List[str]) -> List[str]:

@@ -3,6 +3,7 @@ core/router.py - Routing and proxy assignment engine with Circuit-Aware Lease Re
 Anti-Sybil Cooldown for Registration Bots, and Relay Bridge Resolution
 """
 
+import ipaddress
 import os
 import zlib
 from typing import Optional, List, Dict, Any, Tuple
@@ -13,6 +14,53 @@ from core.models import (
 )
 from core.storage import Storage
 from core.locks import BINDING_WRITE_LOCK
+
+
+def node_isp(node: ProxyNode) -> str:
+    """ISP 元数据走 tags 约定 (需求 §5.3): 节点 tags 中 isp=<name> (小写)。
+    无该 tag 的节点不参与 avoid_same_isp 判定、也不因此被排除。"""
+    for tag in (node.tags or []):
+        if tag.lower().startswith("isp="):
+            return tag.split("=", 1)[1].strip().lower()
+    return ""
+
+
+def _ipv4_slash24(exit_ip: Optional[str]) -> Optional[str]:
+    """家宽 /24 归并键 (需求 §5.2: 同段≈同线路, 误判成本高)。非 IPv4 返回 None。"""
+    if not exit_ip:
+        return None
+    try:
+        addr = ipaddress.ip_address(exit_ip)
+    except ValueError:
+        return None
+    return f"{addr}/24" if addr.version == 4 else None
+
+
+def _build_ban_excluded_networks(quarantines, avoid_cidrs: Optional[List[str]]) -> List[Any]:
+    """被封 exit_ip 的 /24 + 显式 avoid_cidr 网段 (非法 CIDR 跳过, 不炸请求)。"""
+    nets: List[Any] = []
+    for q in quarantines:
+        try:
+            if q.exit_ip:
+                nets.append(ipaddress.ip_network(f"{q.exit_ip}/24", strict=False))
+        except ValueError:
+            continue
+    for cidr in avoid_cidrs or []:
+        try:
+            nets.append(ipaddress.ip_network(cidr, strict=False))
+        except ValueError:
+            continue
+    return nets
+
+
+def _ip_in_excluded_nets(exit_ip: Optional[str], nets: List[Any]) -> bool:
+    if not exit_ip or not nets:
+        return False
+    try:
+        addr = ipaddress.ip_address(exit_ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in nets)
 
 
 class Router:
@@ -59,7 +107,14 @@ class Router:
         # 排除时, 返回临时 lease 改道候选节点但不落库 —— 绑定原地保留, 其他
         # 目标类继续走原节点, 上游修复后下一请求自动回到绑定节点。仅对
         # force_rebind=False 的 sticky 排除场景生效。
-        exclude_transient: bool = False
+        exclude_transient: bool = False,
+        # 封禁感知分配 (ban-aware allocation 2026-11-14): avoid_banned 并入该
+        # service 的 quarantine 集 (节点名 + exit_ip /24); avoid_cidrs 显式网段;
+        # avoid_same_isp 跨 ISP 选点 (仅对带 isp=<name> tag 的节点生效)。
+        # 硬过滤: 候选剔空 -> None (503), 绝不放松约束硬塞 (需求 §4.2)。
+        avoid_banned: bool = False,
+        avoid_cidrs: Optional[List[str]] = None,
+        avoid_same_isp: bool = False
     ) -> Optional[LeaseInfo]:
         with BINDING_WRITE_LOCK:
             return self._acquire_for_account(
@@ -74,7 +129,10 @@ class Router:
                 exclude_nodes=exclude_nodes,
                 region_strict=region_strict,
                 bind_persist=bind_persist,
-                exclude_transient=exclude_transient
+                exclude_transient=exclude_transient,
+                avoid_banned=avoid_banned,
+                avoid_cidrs=avoid_cidrs,
+                avoid_same_isp=avoid_same_isp
             )
 
     def _acquire_for_account(
@@ -90,7 +148,10 @@ class Router:
         exclude_nodes: Optional[set] = None,
         region_strict: bool = False,
         bind_persist: bool = False,
-        exclude_transient: bool = False
+        exclude_transient: bool = False,
+        avoid_banned: bool = False,
+        avoid_cidrs: Optional[List[str]] = None,
+        avoid_same_isp: bool = False
     ) -> Optional[LeaseInfo]:
         """
         Sticky assignment for an account.
@@ -128,6 +189,23 @@ class Router:
         excluded: set = set(exclude_nodes or ())
         if exclude_node:
             excluded.add(exclude_node)
+
+        # 封禁感知分配: quarantine 集合组装 (仅在调用方显式 opt-in 时生效 ——
+        # 用户拍板 2026-11-14: 不做全局自动排除)。节点名放独立集合 (不并入
+        # excluded —— 网关 R1 累积重试依赖 excluded 触发持久重绑, ban 过滤是
+        # per-call 临时性, 两者语义必须分开); /24 与 isp 集在候选过滤阶段生效。
+        ban_excluded_names: set = set()
+        ban_excluded_nets: List[Any] = []
+        ban_excluded_isps: set = set()
+        if avoid_banned:
+            quarantines = self.storage.get_active_quarantines(service=svc)
+            ban_excluded_names = {q.node_name for q in quarantines}
+            for q in quarantines:
+                if q.isp:
+                    ban_excluded_isps.add(q.isp)
+            ban_excluded_nets = _build_ban_excluded_networks(quarantines, avoid_cidrs)
+        elif avoid_cidrs:
+            ban_excluded_nets = _build_ban_excluded_networks([], avoid_cidrs)
 
         # Determine effective tier policy
         # Default is standard_first (protects self-hosted/premium IPs).
@@ -169,7 +247,15 @@ class Router:
             # 1a. Universal Allocation Engine bindings check first
             if alloc:
                 node = self.storage.get_node(alloc["node_name"])
+                # 封禁排除先于一切: 绑定节点在 opt-in quarantine 集里时绝不走
+                # fast path 返回 (先于 healthy/excluded 分支判断)。
                 if (
+                    node
+                    and node.status == HealthStatus.HEALTHY.value
+                    and node.name in ban_excluded_names
+                ):
+                    binding_conflict = True
+                elif (
                     node
                     and node.status == HealthStatus.HEALTHY.value
                     and node.name not in excluded
@@ -231,8 +317,11 @@ class Router:
             )
             if existing:
                 node = self.storage.get_node(existing.node_name)
+                # 封禁排除先于一切 (同 1a): 被封绑定绝不走 fast path 返回。
+                if node and node.status == HealthStatus.HEALTHY.value and node.name in ban_excluded_names:
+                    binding_conflict = True
                 # Ensure existing node is HEALTHY (Closed)
-                if node and node.status == HealthStatus.HEALTHY.value and node.name not in excluded:
+                elif node and node.status == HealthStatus.HEALTHY.value and node.name not in excluded:
                     if _node_matches_constraints(node):
                         return existing
                     binding_conflict = True
@@ -274,6 +363,21 @@ class Router:
             # has already widened scope, and landing back on a node that just failed for
             # this request is strictly worse than returning "no candidate" (-> 503).
             candidates = filtered
+
+        # 封禁感知硬过滤 (需求 §5.2/§5.3): 被封节点名、同 /24、同 ISP 剔除。
+        # 候选剔空 -> 走下方降级分支 (软排除降级会回绑定节点, 与目标级兜底同形)。
+        if ban_excluded_names or ban_excluded_nets or (avoid_same_isp and ban_excluded_isps):
+            def _ban_filtered(c: ProxyNode) -> bool:
+                if c.name in ban_excluded_names:
+                    return False
+                if _ip_in_excluded_nets(c.exit_ip, ban_excluded_nets):
+                    return False
+                if avoid_same_isp and ban_excluded_isps:
+                    isp = node_isp(c)
+                    if isp and isp in ban_excluded_isps:
+                        return False
+                return True
+            candidates = [c for c in candidates if _ban_filtered(c)]
 
         if not candidates:
             # 软排除降级 (目标级兜底): 绑定节点健康、只是被本请求的目标类健康集

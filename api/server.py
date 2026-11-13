@@ -6,6 +6,7 @@ import os
 import time
 import yaml
 import asyncio
+from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 from typing import Optional, List, Dict
 from fastapi import FastAPI, Query, BackgroundTasks, HTTPException, Request
@@ -17,11 +18,11 @@ from core.models import (
     RegistrationLease, IpCooldownRecord, BatteryEventReport,
     BatchAllocationRequest, BatchAllocationResponse, AccountAllocationItem,
     AllocationOverviewResponse, NodeCreateRequest, NodeUpdateRequest,
-    HealthStatus
+    HealthStatus, BanReportRequest, BanReportResponse, BanRecord, BanReason
 )
 from core.storage import Storage
 from core.prober import Prober
-from core.router import Router
+from core.router import Router, node_isp
 from core.metrics import MetricsCollector
 from core.allocator import AllocationEngine
 from core.quality import IPQualityEvaluator
@@ -738,6 +739,94 @@ def list_battery_events(
     return storage.list_battery_events(account_id=account_id, limit=limit)
 
 
+# --- Ban Feedback & Quarantine (ban-aware allocation, 2026-11-14 需求单) ---
+
+BAN_RATE_LIMIT_PER_HOUR = int(os.environ.get("IP_POOL_BAN_RATE_LIMIT_PER_HOUR", "30"))
+QUARANTINE_FLOOD_RATIO = 0.30  # 单 service 每日 quarantine > 池健康节点 30% -> warning (需求 §5.5)
+
+
+def _resolve_ban_node(report: BanReportRequest) -> ProxyNode:
+    """node_id 缺省时按 service+account 找当前绑定节点 (allocation -> lease)。"""
+    if report.node_id:
+        node = storage.get_node(report.node_id)
+        if not node:
+            raise HTTPException(status_code=400, detail=f"Unknown node_id: {report.node_id}")
+        return node
+    alloc = storage.get_allocation(report.service, report.account)
+    if alloc and alloc.get("node_name"):
+        node = storage.get_node(alloc["node_name"])
+        if node:
+            return node
+    lease = storage.get_lease(report.account)
+    if lease:
+        node = storage.get_node(lease.node_name)
+        if node:
+            return node
+    raise HTTPException(status_code=400, detail="No node_id given and no binding found for service+account")
+
+
+@app.post("/v1/feedback/ban", response_model=BanReportResponse, status_code=202)
+def report_ban(report: BanReportRequest):
+    """
+    封禁上报 (需求 §4.1): 边缘 HTML 405 = IP 级封禁权威信号 -> service 维度 quarantine。
+    幂等: 同 node+reason 在隔离窗内重复上报返回同一 ban_id (不叠加时长)。
+    判封门 (§5.1): unusual_activity_3012 且 evidence.body_kind != html -> 只记录不隔离。
+    限流 (§8): 单 service 每小时 <= 30 次, 超出 429。
+    """
+    now_iso = datetime.now().isoformat()
+    # 限流: 计数含只记录的上报 (消费方 bug 打穿控制面同样要挡)
+    if storage.count_bans_since(report.service, (datetime.now() - timedelta(hours=1)).isoformat()) >= BAN_RATE_LIMIT_PER_HOUR:
+        raise HTTPException(status_code=429, detail=f"ban report rate limit exceeded ({BAN_RATE_LIMIT_PER_HOUR}/hour for service {report.service})")
+
+    node = _resolve_ban_node(report)
+
+    quarantine_hours = report.quarantine_hours
+    if report.reason == BanReason.UNUSUAL_ACTIVITY_3012.value and (report.evidence or {}).get("body_kind") != "html":
+        # 应用层 JSON 3012 在 zcode 语境多为「请求形状不对」(2.7.5 口径):
+        # 默认不触发隔离, 由 evidence.body_kind 决定 —— 消费方确认是边缘 HTML
+        # 才隔离, 否则只记录。
+        quarantine_hours = 0
+
+    record, idempotent = storage.record_ban(
+        service=report.service,
+        account=report.account,
+        node_name=node.name,
+        exit_ip=node.exit_ip,
+        isp=node_isp(node) or None,
+        reason=report.reason,
+        evidence=report.evidence,
+        quarantine_hours=quarantine_hours,
+    )
+    storage.incr_metric("ip_pool_ban_events_total", {"service": report.service, "reason": report.reason})
+    return BanReportResponse(
+        ban_id=record.ban_id,
+        node_id=node.name,
+        exit_ip=record.exit_ip,
+        isp=record.isp,
+        quarantine_until=record.quarantined_until,
+        idempotent=idempotent,
+    )
+
+
+@app.get("/v1/feedback/bans", response_model=List[BanRecord])
+def list_bans_history(
+    service: Optional[str] = Query(None, description="Filter by service"),
+    limit: int = Query(100, ge=1, le=1000, description="Max rows (newest first)")
+):
+    """封禁历史列表 (P1): 含已过期与已解除的记录, 供归因与审计。"""
+    return storage.list_bans(service=service, limit=limit)
+
+
+@app.post("/v1/feedback/ban/release")
+def release_ban_quarantine(
+    service: str = Query(..., description="Service scope of the quarantine"),
+    node_id: str = Query(..., description="Node to release from quarantine")
+):
+    """人工解除隔离 (P1): 置 released_at, 该节点立即回到 avoid_banned 候选集。"""
+    released = storage.release_quarantine(service, node_id)
+    return {"success": released > 0, "service": service, "node_id": node_id, "released": released}
+
+
 # --- Universal Account Allocation & Distribution Endpoints ---
 
 @app.post("/v1/allocation/batch", response_model=BatchAllocationResponse)
@@ -763,21 +852,36 @@ def acquire_account_allocation(
     region: Optional[str] = Query(None, description="Optional region preference"),
     tier: Optional[str] = Query(None, description="Optional tier filter: premium or standard"),
     tier_policy: Optional[str] = Query(None, description="Optional tier policy: standard_first, premium_first, premium_only, standard_only"),
-    force_rebalance: bool = Query(False, description="Force reallocating to a different node")
+    force_rebalance: bool = Query(False, description="Force reallocating to a different node"),
+    avoid_banned: bool = Query(False, description="Exclude quarantined (banned) nodes and their /24 for this service"),
+    avoid_cidr: Optional[str] = Query(None, description="Comma-separated CIDR list to exclude, e.g. 23.230.200.0/24"),
+    avoid_same_isp: bool = Query(False, description="Cross-ISP selection: skip nodes whose isp=<name> tag matches a banned node's ISP")
 ):
     """
     On-demand allocation for a single account with load-aware capacity distribution.
+    Ban-aware (2026-11-14): avoid_banned/avoid_cidr/avoid_same_isp are opt-in hard
+    filters — exhausted candidates answer 503, constraints are never relaxed.
     """
     try:
-        return allocator.acquire_single(
+        result = allocator.acquire_single(
             service=service,
             account_id=account_id,
             egress_preference=egress_preference,
             region=region,
             tier=tier,
             tier_policy=tier_policy,
-            force_rebalance=force_rebalance
+            force_rebalance=force_rebalance,
+            avoid_banned=avoid_banned,
+            avoid_cidrs=[c.strip() for c in avoid_cidr.split(",") if c.strip()] if avoid_cidr else None,
+            avoid_same_isp=avoid_same_isp
         )
+        # 防汛告警 (需求 §5.5): 该 service 的 active quarantine 打穿健康池 30% 时
+        # 响应加 warning (语义照常返回, 告警走 metrics + 此字段)。
+        quarantined_count = len(storage.get_active_quarantines(service=service))
+        healthy_count = storage.get_stats().healthy_nodes
+        if healthy_count and quarantined_count > healthy_count * QUARANTINE_FLOOD_RATIO:
+            result.warning = "quarantine_flood"
+        return result
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
@@ -790,6 +894,53 @@ def get_allocation_overview():
     Statistical overview of account distributions and node capacity utilization.
     """
     return storage.get_allocations_overview()
+
+
+@app.get("/v1/allocation/status/account")
+def get_account_allocation_status(
+    service: str = Query(..., description="Service identifier"),
+    account: str = Query(..., description="Account ID (X-Account-Id namespace)")
+):
+    """
+    Per-account binding & quarantine status (需求 §4.3, 程序用):
+    绑定节点 + exit_ip/isp + 该 service 的 active quarantine 清单 + 池健康快照。
+    (既有池级 overview 保留在 /v1/allocation/status, 此路由为 per-account 载荷。)
+    """
+    alloc = storage.get_allocation(service, account)
+    node = None
+    bound_at = None
+    if alloc and alloc.get("node_name"):
+        node = storage.get_node(alloc["node_name"])
+        bound_at = alloc.get("allocated_at")
+    if node is None:
+        lease = storage.get_lease(account)
+        if lease:
+            node = storage.get_node(lease.node_name)
+            bound_at = lease.assigned_at
+    quarantined = [
+        {
+            "node_id": q.node_name,
+            "exit_ip": q.exit_ip,
+            "reason": q.reason,
+            "until": q.quarantined_until,
+        }
+        for q in storage.get_active_quarantines(service=service)
+    ]
+    stats = storage.get_stats()
+    return {
+        "service": service,
+        "account": account,
+        "node_id": node.name if node else None,
+        "exit_ip": node.exit_ip if node else None,
+        "isp": (node_isp(node) or None) if node else None,
+        "bound_at": bound_at,
+        "quarantined": quarantined,
+        "pool_health": {
+            "healthy": stats.healthy_nodes,
+            "quarantined": len(quarantined),
+            "total": stats.total_nodes,
+        },
+    }
 
 
 @app.get("/v1/allocation/accounts")
