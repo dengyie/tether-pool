@@ -32,7 +32,7 @@ class Prober:
 
     async def probe_node(self, node: ProxyNode, retries: int = 1, force: bool = False) -> ProbeResult:
         # Check circuit breaker cooldown if node is DEAD
-        is_canary = node.status == HealthStatus.HALF_OPEN.value
+        is_canary = (not force) and node.status == HealthStatus.HALF_OPEN.value
         if not force and node.status == HealthStatus.DEAD.value:
             if not CircuitBreaker.is_cooldown_expired(node):
                 # Cooldown still active, skip probing to respect isolation

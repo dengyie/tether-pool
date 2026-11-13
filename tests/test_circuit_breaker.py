@@ -250,3 +250,53 @@ async def test_healthy_node_keeps_retries(temp_env, monkeypatch):
     res = await prober.probe_node(storage.get_node("healthy-sg-01"), retries=1)
     assert res.success is True
     assert len(attempts) == 2, "non-canary probes must keep the retry budget"
+
+
+@pytest.mark.asyncio
+async def test_force_probe_of_half_open_keeps_retries(temp_env, monkeypatch):
+    """Review P3 fix: an operator's force=True probe must not inherit the
+    canary single-trial semantics from a leftover HALF_OPEN status."""
+    from core.prober import Prober
+
+    storage, _router = temp_env
+    node = ProxyNode(
+        name="stuck-halfopen-01",
+        host="127.0.0.1",
+        port=59997,
+        region="sg",
+        egress_type=EgressType.WARP_IPV6.value,
+        status=HealthStatus.HALF_OPEN.value
+    )
+    storage.upsert_node(node)
+
+    prober = Prober(storage, timeout=0.2)
+    attempts = []
+
+    class _FailThenOkClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url):
+            attempts.append(url)
+            if len(attempts) == 1:
+                raise RuntimeError("transient")
+            class _Resp:
+                status_code = 200
+                text = "ip=2001:db8::1\n"
+            return _Resp()
+
+    async def fake_wait_for(coro, timeout=None):
+        return await coro
+
+    monkeypatch.setattr("core.prober.httpx.AsyncClient", _FailThenOkClient)
+    monkeypatch.setattr("core.prober.asyncio.wait_for", fake_wait_for)
+
+    res = await prober.probe_node(storage.get_node("stuck-halfopen-01"), retries=1, force=True)
+    assert res.success is True
+    assert len(attempts) == 2, "force probe of a HALF_OPEN node must keep the retry budget"
