@@ -584,6 +584,14 @@ class ForwardProxyGateway:
         # steer 计量 (按目标类累计): 兜底实际改道了多少请求, /metrics 与 relay
         # summary 都能看到 —— "探活绿但业务死"期间的救流量直接可查。
         self.target_steers: Dict[str, int] = {}
+        # metrics 缓冲 (数据流优化 2026-11-14): 旧实现每个请求往 SQLite 写一次
+        # 直方图事务 —— 成功路径上唯一的写操作。改为内存累计 + 5s 批量刷盘,
+        # 崩溃最多丢 5s 的 ops 计数 (非计费数据, 可接受)。
+        self._metrics_buffer: list = []
+        self._metrics_flush_interval = max(
+            1.0, float(os.environ.get("GATEWAY_METRICS_FLUSH_SEC", "5"))
+        )
+        self._metrics_task = None
 
     # Cap on distinct labels per relay map; extra keys collapse into "other".
     RELAY_LABEL_CAP = 2000
@@ -802,12 +810,14 @@ class ForwardProxyGateway:
         entries.append((
             "ip_pool_gateway_attempts_per_request_count", {}, 1.0
         ))
-        # One transaction: the old per-bucket writes put seven SQLite commits on the
-        # success path of every proxied request. Metrics must never fail a request.
-        try:
-            self.storage.incr_metrics(entries)
-        except Exception as exc:
-            print(f"[-] Failed to record gateway attempt metrics: {exc}")
+        # 数据流优化: 成功路径上不再有 SQLite 写事务 —— 直方图计入内存缓冲,
+        # 由 _metrics_flush_loop 每 5s 批量落库 (崩一个 flush 周期至多丢 5s 计数)。
+        # 惰性初始化: 测试里的 __new__ 裸实例与主流程都安全。
+        buffer = getattr(self, "_metrics_buffer", None)
+        if buffer is None:
+            buffer = []
+            self._metrics_buffer = buffer
+        buffer.extend(entries)
 
     async def _open_upstream(
         self,
@@ -891,7 +901,9 @@ class ForwardProxyGateway:
                     "No available proxy nodes in IP pool"
                 )
 
-            node = self.storage.get_node(lease.node_name)
+            node = lease if lease.host is not None else self.storage.get_node(lease.node_name)
+            # lease 携带拨号四元组时直接鸭子类型当节点用 (数据流优化: 少一次
+            # get_node); legacy 镜像 lease 无字段, 回退查库, 行为不变。
             if not node:
                 excluded.add(lease.node_name)
                 continue
@@ -1234,6 +1246,24 @@ class ForwardProxyGateway:
             except Exception as exc:
                 logger.warning("relay summary error: %s", exc)
 
+    async def _metrics_flush_loop(self):
+        """把内存里的直方图缓冲批量落库 (5s 一批); 失败时回灌并封顶防膨胀。"""
+        while True:
+            await asyncio.sleep(self._metrics_flush_interval)
+            await self._flush_metrics()
+
+    async def _flush_metrics(self):
+        if not self._metrics_buffer:
+            return
+        entries, self._metrics_buffer = self._metrics_buffer, []
+        try:
+            self.storage.incr_metrics(entries)
+        except Exception as exc:
+            print(f"[-] Failed to flush gateway metrics: {exc}")
+            self._metrics_buffer = entries + self._metrics_buffer
+            if len(self._metrics_buffer) > 50000:
+                del self._metrics_buffer[:len(self._metrics_buffer) - 50000]
+
     async def _target_probe_loop(self):
         """
         目标类健康探活循环 (兜底): 每轮对每个目标类的 canary URL 探测全池健康节点。
@@ -1283,9 +1313,17 @@ class ForwardProxyGateway:
             logger.info("Target-health probing every %ss (classes=%s, concurrency=%d)",
                         int(self.target_probe_interval),
                         ",".join(TARGET_CLASS_CANARIES), self.target_probe_concurrency)
+        self._metrics_task = asyncio.create_task(self._metrics_flush_loop())
+        logger.info("Gateway metrics flush every %ss (in-memory accumulation)",
+                    int(self._metrics_flush_interval))
 
     async def stop(self):
-        for task_attr in ("_peer_task", "_relay_task", "_target_probe_task"):
+        # 最终刷盘: 进程退出前把残余计数落库 (尽力而为, 失败不阻塞停机)
+        try:
+            await asyncio.wait_for(self._flush_metrics(), timeout=5.0)
+        except Exception:
+            pass
+        for task_attr in ("_peer_task", "_relay_task", "_target_probe_task", "_metrics_task"):
             task = getattr(self, task_attr)
             if task:
                 task.cancel()

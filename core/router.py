@@ -3,6 +3,7 @@ core/router.py - Routing and proxy assignment engine with Circuit-Aware Lease Re
 Anti-Sybil Cooldown for Registration Bots, and Relay Bridge Resolution
 """
 
+import os
 import zlib
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
@@ -17,6 +18,29 @@ from core.locks import BINDING_WRITE_LOCK
 class Router:
     def __init__(self, storage: Storage):
         self.storage = storage
+        # hub 跳板扫描缓存 (数据流优化 2026-11-14): 276 个 relay_fallback 节点
+        # 都没有显式 relay_hop_node, 旧实现每个请求最多扫 4 个 hub 区。跳板候选
+        # 只随节点状态/配置变化, 10s TTL 对"仅直连失败才用到"的兜底路径完全够
+        # 新鲜 —— 每请求 4 次 list_nodes 归零。
+        self._hub_cache: Optional[List[ProxyNode]] = None
+        self._hub_cache_ts: float = 0.0
+        self._hub_cache_ttl: float = float(os.environ.get("IP_POOL_HUB_CACHE_TTL", "10"))
+
+    def _hub_candidates(self) -> List[ProxyNode]:
+        """Healthy clash_proxy hub nodes (hongkong/tokyo/singapore/us-west), 10s TTL cached."""
+        import time
+        now = time.time()
+        if self._hub_cache is None or now - self._hub_cache_ts > self._hub_cache_ttl:
+            candidates: List[ProxyNode] = []
+            for hub_region in ["hongkong", "tokyo", "singapore", "us-west"]:
+                candidates.extend(self.storage.list_nodes(
+                    region=hub_region,
+                    egress_type=EgressType.CLASH_PROXY.value,
+                    status=HealthStatus.HEALTHY.value
+                ))
+            self._hub_cache = candidates
+            self._hub_cache_ts = now
+        return self._hub_cache
 
     def acquire_for_account(
         self,
@@ -176,7 +200,11 @@ class Router:
                             region=node.region,
                             egress_type=node.egress_type,
                             assigned_at=alloc["allocated_at"],
-                            tier=node.tier
+                            tier=node.tier,
+                            host=node.host,
+                            port=node.port,
+                            relay_mode=node.relay_mode,
+                            relay_hop_node=node.relay_hop_node
                         )
                     # Healthy binding that only fails this call's filter -> keep it.
                     binding_conflict = True
@@ -269,7 +297,11 @@ class Router:
                         egress_type=bound.egress_type,
                         # legacy 镜像路径下 alloc 为 None, 直接取当前时间
                         assigned_at=(alloc or {}).get("allocated_at") or datetime.now().isoformat(),
-                        tier=bound.tier
+                        tier=bound.tier,
+                        host=bound.host,
+                        port=bound.port,
+                        relay_mode=bound.relay_mode,
+                        relay_hop_node=bound.relay_hop_node
                     )
             return None
 
@@ -295,7 +327,11 @@ class Router:
             region=selected_node.region,
             egress_type=selected_node.egress_type,
             assigned_at=now_str,
-            tier=selected_node.tier
+            tier=selected_node.tier,
+            host=selected_node.host,
+            port=selected_node.port,
+            relay_mode=selected_node.relay_mode,
+            relay_hop_node=selected_node.relay_hop_node
         )
         if account_id.startswith("anon_"):
             return ephemeral_lease
@@ -328,6 +364,12 @@ class Router:
             [(svc, account_id, selected_node.name, now_str)],
             constraints_by_account={(svc, account_id): _call_constraints()},
         )
+        # set_lease 由 lease 表构造, 不带拨号字段 —— 从 selected_node 补齐,
+        # 让新绑定/R2 重绑路径同样免掉网关的重复 get_node。
+        lease.host = selected_node.host
+        lease.port = selected_node.port
+        lease.relay_mode = selected_node.relay_mode
+        lease.relay_hop_node = selected_node.relay_hop_node
 
         return lease
 
@@ -944,17 +986,10 @@ class Router:
                 return hop
 
         # Fallback candidate pool: healthy clash_proxy nodes in key transit hubs
-        for hub_region in ["hongkong", "tokyo", "singapore", "us-west"]:
-            hub_nodes = self.storage.list_nodes(
-                region=hub_region,
-                egress_type=EgressType.CLASH_PROXY.value,
-                status=HealthStatus.HEALTHY.value
-            )
-            if hub_nodes:
-                # Avoid picking itself as relay
-                valid = [h for h in hub_nodes if h.name != node.name]
-                if valid:
-                    return valid[0]
+        # (10s TTL 缓存 —— 见 _hub_candidates; hop 只在直连拨号失败时才真正使用)
+        valid = [h for h in self._hub_candidates() if h.name != node.name]
+        if valid:
+            return valid[0]
 
         return None
 

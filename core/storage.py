@@ -5,6 +5,7 @@ core/storage.py - SQLite storage engine for IP Pool System with Circuit Breaker 
 import sqlite3
 import json
 import os
+import threading
 from typing import List, Optional, Dict, Tuple, Any
 from datetime import datetime, timedelta
 from contextlib import contextmanager
@@ -24,20 +25,26 @@ class Storage:
         self.db_path = db_path
         # abspath() keeps bare filenames ("pool.db") from yielding an empty dirname
         os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
+        # 线程本地连接复用 (数据流优化 2026-11-14): 旧实现每次 _get_conn 都
+        # sqlite3.connect+close —— 网关粘性请求一次要开 4 个连接。WAL 模式下
+        # 复用同线程连接是安全的 (每操作仍 commit/rollback, 语义不变);
+        # sqlite3.connect(timeout=10.0) 自带 busy handler, 与逐次新建一致。
+        self._thread_local = threading.local()
         self._init_db()
 
     @contextmanager
     def _get_conn(self):
-        conn = sqlite3.connect(self.db_path, timeout=10.0)
-        conn.row_factory = sqlite3.Row
+        conn = getattr(self._thread_local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path, timeout=10.0)
+            conn.row_factory = sqlite3.Row
+            self._thread_local.conn = conn
         try:
             yield conn
             conn.commit()
         except Exception:
             conn.rollback()
             raise
-        finally:
-            conn.close()
 
     def _init_db(self):
         with self._get_conn() as conn:

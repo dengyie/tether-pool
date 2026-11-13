@@ -113,6 +113,18 @@ class LeaseInfo(BaseModel):
     # 目标级兜底旗标 (2026-11-14): 绑定节点被目标类健康集软排除, 本 lease 是
     # 改道候选节点的临时结果 —— 绑定未动, 网关据此计量 steer 事件。
     steered: bool = False
+    # 拨号字段直传 (数据流优化 2026-11-14): router 在 acquire 时手里就有完整
+    # node, 顺手携带连接四元组 —— 网关不必再 get_node 一次 (legacy 镜像 lease
+    # 路径无这些字段, 为 None 时网关回退查库, 行为不变)。
+    host: Optional[str] = None
+    port: Optional[int] = None
+    relay_mode: Optional[str] = None
+    relay_hop_node: Optional[str] = None
+
+    @property
+    def name(self) -> str:
+        """ProxyNode 风格别名: 网关在 lease 携带拨号字段时直接鸭子类型当节点用。"""
+        return self.node_name
 
 
 class BindingEpochInfo(BaseModel):

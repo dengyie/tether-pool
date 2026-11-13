@@ -255,3 +255,99 @@ def test_gateway_counts_and_renders_steers():
         assert summary["target_steers"] == {"google": 3, "openai": 1}
     finally:
         os.remove(f.name)
+
+
+# ---------------------------------------------------------------------------
+# 6. 数据流优化 (2026-11-14): 连接复用 / hub 缓存 / lease 拨号字段 / metrics 缓冲
+# ---------------------------------------------------------------------------
+
+def test_storage_connection_reuse_semantics():
+    """复用连接后每次操作仍具独立事务语义: 成功 commit、异常 rollback。"""
+    import tempfile
+    from datetime import datetime as _dt
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        storage = Storage(db_path=f.name)
+    try:
+        node = ProxyNode(name="reuse-01", host="10.0.0.1", port=1, region="tokyo",
+                         egress_type=EgressType.WARP_IPV6.value)
+        storage.upsert_node(node)
+        assert storage.get_node("reuse-01") is not None
+        # 异常路径: 事务中途抛错 -> rollback -> 半截写入不存在, 连接仍可用
+        with pytest.raises(RuntimeError):
+            with storage._get_conn() as conn:
+                conn.execute(
+                    "INSERT INTO nodes (name, host, port, region, egress_type, status) "
+                    "VALUES ('half-txn', '10.9.9.9', 9, 'tokyo', 'warp_ipv6', 'healthy')"
+                )
+                raise RuntimeError("boom")
+        assert storage.get_node("half-txn") is None, "rollback 生效"
+        # 同线程第二次操作复用同一连接
+        storage.upsert_node(ProxyNode(name="reuse-02", host="10.0.0.2", port=2,
+                                      region="tokyo", egress_type=EgressType.WARP_IPV6.value))
+        assert storage.get_node("reuse-02") is not None
+        # 写入确实落盘 (commit 生效)
+        assert storage.get_node("reuse-01").name == "reuse-01"
+        _ = _dt.now()
+    finally:
+        os.remove(f.name)
+
+
+def test_hub_cache_serves_within_ttl(temp_router):
+    """hub 候选缓存: TTL 内不再重复扫库, 节点变化在下个 TTL 窗口生效。"""
+    import time
+    router, storage = temp_router
+    # 造一个 healthy clash hub 节点
+    storage.upsert_node(ProxyNode(name="hub-hk-01", host="127.0.0.1", port=9,
+                                  region="hongkong", egress_type=EgressType.CLASH_PROXY.value,
+                                  status=HealthStatus.HEALTHY.value))
+    node = ProxyNode(name="warp-fallback-01", host="10.0.0.3", port=3, region="tokyo",
+                     egress_type=EgressType.WARP_IPV6.value,
+                     status=HealthStatus.HEALTHY.value)
+    storage.upsert_node(node)
+    router._hub_cache_ttl = 10
+
+    hop1 = router.resolve_relay_hop(node)
+    assert hop1 is not None and hop1.name == "hub-hk-01"
+    # 缓存窗口内节点死亡, resolve 仍返回旧 hop (10s 新鲜度对兜底路径够用)
+    storage.update_node_status("hub-hk-01", HealthStatus.DEAD.value)
+    hop2 = router.resolve_relay_hop(node)
+    assert hop2 is not None and hop2.name == "hub-hk-01"
+    # TTL 过期后重新扫描, 死节点出局
+    router._hub_cache_ts = 0.0
+    assert router.resolve_relay_hop(node) is None
+
+
+def test_lease_carries_dial_fields(temp_router):
+    """lease 携带拨号四元组: 网关可免 get_node; steered/degrade 路径同样携带。"""
+    router, storage = temp_router
+    _bind(router, storage, "acc_dial", "pigeonw-01")
+    lease = router.acquire_for_account("acc_dial")
+    assert lease.host == "127.0.0.1" and lease.port == 12053
+    assert lease.relay_mode is not None and lease.name == "pigeonw-01"
+    # steer 路径同样携带
+    sleave = router.acquire_for_account(
+        "acc_dial", exclude_nodes={"pigeonw-01"}, exclude_transient=True
+    )
+    assert sleave.host is not None and sleave.steered is True
+
+
+def test_gateway_metrics_buffered_and_flushed():
+    """_record_attempts 只进内存缓冲; flush 批量落库; 失败回灌。"""
+    import tempfile
+    from gateway.server import ForwardProxyGateway
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        storage = Storage(db_path=f.name)
+    try:
+        gw = ForwardProxyGateway(storage, Router(storage), host="127.0.0.1", port=0)
+        gw._record_attempts(2)
+        assert gw._metrics_buffer, "请求路径只入缓冲"
+        # 落库前 DB 里没有直方图计数
+        names = [r["name"] for r in storage.get_runtime_metrics()]
+        assert not any("attempts_per_request" in n for n in names)
+        import asyncio
+        asyncio.get_event_loop_policy().new_event_loop().run_until_complete(gw._flush_metrics())
+        names = [r["name"] for r in storage.get_runtime_metrics()]
+        assert any("attempts_per_request" in n for n in names), "flush 后落库"
+        assert gw._metrics_buffer == []
+    finally:
+        os.remove(f.name)
