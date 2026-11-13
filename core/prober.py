@@ -32,6 +32,7 @@ class Prober:
 
     async def probe_node(self, node: ProxyNode, retries: int = 1, force: bool = False) -> ProbeResult:
         # Check circuit breaker cooldown if node is DEAD
+        is_canary = node.status == HealthStatus.HALF_OPEN.value
         if not force and node.status == HealthStatus.DEAD.value:
             if not CircuitBreaker.is_cooldown_expired(node):
                 # Cooldown still active, skip probing to respect isolation
@@ -42,7 +43,11 @@ class Prober:
                     error="circuit_open_in_cooldown"
                 )
             else:
-                # Cooldown expired, mark as HALF_OPEN for trial canary probe
+                # Cooldown expired, mark as HALF_OPEN for trial canary probe.
+                # A canary is a single-trial probe by definition (the circuit
+                # reopens on failure); burning a full retry (~timeout+0.5s
+                # more per canary per sweep) adds no information.
+                is_canary = True
                 node.status = HealthStatus.HALF_OPEN.value
                 self.storage.update_node_status(node.name, HealthStatus.HALF_OPEN.value)
                 self.storage.record_circuit_event(
@@ -103,7 +108,7 @@ class Prober:
                 if not err_msg or isinstance(e, asyncio.TimeoutError):
                     err_msg = f"Timeout (>{self.timeout}s)"
 
-                if attempt < retries:
+                if attempt < retries and not is_canary:
                     await asyncio.sleep(0.5)
                     continue
 

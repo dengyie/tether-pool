@@ -37,6 +37,9 @@ DASHBOARD_HTML = os.path.join(os.path.dirname(os.path.dirname(__file__)), "web",
 API_TOKEN = os.environ.get("IP_POOL_API_TOKEN", "").strip()
 AUTH_COOKIE_NAME = "ip_pool_token"
 PROBE_INTERVAL_SECONDS = int(os.environ.get("IP_POOL_PROBE_INTERVAL", "300"))
+# 全池 sweep 的并发度。50 并发下 347 节点一轮 ~1 分钟（12s 超时 + warp 高延迟），
+# 25 并发会把死节点多的轮次拖到 2.5 分钟以上。可用 env 调回保守值。
+PROBE_CONCURRENCY = int(os.environ.get("IP_POOL_PROBE_CONCURRENCY", "50"))
 PROBE_HISTORY_KEEP_DAYS = int(os.environ.get("IP_POOL_PROBE_HISTORY_KEEP_DAYS", "7"))
 # Config files below this node count are treated as incomplete (e.g. a scratch
 # override), so startup never acts on the registry based on them.
@@ -139,7 +142,7 @@ async def _scheduled_probe_sweep():
     try:
         async with _probe_lock:
             print("[*] Starting scheduled full pool probe...")
-            results = await prober.probe_all(concurrency=25)
+            results = await prober.probe_all(concurrency=PROBE_CONCURRENCY)
             healthy = sum(1 for r in results if r.success)
             print(f"[+] Scheduled probe finished: {healthy}/{len(results)} nodes healthy.")
             pruned = storage.prune_event_tables(keep_days=PROBE_HISTORY_KEEP_DAYS)
@@ -506,7 +509,7 @@ async def trigger_probe(
         try:
             async with _probe_lock:
                 print(f"[probe] sweep starting (force={force}, queued_behind_sweep={was_locked})")
-                results = await prober.probe_all(concurrency=25, force=force)
+                results = await prober.probe_all(concurrency=PROBE_CONCURRENCY, force=force)
                 healthy = sum(1 for r in results if r.success)
                 print(f"[probe] sweep finished: {healthy}/{len(results)} healthy (force={force})")
         finally:

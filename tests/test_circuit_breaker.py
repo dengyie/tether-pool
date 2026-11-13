@@ -149,3 +149,104 @@ def test_manual_circuit_reset(temp_env):
     reset_node = storage.get_node("dead-node")
     assert reset_node.status == HealthStatus.HEALTHY.value
     assert reset_node.consecutive_failures == 0
+
+
+# ---------------------------------------------------------------------------
+# Canary probes are single-trial: a HALF_OPEN canary must not burn the
+# caller's retry budget (each retry costs ~timeout+0.5s per canary per sweep,
+# and the circuit reopens on failure either way — the retry adds no info).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_half_open_canary_skips_retry(temp_env, monkeypatch):
+    from core.prober import Prober
+
+    storage, _router = temp_env
+    node = ProxyNode(
+        name="canary-sg-01",
+        host="127.0.0.1",
+        port=59999,
+        region="sg",
+        egress_type=EgressType.WARP_IPV6.value,
+        status=HealthStatus.DEAD.value,
+        consecutive_failures=5,
+        next_probe_allowed_at=(datetime.now() - timedelta(seconds=3600)).isoformat()
+    )
+    storage.upsert_node(node)
+
+    prober = Prober(storage, timeout=0.2)
+    attempts = []
+
+    class _FailClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url):
+            attempts.append(url)
+            raise RuntimeError("dial refused")
+
+    async def fake_wait_for(coro, timeout=None):
+        return await coro
+
+    monkeypatch.setattr("core.prober.httpx.AsyncClient", _FailClient)
+    monkeypatch.setattr("core.prober.asyncio.wait_for", fake_wait_for)
+
+    res = await prober.probe_node(storage.get_node("canary-sg-01"), retries=2)
+    assert res.success is False
+    # canary must be a single attempt despite retries=2
+    assert len(attempts) == 1, f"canary retried: {len(attempts)} attempts"
+    assert storage.get_node("canary-sg-01").status == HealthStatus.DEAD.value
+
+
+@pytest.mark.asyncio
+async def test_healthy_node_keeps_retries(temp_env, monkeypatch):
+    from core.prober import Prober
+
+    storage, _router = temp_env
+    node = ProxyNode(
+        name="healthy-sg-01",
+        host="127.0.0.1",
+        port=59998,
+        region="sg",
+        egress_type=EgressType.WARP_IPV6.value,
+        status=HealthStatus.HEALTHY.value
+    )
+    storage.upsert_node(node)
+
+    prober = Prober(storage, timeout=0.2)
+    attempts = []
+
+    class _FailOnceClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url):
+            attempts.append(url)
+            if len(attempts) == 1:
+                raise RuntimeError("transient")
+            class _Resp:
+                status_code = 200
+                text = "ip=2001:db8::1\n"
+            return _Resp()
+
+    async def fake_wait_for(coro, timeout=None):
+        return await coro
+
+    monkeypatch.setattr("core.prober.httpx.AsyncClient", _FailOnceClient)
+    monkeypatch.setattr("core.prober.asyncio.wait_for", fake_wait_for)
+
+    res = await prober.probe_node(storage.get_node("healthy-sg-01"), retries=1)
+    assert res.success is True
+    assert len(attempts) == 2, "non-canary probes must keep the retry budget"
