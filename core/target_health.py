@@ -121,3 +121,11 @@ class TargetHealthTracker:
     def error_of(self, node_name: str, cls: str) -> str:
         entry = self._state.get((node_name, cls))
         return entry["err"] if entry else ""
+
+    def prune(self, active_node_names: Set[str]) -> int:
+        """内存卫生: 节点被删除/退役后, 其 (node, class) 条目不再有探活来源,
+        永远不会被 record 覆盖或 TTL 刷新 —— 每轮 sweep 用当前节点集裁剪一次。"""
+        stale = [key for key in self._state if key[0] not in active_node_names]
+        for key in stale:
+            del self._state[key]
+        return len(stale)

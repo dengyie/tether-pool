@@ -1278,6 +1278,9 @@ class ForwardProxyGateway:
             try:
                 healthy = [n for n in self.storage.list_nodes()
                            if n.status == HealthStatus.HEALTHY.value]
+                # 内存卫生: 已删/退役节点的 (node, class) 条目永远不会再被
+                # record/TTL 触达, 每轮裁剪一次 (数据流 review 2026-11-14)。
+                self.target_health.prune({n.name for n in healthy})
                 for cls, url in TARGET_CLASS_CANARIES.items():
                     async def _one(node: ProxyNode):
                         async with sem:

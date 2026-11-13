@@ -351,3 +351,16 @@ def test_gateway_metrics_buffered_and_flushed():
         assert gw._metrics_buffer == []
     finally:
         os.remove(f.name)
+
+
+def test_tracker_prunes_deleted_nodes():
+    """内存卫生: 已删节点的坏条目被 prune 清掉, 活跃节点条目保留。"""
+    t = TargetHealthTracker(bad_streak=2, bad_ttl_seconds=300)
+    t.record("dead-node", "google", False)
+    t.record("dead-node", "google", False)
+    t.record("alive-node", "google", False)
+    t.record("alive-node", "google", False)
+    assert t.bad_nodes("google") == {"dead-node", "alive-node"}
+    removed = t.prune({"alive-node"})
+    assert removed == 1
+    assert t.bad_nodes("google") == {"alive-node"}
