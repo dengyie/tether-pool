@@ -30,7 +30,12 @@ class Router:
         exclude_node: Optional[str] = None,
         exclude_nodes: Optional[set] = None,
         region_strict: bool = False,
-        bind_persist: bool = False
+        bind_persist: bool = False,
+        # 软排除语义 (2026-11-14 机场目标级故障兜底): 绑定节点被 exclude_nodes
+        # 排除时, 返回临时 lease 改道候选节点但不落库 —— 绑定原地保留, 其他
+        # 目标类继续走原节点, 上游修复后下一请求自动回到绑定节点。仅对
+        # force_rebind=False 的 sticky 排除场景生效。
+        exclude_transient: bool = False
     ) -> Optional[LeaseInfo]:
         with BINDING_WRITE_LOCK:
             return self._acquire_for_account(
@@ -44,7 +49,8 @@ class Router:
                 exclude_node=exclude_node,
                 exclude_nodes=exclude_nodes,
                 region_strict=region_strict,
-                bind_persist=bind_persist
+                bind_persist=bind_persist,
+                exclude_transient=exclude_transient
             )
 
     def _acquire_for_account(
@@ -59,7 +65,8 @@ class Router:
         exclude_node: Optional[str] = None,
         exclude_nodes: Optional[set] = None,
         region_strict: bool = False,
-        bind_persist: bool = False
+        bind_persist: bool = False,
+        exclude_transient: bool = False
     ) -> Optional[LeaseInfo]:
         """
         Sticky assignment for an account.
@@ -132,6 +139,7 @@ class Router:
 
         # 1. Check existing lease if not forcing rebind
         alloc = self.storage.find_allocation_by_account(account_id, service=svc)
+        steer_transient = False
         if not force_rebind:
             # 1a. Universal Allocation Engine bindings check first
             if alloc:
@@ -171,6 +179,16 @@ class Router:
                         )
                     # Healthy binding that only fails this call's filter -> keep it.
                     binding_conflict = True
+                elif (
+                    node
+                    and node.status == HealthStatus.HEALTHY.value
+                    and node.name in excluded
+                    and exclude_transient
+                ):
+                    # 软排除 (目标级兜底): 绑定节点本身健康, 只是被本请求的
+                    # 目标类健康集排除 —— 记旗, 候选选择照常进行, 但最后不落库
+                    # (见 step 5 前的拦截)。绑定原地保留。
+                    steer_transient = True
 
             # 1b. Legacy lease table check — only for accounts that have NO universal
             # allocation at all. `batch_save_allocations` now maintains this mirror in the
@@ -219,6 +237,22 @@ class Router:
             candidates = filtered
 
         if not candidates:
+            # 软排除降级 (目标级兜底): 绑定节点健康、只是被本请求的目标类健康集
+            # 排除, 且候选被排除空 —— 宁可返回绑定节点 (该类流量可能失败, 但绝不
+            # None/503; 绑定节点对其他目标类仍然可用, 探活恢复后自然无感)。
+            if steer_transient and alloc:
+                bound = self.storage.get_node(alloc["node_name"])
+                if bound and bound.status == HealthStatus.HEALTHY.value:
+                    return LeaseInfo(
+                        account_id=account_id,
+                        node_name=bound.name,
+                        proxy_url=bound.proxy_url,
+                        exit_ip=bound.exit_ip,
+                        region=bound.region,
+                        egress_type=bound.egress_type,
+                        assigned_at=alloc["allocated_at"],
+                        tier=bound.tier
+                    )
             return None
 
         # Sort stably by node name
@@ -260,6 +294,12 @@ class Router:
                 )
             except Exception as persist_err:
                 print(f"[-] constraint_rebind persistence failed for {account_id}: {persist_err}")
+            return ephemeral_lease
+
+        # 软排除拦截 (目标级兜底): 改道结果只作为本请求的临时 lease 返回,
+        # 不写 set_lease / account_allocations —— 绑定原地保留, 上游恢复后
+        # 下一请求自动回到原绑定节点。
+        if steer_transient:
             return ephemeral_lease
 
         # 5. Persist lease and synchronize with account_allocations (constraint set rides

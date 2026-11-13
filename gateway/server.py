@@ -21,6 +21,8 @@ from core.models import ProxyNode, RelayMode, ProbeResult, HealthStatus
 from core.storage import Storage
 from core.router import Router
 from core.failover import FailureDomainIsolator, EasytierPeerMonitor
+from core.prober import Prober
+from core.target_health import TargetHealthTracker, TARGET_CLASS_CANARIES, classify_target
 
 DEFAULT_GATEWAY_HOST = os.environ.get("GATEWAY_HOST", "127.0.0.1")
 DEFAULT_GATEWAY_PORT = int(os.environ.get("GATEWAY_PORT", "9101"))
@@ -560,6 +562,25 @@ class ForwardProxyGateway:
             0.0, float(os.environ.get("GATEWAY_RELAY_SUMMARY_INTERVAL_SEC", "60"))
         )
         self._relay_task = None
+        # 目标级健康兜底 (2026-11-14 宝可梦机场故障): 探活只测 ipify/CF, 机场出口对
+        # Google/OpenAI 网段选择性故障时池仍报 healthy, 拨号又必然成功 (桥在本机),
+        # R1 排除重试永远不触发 —— 业务请求会在中继建立后挂死。按目标类周期探活 +
+        # 选路软排除 (临时 lease, 不迁移绑定), 候选被排除空时降级回绑定节点。
+        self.target_health = TargetHealthTracker(
+            bad_streak=max(1, int(os.environ.get("IP_POOL_TARGET_BAD_STREAK", "2"))),
+            bad_ttl_seconds=float(os.environ.get("IP_POOL_TARGET_BAD_TTL", "300")),
+        )
+        self.target_probe_interval = max(
+            0.0, float(os.environ.get("IP_POOL_TARGET_PROBE_INTERVAL", "120"))
+        )
+        self.target_probe_concurrency = max(
+            1, int(os.environ.get("IP_POOL_TARGET_PROBE_CONCURRENCY", "10"))
+        )
+        self.target_probe_timeout = max(
+            2.0, float(os.environ.get("IP_POOL_TARGET_PROBE_TIMEOUT", "8"))
+        )
+        self._target_probe_task = None
+        self._target_last_bad: Dict[str, int] = {}
 
     # Cap on distinct labels per relay map; extra keys collapse into "other".
     RELAY_LABEL_CAP = 2000
@@ -604,6 +625,7 @@ class ForwardProxyGateway:
             "nodes": len(self.relay_nodes),
             "top_accounts": top_accounts,
             "top_nodes": top_nodes,
+            "target_bad": self.target_health.bad_counts(),
         }
 
     def render_metrics(self) -> bytes:
@@ -812,6 +834,12 @@ class ForwardProxyGateway:
         attempts = 0
         last_node_name: Optional[str] = None
 
+        # 目标级软排除集 (兜底): 该目标类下探活连续失败的节点。所有 attempt 都携带,
+        # attempt 0 用临时 lease 语义 (不迁移绑定); attempt >0 已是真实失败路径,
+        # R2 持久重绑语义不变。
+        target_cls = classify_target(target_host)
+        steer_bad: set = self.target_health.bad_nodes(target_cls) if target_cls else set()
+
         for attempt in range(self.max_attempts):
             if attempt > 0 and self.retry_backoff > 0:
                 await asyncio.sleep(self.retry_backoff)
@@ -824,10 +852,27 @@ class ForwardProxyGateway:
                 tier_policy=tier_policy,
                 service=service,
                 force_rebind=force_rebind or (attempt > 0),
-                exclude_nodes=excluded,
+                exclude_nodes=excluded | steer_bad,
                 region_strict=region_strict,
                 bind_persist=bind_persist,
+                exclude_transient=(attempt == 0),
             )
+            if not lease and attempt == 0 and steer_bad:
+                # 降级: 目标类坏节点占满候选 (如整个 us-west 池对该类失联) ->
+                # 无引导重试。宁可走坏出口, 绝不 503 —— 坏出口上目标类之外的
+                # 流量仍可用, 且探活恢复后自动回到绑定节点。
+                lease = self.router.acquire_for_account(
+                    account_id=account_id,
+                    region=region,
+                    egress_type=egress_type,
+                    tier=tier,
+                    tier_policy=tier_policy,
+                    service=service,
+                    force_rebind=force_rebind,
+                    exclude_nodes=excluded,
+                    region_strict=region_strict,
+                    bind_persist=bind_persist,
+                )
             if not lease:
                 # The pool itself cannot serve this request; retrying cannot help.
                 self._record_attempts(max(attempts, 1))
@@ -1167,15 +1212,50 @@ class ForwardProxyGateway:
                 if summary["relays"]:
                     logger.info(
                         "relay summary %ss: relays=%d total=%d accounts=%d nodes=%d "
-                        "top_accounts=%s top_nodes=%s",
+                        "top_accounts=%s top_nodes=%s target_bad=%s",
                         int(self.relay_report_interval), summary["relays"],
                         summary["total"], summary["accounts"], summary["nodes"],
                         summary["top_accounts"], summary["top_nodes"],
+                        summary.get("target_bad") or {},
                     )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.warning("relay summary error: %s", exc)
+
+    async def _target_probe_loop(self):
+        """
+        目标类健康探活循环 (兜底): 每轮对每个目标类的 canary URL 探测全池健康节点。
+
+        判坏需连续 bad_streak 次失败 (tracker 内建), 一次成功立即清除。只在坏计数
+        变化时打日志 —— 稳态零输出, 故障时一条摘要, 恢复时一条摘要。
+        """
+        prober = Prober(self.storage, timeout=self.target_probe_timeout)
+        sem = asyncio.Semaphore(self.target_probe_concurrency)
+        while True:
+            await asyncio.sleep(self.target_probe_interval)
+            try:
+                healthy = [n for n in self.storage.list_nodes()
+                           if n.status == HealthStatus.HEALTHY.value]
+                for cls, url in TARGET_CLASS_CANARIES.items():
+                    async def _one(node: ProxyNode):
+                        async with sem:
+                            res = await prober.probe_target_service(node, url)
+                        self.target_health.record(node.name, cls, res.success, res.error or "")
+
+                    await asyncio.gather(*[_one(n) for n in healthy])
+                counts = self.target_health.bad_counts()
+                if counts != self._target_last_bad:
+                    logger.info(
+                        "target-health transition: bad=%s (was=%s) "
+                        "[classes: google/openai/claude, interval=%ss]",
+                        counts, self._target_last_bad, int(self.target_probe_interval),
+                    )
+                    self._target_last_bad = counts
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("target probe sweep error: %s", exc)
 
     async def start(self):
         self.server = await asyncio.start_server(self.handle_client, self.host, self.port)
@@ -1187,9 +1267,14 @@ class ForwardProxyGateway:
             self._relay_task = asyncio.create_task(self._relay_report_loop())
             logger.info("Relay summary every %ss (per-connection detail at DEBUG)",
                         int(self.relay_report_interval))
+        if self.target_probe_interval > 0:
+            self._target_probe_task = asyncio.create_task(self._target_probe_loop())
+            logger.info("Target-health probing every %ss (classes=%s, concurrency=%d)",
+                        int(self.target_probe_interval),
+                        ",".join(TARGET_CLASS_CANARIES), self.target_probe_concurrency)
 
     async def stop(self):
-        for task_attr in ("_peer_task", "_relay_task"):
+        for task_attr in ("_peer_task", "_relay_task", "_target_probe_task"):
             task = getattr(self, task_attr)
             if task:
                 task.cancel()
