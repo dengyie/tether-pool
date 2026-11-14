@@ -149,3 +149,26 @@ python3 scripts/import_standalone.py realize --group NAME
 ### 验证基线（2026-11-12）
 
 `check` 全绿（pigeonw 五层无回归 + teleapi L1/L3/L4/L5 PASS）· 出口↔固定 IP 136/139 零漂移 · 网关 `region=us-west&type=clash_proxy` 粘性 ✓ · pytest 15/15
+
+---
+
+## 七、云端 mega 桥变体（huawei-vps 单核 3012 listener · 2026-11-14 gen 扩池批次）
+
+> **适用**：云端实例（huawei-vps `/opt/ip-pool`）批量接入 http 上游。与 §六 teleapi 战例同一架构，规模验证到 **3012 http proxies + 3012 socks listeners 单 mihomo 进程**（RSS 71MB / fd 6026，2GB VPS 无压力）。gateway 仅 SOCKS5 拨号（忽略 node.protocol）→ **一切 http vendor 上游必须经 mihomo socks-bridge**。
+
+| 件 | 值 |
+|---|---|
+| systemd 单元 | `ip-pool-huawei-bridge.service`（ExecStart=`bin/mihomo -d config/huawei-bridge -f config/huawei-bridge.yaml`；Restart=always RestartSec=2；**LimitNOFILE=65535 必须**；MemoryHigh=700M/MemoryMax=900M） |
+| 桥核配置 | `config/huawei-bridge.yaml`（含 vendor 凭据，不入仓；`mihomo -t` 先验） |
+| 端口规划 | pigeonw 12053–12072 · teleapi 11101–11239 · gen 21001–24873 |
+| 节点命名 | teleapi `clash-{400+idx}-teleapi-{idx:03d}` · gen `clash-{700+idx}-gen-{idx:04d}` |
+
+### gen 批次要点（普通/数据中心代理，随时可能批量失效）
+
+1. **凭据逐 IP 归属**：共享代理源的账密是 **per-IP** 的——探测/生成配置时必须按行反查该 IP 自己的凭据对，拿别的行的会 400/407。
+2. **region 收敛防污染**：us→`us-west`、eu→`eu-west`，fault_domain=huawei-gen-bridge 独立故障域；与 pigeonw/teleapi 路由互不可见。
+3. **YAML 1.1 布尔陷阱**：国家码 `no`（挪威）会被 YAML 解析成 bool False → pydantic region 崩溃（api 起不来）。一律写成英文国名（`norway`）。
+4. **大配置先 `mihomo -t`**：3012 节点全量配置一次过校验再重启；启动失败先查 yaml 陷阱再查端口占用。
+5. **端口双绑定陷阱**：新桥 listener 段若与残留旧单元重叠（teleapi trial 单元曾占 11101/11102），mihomo **静默跳过**这两个 listener（不报错不退场）→ 旧单元退役后必须**重启新桥**补绑，并 curl 复测每个疑似端口。
+6. **探活兜底**：5 分钟全池 probe + 熔断/半开自愈对 gen 池全效（2873 节点 probe 收敛 ~2min）；vendor 限流（探测时见过 429）会使部分节点间歇 degraded，熔断自动处理，无需人工。
+7. **消费端定位**：gen 仅作池深兜底（`region=us-west/eu-west&type=clash_proxy` 可路由）；主力仍是 pigeonw/teleapi 住宅。
