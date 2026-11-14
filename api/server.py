@@ -119,8 +119,29 @@ def load_initial_nodes():
             print(f"[-] Config file {CONFIG_FILE} parsed empty; skipping node load")
             return 0
         _apply_config_settings(data)
-        nodes_data = data.get("nodes", []) or []
-        for item in nodes_data:
+    nodes_data = data.get("nodes", []) or []
+    # geo-fixed 护栏 (区域纠偏 2026-11-14): yaml 是配置源而探活是事实源 —— 带
+    # geo-fixed 标记的 gen 节点, 其 region 由探活事务按出口真实国家校正过
+    # (update_probe_result), yaml 快照可能滞后。upsert ON CONFLICT 无条件覆盖
+    # region, 重启会把滞后标签写回去 (下一轮探活虽会再纠正, 但产生错误路由窗口),
+    # 故重启加载时对这类节点直接以 DB 权威值覆盖 yaml 条目。
+    db_region_by_name = {}
+    try:
+        for row in storage.list_nodes():
+            if "geo-fixed" in (row.tags or []):
+                db_region_by_name[row.name] = (row.region, row.provider_region)
+    except Exception as e:
+        print(f"[!] geo-fixed guard skipped (list_nodes failed: {e})")
+    overridden = 0
+    for item in nodes_data:
+        db_vals = db_region_by_name.get(item.get("name"))
+        if db_vals and db_vals[0]:
+            item["region"] = db_vals[0]
+            item["provider_region"] = db_vals[1]
+            overridden += 1
+    if overridden:
+        print(f"[+] geo-fixed guard: {overridden} node(s) region taken from DB (probe is source of truth)")
+    for item in nodes_data:
             configured_tier = item.get("tier")
             score, init_tier, _ = IPQualityEvaluator.evaluate_node(
                 tags=item.get("tags", []),

@@ -169,3 +169,67 @@ def test_drift_correction_is_stable_not_flapping(storage):
     ).fetchone()[0]
     conn.close()
     assert total == 1.0
+
+
+# ---- geo-fixed 重启护栏: load_initial_nodes 以 DB 权威值覆盖 yaml 滞后 region ----
+
+def test_startup_geo_fixed_region_taken_from_db(tmp_path, monkeypatch, isolate_api_storage):
+    """yaml 快照滞后于探活纠偏时, 重启不得把旧 region 写回 (upsert ON CONFLICT
+    无条件覆盖 region, 滞后标签会产生错误路由窗口)。带 geo-fixed 标记的节点,
+    load_initial_nodes 必须以 DB 权威值覆盖 yaml 条目。"""
+    import yaml
+    import api.server
+    storage = isolate_api_storage
+
+    # DB 事实源: gen 节点已被探活纠偏为 de 并带 geo-fixed
+    db_node = ProxyNode(
+        name="clash-701-gen-0001", host="127.0.0.1", port=21001,
+        protocol="socks5h", region="de", egress_type=EgressType.CLASH_PROXY.value,
+        tags=["clash", "bridge", "http", "genproxy", "geo-fixed"],
+        relay_mode="direct_only", fault_domain="huawei-gen-bridge",
+        provider_region="de",
+    )
+    storage.upsert_node(db_node)
+    # yaml 配置源: 快照仍滞后为 us-west
+    cfg_path = tmp_path / "nodes.yaml"
+    cfg = {"nodes": [
+        {"name": "clash-701-gen-0001", "host": "127.0.0.1", "port": 21001,
+         "region": "us-west", "provider_region": "us-west",
+         "egress_type": EgressType.CLASH_PROXY.value,
+         "tags": ["clash", "bridge", "http", "genproxy"]},
+    ]}
+    cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    monkeypatch.setattr(api.server, "CONFIG_FILE", str(cfg_path))
+    monkeypatch.setattr(api.server, "PRUNE_MISSING_NODES", False)
+
+    api.server.load_initial_nodes()
+
+    n = storage.get_node("clash-701-gen-0001")
+    assert n.region == "de", "startup must not overwrite geo-fixed region with stale yaml value"
+    assert n.provider_region == "de"
+
+
+def test_startup_non_geo_fixed_node_respects_yaml(tmp_path, monkeypatch, isolate_api_storage):
+    """无 geo-fixed 标记的节点维持原语义: yaml 为权威 (运维改 region 生效)。"""
+    import yaml
+    import api.server
+    storage = isolate_api_storage
+
+    storage.upsert_node(ProxyNode(
+        name="plain-node", host="127.0.0.1", port=21002,
+        protocol="socks5h", region="us-west",
+        egress_type=EgressType.CLASH_PROXY.value, tags=["clash"],
+    ))
+    cfg_path = tmp_path / "nodes.yaml"
+    cfg = {"nodes": [
+        {"name": "plain-node", "host": "127.0.0.1", "port": 21002,
+         "region": "eu-west", "egress_type": EgressType.CLASH_PROXY.value,
+         "tags": ["clash"]},
+    ]}
+    cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    monkeypatch.setattr(api.server, "CONFIG_FILE", str(cfg_path))
+    monkeypatch.setattr(api.server, "PRUNE_MISSING_NODES", False)
+
+    api.server.load_initial_nodes()
+
+    assert storage.get_node("plain-node").region == "eu-west"
