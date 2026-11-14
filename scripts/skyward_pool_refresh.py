@@ -16,10 +16,6 @@
 import fcntl, glob, json, os, re, socket, subprocess, sys, time
 from pathlib import Path
 
-# core.storage.region_from_country (仓库根 import, cron 从任意 cwd 运行也成立)
-sys.path.insert(0, "/opt/ip-pool")
-from core.storage import region_from_country  # noqa: E402
-
 # bearer-token 型订阅 URL 即凭据, 仓库不落盘: 从 /etc/ip-pool-secrets.env 读。
 def _sub_url() -> str:
     url = os.environ.get("SKYWARD_SUB_URL", "").strip()
@@ -245,7 +241,10 @@ def main():
                 elif ip:
                     node["exit_ip"] = ip
             if cc:
-                true_region = region_from_country(cc)
+                # region 映射 (us->us-west 其余小写 ISO): 内联实现而非 import core.storage
+                # —— cron 用系统 python3, 无 pydantic, 拖 core 包会 ModuleNotFoundError。
+                c = str(cc).strip().lower()
+                true_region = ("us-west" if c == "us" else c) if len(c) == 2 and c.isalpha() else None
                 # 上游名字只精确到国家/地区, ip-api 是出口实测 —— 名字与实测都可信
                 # 时以实测为准 (香港例外: 名字 hk 而 exit 可能被识别为 cn, 保持 hk)
                 if true_region and true_region != node.get("region") and node.get("region") != "hk":
