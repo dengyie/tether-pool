@@ -216,3 +216,31 @@ python3 scripts/import_standalone.py realize --group NAME
 6. **密钥迁移 secrets.env（P0）**：`IP_POOL_SERVICE_TOKENS`/`GATEWAY_PASSWORD` 原明文写在 unit 文件里且 unit 是 **644**（任何本地用户可读）。迁移 `/etc/ip-pool-secrets.env`（600 root），unit 改 `EnvironmentFile=`。门禁回归：401/200/407/200 全对。
 7. **sub 刷新脚本二轮**：写入强制 `s1-` 前缀（裸名事故根治）；部署后 sleep 6 用 `ss -tln` 实数 listener 在位数（<预期-2 判 FAIL）；epoch 表无 node 列（SQL 绑定数不匹配会炸——`binding_epoch_state` 只有 service/epoch/changed_at）。
 8. **备份轮换兜底**：pull_deploy 保留 3 份逻辑本身正常（当日 310M 是手工 db bak 混入）；补每日 05:00 cron 兜底轮换防部署脚本不跑时堆积。
+
+## 九、pigeonw 订阅池每日刷新（2026-11-14 系统特性）
+
+> **与 §八的本质区别**：sub 池消费者是随机分配（可全量替换），pigeonw 池消费者（zcode-hub agent）**按节点编号钉节点**（`clash-301~320-pigeonw-XX` → 监听 12053–12072），刷新绝不能重建节点 —— **保号是第一设计约束**。
+
+### 架构事实（2026-11-14 核实修正）
+
+- pigeonw **不在 huawei-bridge 主核**，是独立 `pigeonw-bridge.service`（专用 mihomo，`config/pigeonw-bridge.yaml`）：20 个 `PIGEONW-0NN` http proxy → socks listeners 12053–12072（127.0.0.1）。
+- nodes.yaml：`clash-{300+idx}-pigeonw-{idx:02d}`，tier **premium**，fault_domain `huawei-pigeonw-bridge`，tags 含 `isp=`（探活回填，att/comcast 等）。
+- manifest `config/node_groups.yaml` groups.pigeonw 是账号事实源；订阅名 `United States美国 - 家宽 - 0NN` 按 NNN ↔ idx 对应。
+
+### 刷新脚本 `/opt/ip-pool/scripts/pigeonw_pool_refresh.py`（cron `35 4 * * *`，与 sub 04:30 错峰）
+
+槽位保号算法：
+1. 新条目与旧槽位 **server+port+user+pass 全同** → 原槽位零变更；
+2. **server+port 同、凭据变** → 原槽位原地换凭据（同出口轮换，编号不变）；
+3. 剩余新条目按顺序填空闲槽位（扩容监听顺延 12053 起上限 12099）；
+4. 旧槽位上游**条目消失**才退役（悬空绑定 sqlite 清理）。
+
+**关键教训——探活瞬断不淘汰**：首版用「仅活节点」参与匹配，当天 15/20 探活通过 → 5 个瞬断槽位被误退役 + 25 个绑定被清（下游 agent 的编号钉住全部悬空）。修正：**匹配用全部上游条目，探活只用于 exit_ip 回填与质量门**（存活 <3 全局拦停不部署）。修正版实跑：kept=15 changed=5 retired=0，瞬断槽位全部保号。
+
+其余安全件与 §八同款：flock 互斥 / 时间戳备份轮转 7 份 / `mihomo -t` 失败回滚 / 部署后 `ss -tln` 实听校验 / 失败 `[PIGEONW_REFRESH_FAIL]` 可 grep。
+
+### 坑
+
+1. **上游 403 要 UA**：`nodes.pigeonw.com` 拒默认 python UA → `curl -A clash-verge/1.6.6`；且 VPS 上 python urllib 直连该域 TLS 握手易超时，**用 curl 子进程拉取**（3 次重试）。
+2. **nodes.yaml 原位更新而非重建**：保留存量字段（`isp=` tags 等探活体系回写的），只覆盖 port/exit_ip/vendor_name。
+
