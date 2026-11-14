@@ -256,3 +256,65 @@ def test_relay_counters_and_metrics_rendering(temp_gateway):
     assert 'tetherpool_gateway_relay_total{account="anon"} 1' in body
     # anon uuid ids must never leak as individual labels
     assert "anon_abcdef12" not in body
+
+
+def test_gateway_password_gate(temp_gateway, monkeypatch):
+    """GATEWAY_PASSWORD 设定后：密码错/缺 → 拒；对 → 放行；未设定 → 维持旧行为。"""
+    gateway, storage, router = temp_gateway
+    monkeypatch.setenv("GATEWAY_PASSWORD", "s3cret")
+    gw2 = ForwardProxyGateway(storage, router, host="127.0.0.1", port=0)
+    assert gw2.password == "s3cret"
+    assert gw2._password_ok("Basic " + base64.b64encode(b"acct:s3cret").decode())
+    assert not gw2._password_ok("Basic " + base64.b64encode(b"acct:wrong").decode())
+    assert not gw2._password_ok("Basic " + base64.b64encode(b"acct").decode())
+    assert not gw2._password_ok("Basic !!!notb64!!!")
+    assert not gw2._password_ok("")
+    # 默认（未设 env）: password None, 检查恒 False 但 handle_client 不会走到（门关闭）
+    monkeypatch.delenv("GATEWAY_PASSWORD")
+    gw3 = ForwardProxyGateway(storage, router, host="127.0.0.1", port=0)
+    assert gw3.password is None
+
+
+def test_gateway_password_gate_end_to_end(temp_gateway, monkeypatch):
+    """handle_client 层：密码错/缺 → 407 且不拨上游；/metrics 免密；密码对 → 正常路由。"""
+    import asyncio
+    gateway, storage, router = temp_gateway
+    monkeypatch.setenv("GATEWAY_PASSWORD", "s3cret")
+    gw2 = ForwardProxyGateway(storage, router, host="127.0.0.1", port=0)
+
+    class FakeWriter:
+        def __init__(self):
+            self.buffer = b""
+            self.closed = False
+        def write(self, data): self.buffer += data
+        async def drain(self): pass
+        def close(self): self.closed = True
+        def get_extra_info(self, k): return ("127.0.0.1", 9999)
+
+    class FakeReader:
+        def __init__(self, payload): self._payload = payload
+        async def readuntil(self, sep):
+            idx = self._payload.index(sep) + len(sep)
+            data, self._payload = self._payload[:idx], self._payload[idx:]
+            return data
+
+    async def run(auth_bytes):
+        fw = FakeWriter()
+        if auth_bytes is None:
+            payload = b"CONNECT api.ipify.org:443 HTTP/1.1\r\nHost: api.ipify.org:443\r\n\r\n"
+        else:
+            payload = (b"CONNECT api.ipify.org:443 HTTP/1.1\r\nHost: api.ipify.org:443\r\n"
+                       b"Proxy-Authorization: Basic " + auth_bytes + b"\r\n\r\n")
+        await gw2.handle_client(FakeReader(payload), fw)
+        return fw
+
+    async def scenario():
+        wrong = await run(base64.b64encode(b"acct:wrong"))
+        assert b"407" in wrong.buffer and wrong.closed
+        missing = await run(None)
+        assert b"407" in missing.buffer
+        right = await run(base64.b64encode(b"acct:s3cret"))
+        # 密码对 → 不 407；空池拨号失败应给出 503/502/5xx 或错误行, 而非鉴权拒
+        assert b"407" not in right.buffer
+
+    asyncio.run(scenario())

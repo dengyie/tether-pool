@@ -5,6 +5,7 @@ Transparently maps client requests to sticky EasyTier SOCKS5 exits based on head
 
 import asyncio
 import base64
+import hmac
 import logging
 import os
 import sys
@@ -544,6 +545,10 @@ class ForwardProxyGateway:
         self.max_attempts = max(1, max_attempts)
         self.retry_backoff = max(0, retry_backoff_ms) / 1000.0
         self.attempt_timeout = max(0.1, attempt_timeout)
+        # 网关共享密码（2026-11-14 深度 review 加固）：历史上 Basic password 只是文档
+        # 约定的 "tetherpool"，网关从不校验 —— mesh 内任意进程可用任意/空密码消费全池
+        # 出口。设 GATEWAY_PASSWORD 后强制校验（空值=维持旧行为，测试/本地零成本）。
+        self.password: Optional[str] = os.environ.get("GATEWAY_PASSWORD", "").strip() or None
         # R3: one isolator per gateway; it degrades to single-node reporting for
         # domains that contain only one listener.
         self.isolator = isolator or FailureDomainIsolator(storage, router)
@@ -1017,6 +1022,21 @@ class ForwardProxyGateway:
             f"Last error: {last_err}",
         )
 
+    def _password_ok(self, auth_header: str) -> bool:
+        """Constant-shape check of the Basic password part against GATEWAY_PASSWORD.
+
+        The username half is routing metadata (account/region/...) and stays free-form;
+        only the password half is the shared secret. Header absent -> reject.
+        """
+        if not auth_header or not auth_header.lower().startswith("basic "):
+            return False
+        try:
+            decoded = base64.b64decode(auth_header[6:].strip()).decode("utf-8", "replace")
+        except Exception:
+            return False
+        presented = decoded.split(":", 1)[1] if ":" in decoded else ""
+        return hmac.compare_digest(presented, self.password or "")
+
     async def handle_client(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
         peer = client_writer.get_extra_info("peername")
         client_ip = peer[0] if peer else "127.0.0.1"
@@ -1047,6 +1067,22 @@ class ForwardProxyGateway:
 
             # 2. Extract routing constraints
             route_ctx = self._extract_routing_headers(headers_dict, client_ip)
+
+            # 2a. Shared-password gate (2026-11-14 review hardening): when
+            # GATEWAY_PASSWORD is set, every request (CONNECT / plain HTTP / headers-only
+            # routing) must present it in Proxy-Authorization. /metrics exempt so
+            # Prometheus scrapers need no proxy credentials.
+            if self.password and not (method.upper() == "GET" and target.split("?")[0] == "/metrics"):
+                if not self._password_ok(headers_dict.get("proxy-authorization", "")):
+                    logger.warning("gateway auth rejected: peer=%s target=%s", client_ip, target[:80])
+                    if method.upper() == "CONNECT":
+                        resp = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"tetherpool\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    else:
+                        resp = b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Type: text/plain\r\nContent-Length: 16\r\nConnection: close\r\n\r\nauth required\r\n\r\n"
+                    client_writer.write(resp)
+                    await client_writer.drain()
+                    client_writer.close()
+                    return
 
             # Internal Prometheus endpoint: GET /metrics never proxies; it reports the
             # gateway's own per-account relay counters (ops hotfix carried over from prod).
