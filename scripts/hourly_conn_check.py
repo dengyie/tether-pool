@@ -106,6 +106,12 @@ def main():
         oks, details = 0, []
         for name, port, region, _ in rows:
             ok, detail = socks5_probe("127.0.0.1", port, region)
+            if not ok:
+                # 一次重试: cloud 池等共享出口的节点会集体撞 ip-api 对该出口 IP
+                # 的 45/min 限流窗口 (2026-11-15 首跑 0/5 复盘, 2s 后 15/15 OK),
+                # 单轮瞬时失败不算故障。
+                time.sleep(2)
+                ok, detail = socks5_probe("127.0.0.1", port, region)
             oks += ok
             details.append(f"{name}:{'OK' if ok else detail}")
         tag = "OK" if oks > 0 else "FAIL"
