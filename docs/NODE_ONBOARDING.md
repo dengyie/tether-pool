@@ -172,3 +172,33 @@ python3 scripts/import_standalone.py realize --group NAME
 5. **端口双绑定陷阱**：新桥 listener 段若与残留旧单元重叠（teleapi trial 单元曾占 11101/11102），mihomo **静默跳过**这两个 listener（不报错不退场）→ 旧单元退役后必须**重启新桥**补绑，并 curl 复测每个疑似端口。
 6. **探活兜底**：5 分钟全池 probe + 熔断/半开自愈对 gen 池全效（2873 节点 probe 收敛 ~2min）；vendor 限流（探测时见过 429）会使部分节点间歇 degraded，熔断自动处理，无需人工。
 7. **消费端定位**：gen 仅作池深兜底（`region=us-west/eu-west&type=clash_proxy` 可路由）；主力仍是 pigeonw/teleapi 住宅。
+
+---
+
+## 八、订阅型节点组（sub 池 · 2026-11-14 免费订阅批次）
+
+> **适用**：用户给的订阅链接（免费池/机场分享），内容**每日时变**。与 §七同壳（huawei-bridge），但节点以 `s1-`/`s2-` 前缀进桥核、`clash-5xx-sub-xxx` 进 nodes.yaml，刷新脚本可整体替换、不碰其他组。
+
+### 架构与刷新
+
+| 件 | 值 |
+|---|---|
+| 桥核端口段 | 25001+（sub 专用；gen 21001–24873 / teleapi 11101–11239 / pigeonw 12053–12072 之外） |
+| fault_domain | `huawei-sub-bridge`（独立故障域） |
+| region 映射 | 名字国家码 `us`→us-west，其余国家码直作 region（hk/de/fr/nl/…） |
+| 刷新脚本 | `/opt/ip-pool/scripts/sub_pool_refresh.py`（拉取→临时 mihomo 探活→**全量替换** sub 前缀条目→`mihomo -t` 不过自动回滚→重启三服务） |
+| cron | `30 4 * * *` root，日志 `/var/log/sub_pool_refresh.log` |
+| tier/tags | standard；tags 含 `sub` + 协议类型 + 商宽→`residential`/机房→`datacenter` |
+
+### 免费订阅探活判死标准（2026-11-14 实战沉淀）
+
+1. **CONNECT 成功但回包恒空 = 判死**（换 google/明文目标复测仍空 → 上游劫持/吞请求型，无使用价值）。本批 152 个里 72 个属此类。
+2. ** socks 探活目标用明文 http**（ip-api.com/json）：免费代理 TLS 指纹一塌糊涂，120/152 在 TLS 握手层 SSL EOF，明文目标才能区分「代理死」vs「TLS 被拒」。
+3. **重名防御**：订阅节点可能重名（mihomo duplicate name 直接拒载）→ 生成时统一加来源前缀 `s1-/s2-/s3-`。
+4. **URI 订阅转换**：ssr/vmess/vless 行需先转 clash schema（工具已在 sub3 转换中验证，vmess 记得 alterId、vless 记得 network/ws-opts）。
+5. **YAML 1.1 布尔陷阱同样适用**：任何国家码 region（如 `no`）写脚本前先 str 化。
+6. **免费池质量预期**：本批 78/152 → 59-78 存活波动；探活收敛后 59/59 healthy。免费节点当兜底池用，熔断自动处理日常死亡。
+
+### 中转（dialer-proxy）判定
+
+华为云境内→上游直拨无跨 GFW RST（与 Mac §六场景相反），**本批未挂中转**。判定法：探活若出现大量 `TimeoutError`/连接重置而节点 vendor 侧正常，才按 §六 `relay` 流程接 AWS 中转。
