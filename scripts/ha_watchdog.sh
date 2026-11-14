@@ -1,6 +1,6 @@
 #!/bin/bash
 # TetherPool HA 看门狗 (2026-11-14 深度修复): 分级处置, 一次自动重启, 持续异常打 [HA_ALERT].
-# 判据: ① 三服务 active ② 桥核 listener 数 >= 3000 ③ api /health ④ 根分区 <90% ⑤ 探活新鲜度 <15min
+# 判据: ① 三服务 active ② 桥核 listener 数 >= 3000 ③ api /health ④ 根分区 <90% ⑤ 探活新鲜度 <30min
 STATE=/tmp/ip_pool_watchdog_state
 declare -A FAIL
 
@@ -20,16 +20,31 @@ curl -sf -m 8 http://127.0.0.1:9100/health > /dev/null || FAIL[api_health]=1
 U=$(df --output=pcent / | tail -1 | tr -dc 0-9)
 if [ "${U:-0}" -ge 90 ]; then FAIL[disk]="$U"; fi
 # ⑤ 探活新鲜度 (api 死循环/探活线程挂死时服务仍 active 的盲区)
-LAST=$(journalctl -u ip-pool-api --since "15 min ago" --no-pager 2>/dev/null | grep -c "probe finished")
-if [ "${LAST:-0}" -eq 0 ]; then FAIL[probe_stale]=1; fi
+# 窗口 30min 且不触发重启 (二轮 review): 全池降级时单轮 sweep 可达 ~15-20min
+# (3000 节点 × 重试 + 超时), 15min 窗口 + 重启会造成 降级->重启->更慢->循环重启;
+# 挂死的探活循环 30min 内必无日志, 足以区分。且重启 api 无法治愈降级,
+# 只会清空内存态 (target_health 坏集缓存等) 恶化恢复 —— 故本项只告警。
+LAST=$(journalctl -u ip-pool-api --since "30 min ago" --no-pager 2>/dev/null | grep -c "probe finished")
+if [ "${LAST:-0}" -eq 0 ]; then FAIL[probe_stale_alert_only]=1; fi
 
 if [ "${#FAIL[@]}" -eq 0 ]; then
   [ -f "$STATE" ] && rm -f "$STATE"
   exit 0
 fi
 
+# probe_stale 只告警不重启 (见 ⑤ 注释): 从处置集里摘掉
+DISPOSITION_FAIL=()
+for k in "${!FAIL[@]}"; do
+  [ "$k" = "probe_stale_alert_only" ] || DISPOSITION_FAIL+=("$k=${FAIL[$k]}")
+done
+
+if [ "${#DISPOSITION_FAIL[@]}" -eq 0 ]; then
+  echo "[HA_ALERT] probe_stale (no 'probe finished' in 30min) — sweep slow or probe loop degraded; NOT restarting (degradation restart-loop guard)"
+  exit 0
+fi
+
 KEY=""
-for k in "${!FAIL[@]}"; do KEY="$KEY$k=${FAIL[$k]} "; done
+for k in "${DISPOSITION_FAIL[@]}"; do KEY="$KEY$k "; done
 PREV=$(cat "$STATE" 2>/dev/null)
 if [ -z "$PREV" ]; then
   echo "$KEY" > "$STATE"

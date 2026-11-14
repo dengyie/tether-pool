@@ -52,7 +52,9 @@ TetherPool 对外提供两个核心服务端口（部署于中心节点，如 Ea
   ```
   http://<account_id>[__param1_value][__param2_value]:<password>@10.144.144.9:9101
   ```
-  *(默认密码固定为 `tetherpool`)*
+  *(密码来自网关侧 `GATEWAY_PASSWORD` 环境变量；消费方 SDK/adapter 统一经
+  `adapters.tetherpool_client.gateway_password()` 读取，默认回退 `tetherpool`。
+  线上启用密码门后，SDK/adapter 必须在消费方环境配置 `GATEWAY_PASSWORD`)*
 
 #### 支持的参数化指令表：
 | 参数标识 | 可选值 | 说明 | 示例 |

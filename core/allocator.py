@@ -20,6 +20,7 @@ from core.models import (
 from core.storage import Storage
 from core.locks import BINDING_WRITE_LOCK
 from core.ban import node_isp, ip_in_excluded_nets, collect_ban_exclusions
+from adapters.tetherpool_client import gateway_password
 
 
 class ConsistentHashRing:
@@ -182,7 +183,7 @@ class AllocationEngine:
             parts.append(f"service_{service}")
         auth_user = "__".join(parts)
 
-        return f"{scheme}://{auth_user}:tetherpool@{netloc}"
+        return f"{scheme}://{auth_user}:{gateway_password()}@{netloc}"
 
     def batch_allocate(
         self,

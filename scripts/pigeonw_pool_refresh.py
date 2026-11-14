@@ -15,7 +15,6 @@
 部署后 ss -tln 实听校验 / 失败 [PIGEONW_REFRESH_FAIL] 可 grep 告警。
 """
 import fcntl, glob, json, os, re, socket, subprocess, sys, time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 # bearer-token 型订阅 URL 即凭据, 仓库不落盘: 从 /etc/ip-pool-secrets.env 读。
@@ -89,67 +88,13 @@ def fetch_and_parse():
 
 
 def probe_via_listeners(proxies):
-    """临时 mihomo 核 + 明文 ip-api 探活, 返回 [(idx, proxy, exit_ip)] (仅活节点)."""
-    import yaml
-    listeners = [{"name": f"probe-{i:03d}", "type": "socks", "port": PROBE_POOL + i,
-                  "listen": "127.0.0.1", "proxy": p["name"]} for i, p in enumerate(proxies)]
-    cfg = {"proxies": proxies, "listeners": listeners, "mode": "global",
-           "log-level": "warning", "ipv6": False, "allow-lan": False,
-           "external-controller": ""}
-    # datadir 独立 (sub 刷新脚本共享 /tmp/mihomo-probe 曾有并发写坏 geo 缓存风险)
-    probe_dir = Path("/tmp/mihomo-probe-pigeonw")
-    probe_dir.mkdir(exist_ok=True)
-    tmp = probe_dir / "probe.yaml"
-    fd = os.open(str(tmp), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False))
-    proc = subprocess.run(["/opt/ip-pool/bin/mihomo", "-t", "-d", str(probe_dir), "-f", str(tmp)],
-                          capture_output=True, text=True)
-    if "successful" not in proc.stdout + proc.stderr:
-        print("probe config invalid:", proc.stdout[-300:], proc.stderr[-300:], file=sys.stderr)
-        return []
-    core = subprocess.Popen(["/opt/ip-pool/bin/mihomo", "-d", str(probe_dir), "-f", str(tmp)],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(4)
+    """临时 mihomo 核 + 明文 ip-api 探活, 返回 [(idx, proxy, exit_ip)] (仅活节点).
 
-    def probe(i_p):
-        i, p = i_p
-        try:
-            s = socket.create_connection(("127.0.0.1", PROBE_POOL + i), timeout=10)
-            s.sendall(b"\x05\x01\x00")
-            if s.recv(2) != b"\x05\x00":
-                return None
-            ipb = bytes(int(x) for x in "208.95.112.1".split("."))
-            s.sendall(b"\x05\x01\x00\x01" + ipb + b"\x00\x50")
-            if s.recv(10)[1] != 0:
-                return None
-            s.sendall(b"GET /json HTTP/1.0\r\nHost: ip-api.com\r\n\r\n")
-            s.settimeout(6)
-            data = b""
-            while True:
-                c = s.recv(4096)
-                if not c:
-                    break
-                data += c
-                if len(data) > 8192:
-                    break
-            body = data.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in data else b""
-            j = json.loads(body)
-            if j.get("query"):
-                return (i, p, j["query"])
-        except Exception:
-            return None
-        return None
-
-    try:
-        with ThreadPoolExecutor(max_workers=20) as ex:
-            return [r for r in ex.map(probe, enumerate(proxies)) if r]
-    finally:
-        core.terminate()
-        try:
-            core.wait(timeout=5)
-        except Exception:
-            core.kill()
+    F9 (二轮 review): 实现与 sub 刷新共享, 抽到 scripts/bridge_probe.py。
+    datadir 独立 (共享 /tmp/mihomo-probe 曾有并发写坏 geo 缓存风险)。"""
+    from bridge_probe import probe_via_listeners as _shared
+    return _shared(proxies, probe_pool=PROBE_POOL, probe_dir="/tmp/mihomo-probe-pigeonw",
+                   mode="global", external_controller="", allow_lan=False, max_workers=20)
 
 
 def slot_key(idx):

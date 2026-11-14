@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.storage import Storage
 from core.router import Router
 from core.models import EgressType
+from adapters.tetherpool_client import gateway_password
 
 
 class PlaywrightProxyManager:
@@ -75,6 +76,6 @@ class PlaywrightProxyManager:
             "proxy": {
                 "server": "http://127.0.0.1:9101",
                 "username": username,
-                "password": "tetherpool",
+                "password": gateway_password(),
             },
         }

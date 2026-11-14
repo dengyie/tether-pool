@@ -1329,6 +1329,12 @@ class Storage:
             cur = conn.execute("DELETE FROM binding_changes WHERE created_at < ?", (cutoff,))
             return cur.rowcount
 
+    def prune_expired_cooldowns(self) -> int:
+        """ip_cooldowns 保留窗 (#8, 二轮 review): 过期行原先只在注册分配路径
+        (_acquire_for_registration) 清理 —— 不跑注册业务的池子无限膨胀。挂进
+        prune_event_tables 随每轮探活清扫。"""
+        return self.clean_expired_cooldowns()
+
     def prune_event_tables(self, keep_days: int = 7) -> Dict[str, int]:
         """Applies the same retention window to every append-only event table.
 
@@ -1341,6 +1347,7 @@ class Storage:
             "battery_events": self.prune_battery_events(keep_days),
             "binding_changes": self.prune_binding_changes(keep_days),
             "ban_events": self.prune_ban_events(keep_days=30),
+            "ip_cooldowns": self.prune_expired_cooldowns(),
         }
 
     def mark_nodes_missing_as_dead(self, keep_names: List[str]) -> List[str]:

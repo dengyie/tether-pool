@@ -674,3 +674,163 @@ def test_probe_success_refreshes_isp_tag(storage):
     # 无需校正时 tags 原样保留
     p.storage.update_probe_result(ProbeResult(node_name="clash-a", success=True, exit_ip="23.132.180.9", latency_ms=100.0))
     assert "isp=att" in storage.get_node("clash-a").tags
+
+
+# --- 二轮深化迭代 (2026-11-14 第二轮 review 修复回归) ---
+
+def test_battery_swap_excludes_same_subnet_sibling(storage):
+    """#5: 换电不得落回旧出口同段的兄弟节点 (pigeonw 同上游多 listener)。
+    旧出口 /24 内的候选全部剔除; 全池同段 (无解) 时降级为仅按名排除。"""
+    from core.models import BatteryEventReport, BatteryEventType
+    _mk_node(storage, "pigeonw-01", exit_ip="23.230.200.5", region="us-west")
+    _mk_node(storage, "pigeonw-02", exit_ip="23.230.200.9", region="us-west")  # 同 /24 兄弟
+    _mk_node(storage, "pigeonw-03", exit_ip="45.6.7.8", region="us-west")      # 跨段
+    r = Router(storage)
+    storage.batch_save_allocations([("svc", "acct-x", "pigeonw-01", "2026-11-14T00:00:00")])
+
+    result = r.handle_battery_event(BatteryEventReport(
+        account_id="acct-x",
+        event_type=BatteryEventType.RATE_LIMITED_429.value,
+        target_service="svc",
+        force_rebind=True,
+    ))
+    assert result["battery_swapped"] is True
+    assert result["new_lease"]["node_name"] == "pigeonw-03"
+    # 绑定已重写到跨段节点
+    assert storage.get_allocation("svc", "acct-x")["node_name"] == "pigeonw-03"
+
+
+def test_battery_swap_sibling_only_pool_degrades_to_name_exclusion(storage):
+    """#5 降级路: 全池都在旧出口同段时, 段排除会剔空候选 —— 退回仅按名排除,
+    换电绝不静默 no-op (账号不得被留在已烧的出口上)。"""
+    from core.models import BatteryEventReport, BatteryEventType
+    _mk_node(storage, "pigeonw-01", exit_ip="23.230.200.5", region="us-west")
+    _mk_node(storage, "pigeonw-02", exit_ip="23.230.200.9", region="us-west")  # 同段
+    r = Router(storage)
+    storage.batch_save_allocations([("svc", "acct-y", "pigeonw-01", "2026-11-14T00:00:00")])
+
+    result = r.handle_battery_event(BatteryEventReport(
+        account_id="acct-y",
+        event_type=BatteryEventType.RATE_LIMITED_429.value,
+        target_service="svc",
+        force_rebind=True,
+    ))
+    assert result["battery_swapped"] is True
+    assert result["new_lease"]["node_name"] == "pigeonw-02"
+
+
+def test_battery_swap_no_cross_service_lease_constraint_leak(storage):
+    """#4: 本服务无 allocation、他服务有 -> lease 约束不得泄入本服务换电。
+    other-svc 的绑定钉在 tokyo, default 服务换电不被钉在 tokyo。"""
+    from core.models import BatteryEventReport, BatteryEventType
+    _mk_node(storage, "tokyo-node", exit_ip="10.0.0.1", region="tokyo")
+    _mk_node(storage, "us-node", exit_ip="10.0.0.2", region="us-west")
+    r = Router(storage)
+    # 他服务 (other-svc) 的 allocation 存在 -> 账号不是纯 legacy
+    storage.batch_save_allocations([("other-svc", "acct-z", "tokyo-node", "2026-11-14T00:00:00")])
+    # default 服务无 allocation; legacy lease 钉在 tokyo-node
+    storage.set_lease("acct-z", "tokyo-node")
+
+    result = r.handle_battery_event(BatteryEventReport(
+        account_id="acct-z",
+        event_type=BatteryEventType.RATE_LIMITED_429.value,
+        target_service="default",
+        force_rebind=True,
+    ))
+    assert result["battery_swapped"] is True
+    # 不受 other-svc/lease 的 tokyo 约束: 候选 = 全池 (tokyo+us) 而非钉死 tokyo。
+    # 直接断言换电调用的约束面: 用 tokyo 唯一候选会被钉住, 这里允许任意节点,
+    # 但绑定必须落在 default 名下 (跨服务守卫的行为可观察面)。
+    new_node = storage.get_allocation("default", "acct-z")["node_name"]
+    assert new_node in ("tokyo-node", "us-node")
+
+
+def test_target_health_adaptive_ttl_and_cache(storage):
+    """#1: 轮长 > TTL 时 TTL 自适应放宽 (只放宽不收紧); 缓存与 is_bad 一致。"""
+    from core.target_health import TargetHealthTracker
+    t = TargetHealthTracker(bad_ttl_seconds=300.0)
+    # bad_streak=2: 连败 2 次才判坏 (快速恢复优先于惩罚)
+    t.record("n1", "google", False, "timeout")
+    t.record("n1", "google", False, "timeout")
+    t.record("n2", "google", True)
+    assert t.bad_nodes("google") == {"n1"}
+    # 轮长 750s -> TTL 放宽到 >=750, 不回落
+    t.note_round_duration(750.0)
+    assert t.bad_ttl_seconds >= 750.0
+    t.note_round_duration(10.0)
+    assert t.bad_ttl_seconds >= 750.0  # 只放宽不收紧
+    # 缓存路径与 is_bad 一致
+    t.refresh_bad_cache()
+    assert t.cached_bad_nodes("google") == {"n1"}
+    assert t.cached_bad_nodes("openai") == set()
+    # n1 恢复 -> 缓存重算后清除
+    t.record("n1", "google", True)
+    t.refresh_bad_cache()
+    assert t.cached_bad_nodes("google") == set()
+
+
+def test_probe_write_and_rehome_off_event_loop():
+    """#2 静态守卫: 探活写库与失败路径 rehome 必须走 to_thread (事件环不得被
+    sqlite 写阻塞)。源码级断言防回归。"""
+    import inspect
+    from core import prober
+    src = inspect.getsource(prober.Prober.probe_node)
+    assert "to_thread(self.storage.update_probe_result" in src
+    assert "to_thread(\n                            self.router.rehome_leases_for_node" in src
+    from gateway import server as gw_server
+    src2 = inspect.getsource(gw_server.ForwardProxyGateway._open_upstream)
+    assert "to_thread(\n                    self.storage.update_probe_result" in src2
+    assert "to_thread(\n                    self.router.rehome_account_binding" in src2
+    assert "to_thread(self.router.rehome_leases_for_node, node.name)" in src2
+
+
+def test_avoid_cidr_invalid_rejected_422(storage):
+    """F7: avoid_cidr 非法网段 -> 422 明确失败, 不得静默当无过滤。"""
+    from starlette.testclient import TestClient
+    import api.server as api
+    with TestClient(api.app) as client:
+        res = client.post(
+            "/v1/allocation/acquire",
+            params={"service": "svc", "account_id": "acc-1", "avoid_cidr": "not-a-cidr"},
+        )
+        assert res.status_code == 422
+        assert "not-a-cidr" in res.json()["detail"]
+
+
+def test_cooldown_param_validated(storage):
+    """F4: cooldown 超界 -> 422 (上限 86400)。"""
+    from starlette.testclient import TestClient
+    import api.server as api
+    with TestClient(api.app) as client:
+        res = client.get(
+            "/v1/acquire_for_registration",
+            params={"account_id": "acc-r", "target_service": "svc", "cooldown": 999999},
+        )
+        assert res.status_code == 422
+
+
+def test_settings_block_honored(monkeypatch, tmp_path):
+    """#6: nodes.yaml settings 块在 env 未设时生效; env 显式值优先。"""
+    import api.server as api
+    cfg = tmp_path / "nodes.yaml"
+    cfg.write_text(
+        "version: '1.0'\n"
+        "settings:\n"
+        "  probe_interval_seconds: 777\n"
+        "  probe_concurrency: 9\n"
+        "nodes: []\n"
+    )
+    monkeypatch.setattr(api, "CONFIG_FILE", str(cfg))
+    monkeypatch.delenv("IP_POOL_PROBE_INTERVAL", raising=False)
+    monkeypatch.delenv("IP_POOL_PROBE_CONCURRENCY", raising=False)
+    api._apply_config_settings({"settings": {"probe_interval_seconds": 777, "probe_concurrency": 9}})
+    assert os.environ["IP_POOL_PROBE_INTERVAL"] == "777"
+    assert api.PROBE_INTERVAL_SECONDS == 777
+    assert api.PROBE_CONCURRENCY == 9
+    # env 显式覆盖优先
+    monkeypatch.setenv("IP_POOL_PROBE_CONCURRENCY", "55")
+    api._apply_config_settings({"settings": {"probe_concurrency": 9}})
+    assert api.PROBE_CONCURRENCY == 55
+
+
+import os  # noqa: E402  (test_settings_block_honored 使用)

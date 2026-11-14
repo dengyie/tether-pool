@@ -69,6 +69,26 @@ class TargetHealthTracker:
         self.bad_ttl_seconds = bad_ttl_seconds
         # (node, class) -> {"window": deque(maxlen=4), "ts": float, "err": str}
         self._state: Dict[Tuple[str, str], Dict] = {}
+        self._bad_cache: Dict[str, Set[str]] = {}
+
+    def note_round_duration(self, seconds: float) -> None:
+        """TTL 自适应: TTL 必须盖住一整轮探活 + 间隙, 否则轮尾记录在下一轮判定时
+        已过 TTL -> bad 集恒空, steering 静默失效 (二轮 review: 3000 节点 × 3 类 ×
+        并发 10, 轮长可达 750s+, 远超默认 TTL 300s)。只放宽不收紧 (人工调大的 env 生效)。"""
+        if seconds > self.bad_ttl_seconds:
+            self.bad_ttl_seconds = seconds * 1.5
+
+    def refresh_bad_cache(self) -> None:
+        """每轮探活结束重算一次坏集缓存; 热路径 (_open_upstream) 读缓存,
+        避免每请求遍历全部 (node, class) 条目的 O(N) 扫描。"""
+        self._bad_cache = {}
+        for (node, cls) in list(self._state):
+            if self.is_bad(node, cls):
+                self._bad_cache.setdefault(cls, set()).add(node)
+
+    def cached_bad_nodes(self, cls: str) -> Set[str]:
+        """热路径专用: 读最近一轮的预计算坏集 (无锁, 轮内新鲜度足够)。"""
+        return self._bad_cache.get(cls) or set()
 
     def record(self, node_name: str, cls: str, ok: bool, error: str = "", now: Optional[float] = None) -> None:
         now = time.time() if now is None else now

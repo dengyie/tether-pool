@@ -337,15 +337,16 @@ http://<account_id>:<gateway_password>@<gateway_host>:9101
 - **Query 参数**：
   - `account_id` (必需)
   - `target_service` (必需)
-  - `cooldown_seconds` (可选, 默认 `1800`)
+  - `cooldown` (可选, 默认 `1800`, 范围 `0-86400`)
+  - `region` / `egress_type` / `tier` (可选偏好过滤)
 - **成功响应**：`200 OK` (含 `cooled_until` 字段)
 
 ---
 
 ### 3. 重置熔断器 (Circuit Reset)
 - **方法**：`POST /v1/circuit/reset`
-- **Query 参数**：`node_name` (可选，不传则全池重置)
-- **说明**：手动将 `dead` 状态节点重置为 `unprobed` 并清除失败计数。
+- **Query 参数**：`node_name` (必需)
+- **说明**：手动将指定节点的熔断状态重置回健康并清除失败计数。
 
 ---
 
@@ -360,8 +361,8 @@ http://<account_id>:<gateway_password>@<gateway_host>:9101
 
 ### 1. 触发全量并发探测 (Trigger Probe Sweep)
 - **方法**：`POST /v1/probe`
-- **Query 参数**：`concurrency` (int, 可选, 默认 `25`, 建议最高 `40`)
-- **说明**：异步非阻塞并发探活全池节点（内置并发防重入锁保护）。
+- **Query 参数**：`force` (bool, 可选, 默认 `false`；跳过熔断冷却强制探活 DEAD 节点, 用于桥核重启后快速恢复)
+- **说明**：异步非阻塞并发探活全池节点（15s 窗口合并重复触发 + `_probe_pending` 单飞保护, 并发度由 `IP_POOL_PROBE_CONCURRENCY` env 控制）。
 
 ---
 

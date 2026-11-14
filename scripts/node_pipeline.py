@@ -44,6 +44,10 @@ NODES_YAML = PROJECT / "config" / "nodes.yaml"
 START_SH = PROJECT / "start.sh"
 CONTROL = "http://127.0.0.1:9100"
 GATEWAY = "http://127.0.0.1:9101"
+# 网关密码从环境读取 (F2, 二轮 review): 线上启用 GATEWAY_PASSWORD 后, verify
+# 阶段硬编码 "x" 会全量 407, 网关路由检查形同虚设。GATEWAY_PASSWORD 未设时
+# 回退 "x" (密码门未开时该值被网关忽略, 不影响本地 dev)。
+GATEWAY_PASSWORD = os.environ.get("GATEWAY_PASSWORD") or "x"
 VERGE_DIR = Path.home() / "Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
 SCRIPT_JS = VERGE_DIR / "profiles" / "Script.js"
 MERGE_YAML = VERGE_DIR / "profiles" / "Merge.yaml"
@@ -579,7 +583,7 @@ def cmd_verify(args):
         def gw(user):
             try:
                 r = subprocess.run(
-                    ["curl", "-s", "-x", GATEWAY, "-U", f"{user}:x", PROBE_URL, "--max-time", "35"],
+                    ["curl", "-s", "-x", GATEWAY, "-U", f"{user}:{GATEWAY_PASSWORD}", PROBE_URL, "--max-time", "35"],
                     capture_output=True, text=True, timeout=40)
                 return r.stdout.strip() if r.returncode == 0 else ""
             except Exception:  # noqa: BLE001

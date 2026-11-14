@@ -5,10 +5,18 @@ Supports batch account allocation, zero-config parametric gateway URLs, and batt
 """
 
 import json
+import os
 import urllib.request
 import urllib.error
 from urllib.parse import urlparse, urlencode, quote
 from typing import List, Dict, Optional, Any
+
+
+def gateway_password() -> str:
+    """网关密码统一从 GATEWAY_PASSWORD 读取 (F1, 二轮 review): 硬编码默认值在
+    线上启密码门后必然 407。未配置 env 时保留 'tetherpool' 以兼容本地无密码门
+    开发环境 (密码门未开时密码值被忽略)。"""
+    return os.environ.get("GATEWAY_PASSWORD") or "tetherpool"
 
 
 class TetherPoolClient:
@@ -180,7 +188,7 @@ class TetherPoolClient:
             parts.append(f"service_{service}")
         auth_user = "__".join(parts)
 
-        return f"{scheme}://{auth_user}:tetherpool@{netloc}"
+        return f"{scheme}://{auth_user}:{gateway_password()}@{netloc}"
 
     # --- Battery Lifecycle & Self-Healing ---
 

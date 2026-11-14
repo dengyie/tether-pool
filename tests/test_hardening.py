@@ -319,6 +319,8 @@ def test_prune_event_tables_bounds_every_append_only_table(storage):
     # ban_events (ban-aware allocation 2026-11-14) is append-only too: same window.
     storage.record_ban("svc", "acc-ret", "ret-node", "198.51.100.7", None,
                        "edge_405_html", {}, 0)
+    # ip_cooldowns (#8, 二轮 review): 过期行也随 prune_event_tables 清扫。
+    storage.add_ip_cooldown("198.51.100.7", "svc", "ret-node", cooldown_seconds=-1)
 
     pruned = storage.prune_event_tables(keep_days=0)
 
@@ -328,6 +330,7 @@ def test_prune_event_tables_bounds_every_append_only_table(storage):
         "battery_events": 1,
         "binding_changes": 1,
         "ban_events": 0,  # 固定 30 天窗 (归因审计数据), 不随 keep_days=0 清空
+        "ip_cooldowns": 1,  # 已过期 (-1s) 的冷却行被清走
     }
     assert storage.prune_ban_events(keep_days=0) == 1
     with storage._get_conn() as conn:

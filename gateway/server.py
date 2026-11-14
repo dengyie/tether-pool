@@ -864,7 +864,9 @@ class ForwardProxyGateway:
         # attempt 0 用临时 lease 语义 (不迁移绑定); attempt >0 已是真实失败路径,
         # R2 持久重绑语义不变。
         target_cls = classify_target(target_host)
-        steer_bad: set = self.target_health.bad_nodes(target_cls) if target_cls else set()
+        # 热路径读预计算缓存 (二轮 review): bad_nodes() 每请求 O(N) 全表扫描,
+        # 缓存由探活循环每轮 refresh, 轮内新鲜度足够 (TTL 自适应覆盖轮长)。
+        steer_bad: set = self.target_health.cached_bad_nodes(target_cls) if target_cls else set()
 
         for attempt in range(self.max_attempts):
             if attempt > 0 and self.retry_backoff > 0:
@@ -941,11 +943,15 @@ class ForwardProxyGateway:
                 last_err = exc
                 excluded.add(node.name)
 
-                _, event = self.storage.update_probe_result(ProbeResult(
-                    node_name=node.name,
-                    success=False,
-                    error=f"gateway_connect_failed: {exc}"[:120],
-                ))
+                # 阻塞 sqlite 写移出事件环 (二轮 review #2): 失败路径在 3000 并发下
+                # 每次写库都是一次全事件环停顿; rehome 内部含写锁与多表事务, 同理。
+                _, event = await asyncio.to_thread(
+                    self.storage.update_probe_result, ProbeResult(
+                        node_name=node.name,
+                        success=False,
+                        error=f"gateway_connect_failed: {exc}"[:120],
+                    )
+                )
 
                 # R3: a connection-layer failure is a host-level signal, not a port-level
                 # one. The isolator decides whether this collapses the whole domain, but
@@ -973,7 +979,8 @@ class ForwardProxyGateway:
                     and self.router
                 ):
                     try:
-                        self.router.rehome_leases_for_node(node.name)
+                        # 同 #2: rehome 含写锁事务, 移出事件环
+                        await asyncio.to_thread(self.router.rehome_leases_for_node, node.name)
                     except Exception as rehome_err:
                         print(f"[-] Error rehoming leases for {node.name} on gateway failure: {rehome_err}")
 
@@ -991,7 +998,9 @@ class ForwardProxyGateway:
         rehome = {"rehomed": False, "reason": "no_attempts"}
         if last_node_name and self.router:
             try:
-                rehome = self.router.rehome_account_binding(
+                # rehome 含 BINDING_WRITE_LOCK + 多表写事务, 同样移出事件环
+                rehome = await asyncio.to_thread(
+                    self.router.rehome_account_binding,
                     account_id=account_id,
                     failed_node_name=last_node_name,
                     service=service,
@@ -1322,6 +1331,7 @@ class ForwardProxyGateway:
         sem = asyncio.Semaphore(self.target_probe_concurrency)
         while True:
             await asyncio.sleep(self.target_probe_interval)
+            round_start = time.monotonic()
             try:
                 healthy = [n for n in self.storage.list_nodes()
                            if n.status == HealthStatus.HEALTHY.value]
@@ -1337,11 +1347,16 @@ class ForwardProxyGateway:
                     # return_exceptions: 单个探测异常不得吞掉本轮其余结果 (un-awaited 孤儿任务教训)
                     await asyncio.gather(*[_one(n) for n in healthy], return_exceptions=True)
                 counts = self.target_health.bad_counts()
+                # TTL 自适应 (二轮 review): 轮长 > TTL 时 bad 记录在下一轮判定前就
+                # 过期, steering 恒空。按实测轮长放宽 TTL, 并重算热路径坏集缓存。
+                self.target_health.note_round_duration(time.monotonic() - round_start)
+                self.target_health.refresh_bad_cache()
                 if counts != self._target_last_bad:
                     logger.info(
                         "target-health transition: bad=%s (was=%s) "
-                        "[classes: google/openai/claude, interval=%ss]",
+                        "[classes: google/openai/claude, interval=%ss, round=%.0fs]",
                         counts, self._target_last_bad, int(self.target_probe_interval),
+                        time.monotonic() - round_start,
                     )
                     self._target_last_bad = counts
             except asyncio.CancelledError:

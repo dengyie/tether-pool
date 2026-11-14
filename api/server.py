@@ -55,6 +55,8 @@ PROBE_INTERVAL_SECONDS = int(os.environ.get("IP_POOL_PROBE_INTERVAL", "300"))
 # 25 并发会把死节点多的轮次拖到 2.5 分钟以上。可用 env 调回保守值。
 PROBE_CONCURRENCY = int(os.environ.get("IP_POOL_PROBE_CONCURRENCY", "50"))
 PROBE_HISTORY_KEEP_DAYS = int(os.environ.get("IP_POOL_PROBE_HISTORY_KEEP_DAYS", "7"))
+# Prober 每次拨号的超时 (settings.probe_timeout_seconds / env 可覆盖)
+DEFAULT_PROBE_TIMEOUT = 12.0
 # Config files below this node count are treated as incomplete (e.g. a scratch
 # override), so startup never acts on the registry based on them.
 MIN_CONFIG_NODES_FOR_PRUNE = 10
@@ -64,7 +66,8 @@ PRUNE_MISSING_NODES = os.environ.get("IP_POOL_PRUNE_MISSING_NODES", "").strip() 
 
 storage = Storage()
 router = Router(storage)
-prober = Prober(storage, router=router)
+prober = Prober(storage, router=router,
+                timeout=float(os.environ.get("IP_POOL_PROBE_TIMEOUT", str(DEFAULT_PROBE_TIMEOUT))))
 allocator = AllocationEngine(storage)
 metrics_collector = MetricsCollector(storage)
 cpa_adapter = CpaAdapter(storage)
@@ -77,6 +80,35 @@ _probe_pending: bool = False  # 已排队但尚未跑完的 sweep (sweep 排队�
 PROBE_TRIGGER_COALESCE_SECONDS = 15  # 同窗口重复触发合并 (含 start.sh 确认式重试)
 
 
+def _apply_config_settings(data: dict) -> None:
+    """#6 (二轮 review): nodes.yaml 的 settings: 块此前被静默忽略 —— 文件里写的
+    probe_interval_seconds 等根本不生效, 误导运维。契约: 配置文件值作为 env 未设
+    时的缺省 (env 优先); 同步刷新模块常量 (模块级读取发生在 import 时, 早于本函数)。"""
+    global PROBE_INTERVAL_SECONDS, PROBE_CONCURRENCY, PROBE_HISTORY_KEEP_DAYS
+    s = data.get("settings") or {}
+    if not isinstance(s, dict):
+        return
+    mapping = {
+        "probe_interval_seconds": "IP_POOL_PROBE_INTERVAL",
+        "probe_timeout_seconds": "IP_POOL_PROBE_TIMEOUT",
+        "probe_concurrency": "IP_POOL_PROBE_CONCURRENCY",
+        "probe_history_keep_days": "IP_POOL_PROBE_HISTORY_KEEP_DAYS",
+    }
+    for key, env_name in mapping.items():
+        val = s.get(key)
+        if val is None or os.environ.get(env_name):
+            continue  # 文件未写该键, 或 env 显式覆盖 -> 尊重 env
+        try:
+            os.environ[env_name] = str(int(val))
+        except (TypeError, ValueError):
+            print(f"[-] settings.{key}={val!r} is not an int; ignored")
+            continue
+    # env 已定稿 (文件缺省已并入), 常量按最终值重读
+    PROBE_INTERVAL_SECONDS = int(os.environ.get("IP_POOL_PROBE_INTERVAL", "300"))
+    PROBE_CONCURRENCY = int(os.environ.get("IP_POOL_PROBE_CONCURRENCY", "50"))
+    PROBE_HISTORY_KEEP_DAYS = int(os.environ.get("IP_POOL_PROBE_HISTORY_KEEP_DAYS", "7"))
+
+
 def load_initial_nodes():
     if not os.path.exists(CONFIG_FILE):
         print(f"[-] Config file not found: {CONFIG_FILE}")
@@ -86,6 +118,7 @@ def load_initial_nodes():
         if not data or not isinstance(data, dict):
             print(f"[-] Config file {CONFIG_FILE} parsed empty; skipping node load")
             return 0
+        _apply_config_settings(data)
         nodes_data = data.get("nodes", []) or []
         for item in nodes_data:
             configured_tier = item.get("tier")
@@ -445,7 +478,9 @@ def reload_config():
             "nodes_loaded": count
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to reload config: {str(e)}")
+        # F6 同口径: 配置异常串可能含磁盘路径, 只落日志
+        print(f"[-] reload config failed: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to reload config (internal error, see api logs)")
 
 
 
@@ -740,7 +775,7 @@ def trigger_node_rehome(node_name: str = Query(..., description="Node name whose
 def acquire_for_registration(
     account_id: str = Query(..., description="Unique registration account ID / email"),
     target_service: str = Query(..., description="Target service identifier (e.g., grok_reg, openai_signup)"),
-    cooldown: int = Query(1800, description="IP cooldown seconds after registration"),
+    cooldown: int = Query(1800, ge=0, le=86400, description="IP cooldown seconds after registration (0-86400)"),
     region: Optional[str] = Query(None, description="Optional target region preference"),
     egress_type: Optional[str] = Query(None, description="Optional preferred egress type (clash_proxy, native_ipv4, warp_ipv6)"),
     tier: Optional[str] = Query("premium", description="Optional quality tier preference (defaults to premium for registration protection)")
@@ -910,7 +945,9 @@ def batch_allocate_accounts(request: BatchAllocationRequest):
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # F6 (二轮 review): 异常串可能含内部路径/SQL, 只落日志, 响应体给类型摘要
+        print(f"[-] batch_allocate failed: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="batch allocation failed (internal error, see api logs)")
 
 
 @app.post("/v1/allocation/acquire", response_model=AccountAllocationItem)
@@ -934,6 +971,22 @@ def acquire_account_allocation(
     region_strict=true stops the ladder from relaxing `region` to another region
     (same semantics as POST /v1/acquire; an exhausted region answers 503).
     """
+    # F7 (二轮 review): 非法 CIDR 原先在 build_ban_excluded_networks 里被静默跳过,
+    # 消费方拼错网段时得到"过滤生效"的假象。入口先校验, 拼错 -> 422 明确失败。
+    avoid_cidrs: Optional[List[str]] = None
+    if avoid_cidr:
+        import ipaddress as _ipaddress
+        avoid_cidrs = []
+        for c in avoid_cidr.split(","):
+            c = c.strip()
+            if not c:
+                continue
+            try:
+                _ipaddress.ip_network(c, strict=False)
+            except ValueError:
+                raise HTTPException(status_code=422, detail=f"invalid CIDR in avoid_cidr: '{c}'")
+            avoid_cidrs.append(c)
+
     try:
         result = allocator.acquire_single(
             service=service,
@@ -944,7 +997,7 @@ def acquire_account_allocation(
             tier_policy=tier_policy,
             force_rebalance=force_rebalance,
             avoid_banned=avoid_banned,
-            avoid_cidrs=[c.strip() for c in avoid_cidr.split(",") if c.strip()] if avoid_cidr else None,
+            avoid_cidrs=avoid_cidrs,
             avoid_same_isp=avoid_same_isp,
             region_strict=region_strict
         )
@@ -961,7 +1014,9 @@ def acquire_account_allocation(
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        # F6 (二轮 review): RuntimeError(str) 可能携带内部细节, 响应体给稳定摘要
+        print(f"[-] allocation acquire failed: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=503, detail="no available node for this constraint set (see api logs for cause)")
 
 
 @app.get("/v1/allocation/status", response_model=AllocationOverviewResponse)

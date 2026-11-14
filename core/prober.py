@@ -97,7 +97,9 @@ class Prober:
                         exit_ip=exit_ip,
                         latency_ms=latency
                     )
-                    _, event = self.storage.update_probe_result(res)
+                    # sqlite 写移出事件环 (二轮 review #2): sweep 并发下每次同步
+                    # 写库都是一次全事件环停顿。
+                    _, event = await asyncio.to_thread(self.storage.update_probe_result, res)
                     return res
                 else:
                     raise RuntimeError(f"HTTP status {resp.status_code}")
@@ -118,12 +120,15 @@ class Prober:
                     latency_ms=latency,
                     error=err_msg[:120]
                 )
-                _, event = self.storage.update_probe_result(res)
+                _, event = await asyncio.to_thread(self.storage.update_probe_result, res)
 
                 # Automatic Self-Healing: If circuit tripped OPEN (DEAD), rehome attached leases
                 if event and event.to_state == HealthStatus.DEAD.value and self.router:
                     try:
-                        rehome_res = self.router.rehome_leases_for_node(node.name)
+                        # rehome 含 BINDING_WRITE_LOCK 多表事务, 同样移出事件环
+                        rehome_res = await asyncio.to_thread(
+                            self.router.rehome_leases_for_node, node.name
+                        )
                         if rehome_res.get("rehomed_count", 0) > 0:
                             print(f"[Self-Healing] Node {node.name} tripped OPEN. Rehomed {rehome_res['rehomed_count']} leases.")
                     except Exception as rehome_err:

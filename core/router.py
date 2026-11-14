@@ -5,6 +5,7 @@ Anti-Sybil Cooldown for Registration Bots, and Relay Bridge Resolution
 
 import os
 import zlib
+import ipaddress
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
 from core.models import (
@@ -1201,6 +1202,7 @@ class Router:
             target_egress = None
             target_tier = None
             previous_node_name = None
+            previous_exit_ip: Optional[str] = None
 
             # 1. Check account_allocations first
             alloc = self.storage.find_allocation_by_account(report.account_id, service=svc)
@@ -1211,15 +1213,43 @@ class Router:
                     target_egress = old_node.egress_type
                     target_tier = old_node.tier
                     previous_node_name = old_node.name
+                    previous_exit_ip = old_node.exit_ip
             else:
-                existing_lease = self.storage.get_lease(report.account_id)
-                if existing_lease:
-                    old_node = self.storage.get_node(existing_lease.node_name)
-                    if old_node:
-                        target_region = old_node.region
-                        target_egress = old_node.egress_type
-                        target_tier = old_node.tier
-                        previous_node_name = old_node.name
+                # F2 guard (二轮 review #4): lease 表没有 service 列, 但不变量是
+                # "lease 行必有 allocation 行"。本服务无 allocation 而其他服务有,
+                # 该 lease 就属于其他服务 —— 其 region/egress/tier 约束不得泄入
+                # 本服务的换电重绑 (否则 B 服务换电会被 A 服务的区域钉死)。
+                # 仅当全库无任何 allocation (纯 legacy 账号, 隐属 default) 且本
+                # 服务就是 default 时才采纳 lease 的约束提示。
+                legacy_only = (
+                    svc == "default"
+                    and self.storage.find_allocation_by_account(report.account_id) is None
+                )
+                if legacy_only:
+                    existing_lease = self.storage.get_lease(report.account_id)
+                    if existing_lease:
+                        old_node = self.storage.get_node(existing_lease.node_name)
+                        if old_node:
+                            target_region = old_node.region
+                            target_egress = old_node.egress_type
+                            target_tier = old_node.tier
+                            previous_node_name = old_node.name
+                            previous_exit_ip = old_node.exit_ip
+
+            # 同出口兄弟节点排除 (二轮 review #5): 只按名字排除旧节点不够 ——
+            # pigeonw/sub 池同一上游出口挂多个 listener, 换电会精确落回同网段的
+            # 兄弟端口, 出口 IP 纹丝不动, 429/401 照旧。旧节点 exit_ip 的同段
+            # 作为 per-call CIDR 排除传入 (quarantine 集为空, 只产网段排除)。
+            # 段宽按地址族: v4 用 /24 (上游主机粒度), v6 用 /64 (同一 /24 能罩住
+            # 整个 v6 池, 会把换电变成无解)。
+            avoid_cidrs: Optional[List[str]] = None
+            if previous_exit_ip:
+                try:
+                    addr = ipaddress.ip_address(previous_exit_ip)
+                    prefix = 24 if addr.version == 4 else 64
+                    avoid_cidrs = [str(ipaddress.ip_network(f"{addr}/{prefix}", strict=False))]
+                except ValueError:
+                    avoid_cidrs = None
 
             new_lease = self.acquire_for_account(
                 account_id=report.account_id,
@@ -1229,8 +1259,23 @@ class Router:
                 force_rebind=True,
                 service=svc,
                 # A swap that recomputes the same node is a no-op; exclude it.
-                exclude_node=previous_node_name
+                exclude_node=previous_node_name,
+                avoid_cidrs=avoid_cidrs,
             )
+            if new_lease is None and avoid_cidrs:
+                # 降级 (宁可走坏出口, 绝不 no-op): 全池候选都落在旧出口同段
+                # (如测试池/单段 vendor 池) 时, 段排除会剔空候选使换电静默失败,
+                # 账号被留在已烧的出口上。此时退回仅按节点名排除 —— 至少换到
+                # 不同 listener (上游可能已轮换出口), 探活刷新后 isp/段随之更新。
+                new_lease = self.acquire_for_account(
+                    account_id=report.account_id,
+                    region=target_region,
+                    egress_type=target_egress,
+                    tier=target_tier,
+                    force_rebind=True,
+                    service=svc,
+                    exclude_node=previous_node_name,
+                )
 
             # 2. Rewrite ONLY the reporting service's binding. Touching sibling
             # services would contaminate unrelated pools with this exit.
