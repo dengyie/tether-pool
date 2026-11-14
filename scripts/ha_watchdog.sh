@@ -1,6 +1,6 @@
 #!/bin/bash
 # TetherPool HA 看门狗 (2026-11-14 深度修复): 分级处置, 一次自动重启, 持续异常打 [HA_ALERT].
-# 判据: ① 三服务 active ② 桥核 listener 数 >= 3000 ③ api /health ④ 根分区 <90% ⑤ 探活新鲜度 <30min
+# 判据: ① 三服务 active ② 桥核 listener 数 >= 3000 ③ api /health ④ 根分区<90% + /tmp<85% ⑤ 探活新鲜度 <30min
 STATE=/tmp/ip_pool_watchdog_state
 declare -A FAIL
 
@@ -16,9 +16,24 @@ if [ -z "${FAIL[ip-pool-huawei-bridge]:-}" ]; then
 fi
 # ③ api 健康
 curl -sf -m 8 http://127.0.0.1:9100/health > /dev/null || FAIL[api_health]=1
-# ④ 磁盘 (97% 事故教训)
+# ④ 磁盘 (97% 事故教训) — 根分区 + /tmp (tmpfs 打满会让测试门禁/临时文件全挂,
+# 2026-11-14 事故: 1780 个泄漏测试 db-wal 塞满 987M tmpfs)
 U=$(df --output=pcent / | tail -1 | tr -dc 0-9)
 if [ "${U:-0}" -ge 90 ]; then FAIL[disk]="$U"; fi
+T=$(df --output=pcent /tmp | tail -1 | tr -dc 0-9)
+if [ "${T:-0}" -ge 85 ]; then FAIL[tmp_disk]="$T"; fi
+# ⑥ WAL 无限增长守卫 (HA 加固): 长事务读者存在时 wal_autocheckpoint 压不住,
+# WAL 超过 100MB 告警人工 checkpoint (自动 checkpoint 会与活跃读者竞争锁,
+# 不自愈 —— 100MB 级别在 40G 盘上是趋势信号而非紧急态)。
+WAL_SIZE=$(stat -c %s /opt/ip-pool/data/ip_pool.db-wal 2>/dev/null || echo 0)
+if [ "${WAL_SIZE:-0}" -ge 104857600 ]; then FAIL[wal_giant]="$((WAL_SIZE / 1048576))MB"; fi
+# /tmp 泄漏自愈: pytest NamedTemporaryFile (tmp??????.db*) 只在进程死亡时泄漏,
+# 活测试进程持有中删除无害 (fd 仍有效)。mtime >1h 的才清, 持续增长则下轮告警。
+if [ "${T:-0}" -ge 85 ]; then
+  find /tmp -maxdepth 1 -name 'tmp??????.db*' -mmin +60 -delete 2>/dev/null
+  find /tmp -maxdepth 1 -name 'tmp??????.db*' -mmin +60 -delete 2>/dev/null
+  rm -rf /tmp/pytest-of-root 2>/dev/null
+fi
 # ⑤ 探活新鲜度 (api 死循环/探活线程挂死时服务仍 active 的盲区)
 # 窗口 30min 且不触发重启 (二轮 review): 全池降级时单轮 sweep 可达 ~15-20min
 # (3000 节点 × 重试 + 超时), 15min 窗口 + 重启会造成 降级->重启->更慢->循环重启;

@@ -38,6 +38,13 @@ class Storage:
         if conn is None:
             conn = sqlite3.connect(self.db_path, timeout=10.0)
             conn.row_factory = sqlite3.Row
+            try:
+                # WAL 自动 checkpoint 上限 (HA 加固): 默认 1000 页在长事务读者
+                # (探活线程池) 存在时可能压不住, WAL 无限增长最终打满磁盘
+                # (97% 事故同型)。10000 页 ≈ 40MB, checkpoint 由后续写自然触发。
+                conn.execute("PRAGMA wal_autocheckpoint = 10000;")
+            except sqlite3.OperationalError:
+                pass  # 只读连接/磁盘异常时不阻断建连
             self._thread_local.conn = conn
         try:
             yield conn
