@@ -356,6 +356,28 @@ def test_ban_report_unusual_3012_no_quarantine(client, seeded):
     assert r2.json()["quarantine_until"] is not None
 
 
+def test_ban_explicit_node_name_beats_binding(client):
+    # 2026-11-14 实战事故回归 (消费端 agent 上报): agent 发 node_name 被旧
+    # 契约静默丢弃 -> 缺省回退隔离了绑定节点, 真凶没进隔离池。别名收编后:
+    # 显式 node_name 必须优先生效, 绑定节点不得被误隔离。
+    s = api.server.storage
+    s.batch_save_allocations([("zcode-hub", "acc", "clash-b", "2026-11-14T00:00:00")])
+    body = {"service": "zcode-hub", "account": "acc", "node_name": "clash-a",  # 真凶, 显式指认
+            "reason": "edge_405_html", "evidence": {"http_status": 405, "body_kind": "html"}}
+    r = client.post("/v1/feedback/ban", json=body)
+    assert r.status_code == 202
+    d = r.json()
+    assert d["node_id"] == "clash-a" and d["exit_ip"] == "23.1.1.5"  # 真凶进隔离
+    # 断言走 client 同一个 storage 实例 (conftest isolate: seeded 是独立临时库)
+    banned = {q.node_name for q in s.get_active_quarantines()}
+    assert banned == {"clash-a"} and "clash-b" not in banned       # 绑定节点未被误伤
+    # /24 联动 (bug2 同根): 真凶被封后, 同 /24 的兄弟节点被 avoid_banned 排除
+    s.delete_allocation("zcode-hub", "acc")
+    rr = client.post("/v1/allocation/acquire?service=zcode-hub&account_id=x2&egress_preference=&avoid_banned=true")
+    got = rr.json().get("node_name")
+    assert got not in ("clash-a", "clash-b")  # 23.1.1.x 整段排除
+
+
 def test_ban_report_400_no_binding(client):
     r = client.post("/v1/feedback/ban", json={"service": "s", "account": "ghost", "reason": "edge_405_html"})
     assert r.status_code == 400

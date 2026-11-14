@@ -199,11 +199,14 @@ class BanReportRequest(BaseModel):
 
     account 字段接受 account_id 别名（契约对齐 2026-11-14: acquire 端用
     account_id、ban body 历史上用 account，两拼写均收，内部统一为 account）。
+    node_id 同理收 node_name 别名（2026-11-14 实战事故: 消费端 agent 发
+    node_name 被 pydantic 静默丢弃 -> 缺省回退隔离了绑定节点而非真凶 ——
+    显式指认节点是 ban 语义的核心，未知字段绝不能再静默吞）。
     """
     model_config = ConfigDict(populate_by_name=True)
     service: str = Field(..., min_length=1)
     account: str = Field(..., min_length=1, validation_alias=AliasChoices("account", "account_id"))
-    node_id: Optional[str] = None                        # 缺省 = 该账号当前绑定节点
+    node_id: Optional[str] = Field(None, validation_alias=AliasChoices("node_id", "node_name"))  # 缺省 = 该账号当前绑定节点
     reason: str = Field(..., min_length=1)
     evidence: Dict[str, object] = Field(default_factory=dict)
     quarantine_hours: int = Field(24, ge=0, le=24 * 30)
