@@ -23,6 +23,47 @@ from core.models import ProxyNode
 from core.storage import Storage
 
 
+# 已知家宽 ISP 出口段 (消费方实测, 2026-11-14): pigeonw 同一节点的上游出口会在
+# Comcast / AT&T 段间漂移, 静态 isp tag 会过时 —— 探活成功时按 exit_ip 段刷新
+# (update_probe_result 调 refresh_isp_tag)。未知段不动作 (宁缺毋滥, 不误标)。
+ISP_SEGMENT_MAP: Tuple[Tuple[str, str], ...] = (
+    ("23.230.200.0/24", "comcast"),
+    ("23.132.180.0/24", "att"),
+)
+
+
+def detect_isp_by_exit_ip(exit_ip: Optional[str]) -> Optional[str]:
+    """exit_ip 落入已知 ISP 段则返回 isp 名, 否则 None。"""
+    if not exit_ip:
+        return None
+    try:
+        addr = ipaddress.ip_address(exit_ip)
+    except ValueError:
+        return None
+    for cidr, isp in ISP_SEGMENT_MAP:
+        try:
+            if addr in ipaddress.ip_network(cidr):
+                return isp
+        except ValueError:
+            continue
+    return None
+
+
+def refresh_isp_tag(node: ProxyNode, exit_ip: Optional[str]) -> Optional[ProxyNode]:
+    """探活成功后按 exit_ip 段校正 isp tag。
+
+    返回携带新 tags 的 node 副本 (调用方负责落库), tag 已正确或无法判定时返回
+    None (无需写库)。已知段与现 tag 不一致才改 —— 段未知时保留现 tag。"""
+    detected = detect_isp_by_exit_ip(exit_ip)
+    if detected is None:
+        return None
+    if node_isp(node) == detected:
+        return None
+    tags = [t for t in (node.tags or []) if not t.lower().startswith("isp=")]
+    tags.append(f"isp={detected}")
+    return node.model_copy(update={"tags": tags})
+
+
 def node_isp(node: ProxyNode) -> str:
     """ISP 元数据走 tags 约定 (需求 §5.3): 节点 tags 中 isp=<name> (小写)。
     无该 tag 的节点不参与 avoid_same_isp 判定、也不因此被排除。"""

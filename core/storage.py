@@ -356,6 +356,11 @@ class Storage:
             )
 
             if res.success:
+                # isp tag 防漂移 (ban-aware 2026-11-14): pigeonw 等家宽节点的上游
+                # 出口会在 ISP 段间漂移, 探活成功时按 exit_ip 段校正 (core/ban),
+                # 与 exit_ip 写入同一事务, avoid_same_isp 判定拿到的是新鲜 ISP。
+                from core.ban import refresh_isp_tag
+                updated_node = refresh_isp_tag(node, res.exit_ip)
                 conn.execute("""
                     UPDATE nodes SET
                         exit_ip = ?,
@@ -368,12 +373,16 @@ class Storage:
                         next_probe_allowed_at = ?,
                         last_probed_at = ?,
                         tier = ?,
-                        quality_score = ?
+                        quality_score = ?,
+                        tags = ?
                     WHERE name = ?
                 """, (
                     res.exit_ip, res.latency_ms, new_state, new_state,
                     new_fails, new_succs, next_allowed_str, now_str,
-                    q_tier, q_score, res.node_name
+                    q_tier, q_score,
+                    # 无需校正时原样回写 (JSON 序列化与列存储同形)
+                    json.dumps(updated_node.tags if updated_node else node.tags, ensure_ascii=False),
+                    res.node_name
                 ))
             else:
                 conn.execute("""

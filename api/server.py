@@ -37,6 +37,17 @@ DASHBOARD_HTML = os.path.join(os.path.dirname(os.path.dirname(__file__)), "web",
 # every other endpoint requires the token, provided as `Authorization: Bearer <token>`,
 # a `?token=` query parameter, or the `ip_pool_token` cookie set by /dashboard.
 API_TOKEN = os.environ.get("IP_POOL_API_TOKEN", "").strip()
+# Per-service tokens (需求 §8, 2026-11-14): 独立于全局 token 的 service 级令牌,
+# 格式 `service=token[,service2=token2]` (token 用 hex, 不含逗号/等号)。
+# 语义: 请求目标 service (query 或 JSON body) 的专用 token 与其匹配即放行 ——
+# 单独吊销某一消费方的令牌不影响其他端点; 全局 API_TOKEN 未设时其余 service
+# 维持 Mesh 内网现状 (与需求 §8 "本次接入作为设 token 的契机" 同口径)。
+SERVICE_TOKENS: Dict[str, str] = {}
+for _pair in os.environ.get("IP_POOL_SERVICE_TOKENS", "").split(","):
+    if "=" in _pair:
+        _svc, _tok = _pair.split("=", 1)
+        if _svc.strip() and _tok.strip():
+            SERVICE_TOKENS[_svc.strip()] = _tok.strip()
 AUTH_COOKIE_NAME = "ip_pool_token"
 PROBE_INTERVAL_SECONDS = int(os.environ.get("IP_POOL_PROBE_INTERVAL", "300"))
 # 全池 sweep 的并发度。50 并发下 347 节点一轮 ~1 分钟（12s 超时 + warp 高延迟），
@@ -196,23 +207,63 @@ def _provided_token(request: Request) -> str:
     return request.query_params.get("token", "").strip()
 
 
+async def _request_service(request: Request) -> Optional[str]:
+    """请求目标的 service 标识 (per-service token 判定用): 先查 query, 再窥
+    JSON body (starlette 缓存 body, 端点二次读取安全)。"""
+    svc = request.query_params.get("service")
+    if svc:
+        return svc
+    if (request.headers.get("content-type", "") or "").startswith("application/json"):
+        try:
+            body = await request.json()
+        except Exception:
+            return None
+        if isinstance(body, dict):
+            return body.get("service")
+    return None
+
+
 @app.middleware("http")
 async def bearer_auth_middleware(request: Request, call_next):
-    if API_TOKEN and request.url.path != "/health":
-        token = _provided_token(request)
-        if token != API_TOKEN:
-            # Browsers cannot attach an Authorization header to a navigation request,
-            # so entering the dashboard is a two-step handshake: ?token=... is exchanged
-            # for an HttpOnly cookie, after which the page's same-origin fetches carry it.
-            if request.url.path in ("/", "/dashboard") and request.method in ("GET", "HEAD"):
-                return HTMLResponse(
-                    "<html><body style='font-family:system-ui;padding:2rem'>"
-                    "<h3>IP Pool control plane</h3>"
-                    "<p>Access requires a token. Open <code>/dashboard?token=&lt;YOUR_TOKEN&gt;</code>.</p>"
-                    "</body></html>",
-                    status_code=401,
-                )
-            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    if API_TOKEN or SERVICE_TOKENS:
+        if request.url.path != "/health":
+            token = _provided_token(request)
+            svc = await _request_service(request) if SERVICE_TOKENS else None
+            if API_TOKEN and token == API_TOKEN:
+                authorized = True
+            elif SERVICE_TOKENS and svc is not None and token and token == SERVICE_TOKENS.get(svc):
+                authorized = True
+            elif API_TOKEN:
+                # 全局令牌模式 (既有行为): 除 /health 外一律要求全局令牌,
+                # dashboard 走 ?token= 换 cookie 握手。
+                authorized = False
+            elif svc is None:
+                # 仅 per-service 模式: 无 service 标识的端点 (dashboard /
+                # node_pipeline / metrics) 维持 Mesh 内网现状放行 (需求 §8)。
+                authorized = True
+            elif svc not in SERVICE_TOKENS:
+                # 未配专用令牌的 service 维持放行; 但持失败凭据的请求按无效
+                # 令牌拒绝 (fail closed, 防 A 服务令牌被误用于 B 服务)。
+                authorized = not token
+            else:
+                # 目标 service 配了专用令牌: 必须持匹配令牌。
+                authorized = False
+            if not authorized:
+                if API_TOKEN:
+                    # Browsers cannot attach an Authorization header to a navigation request,
+                    # so entering the dashboard is a two-step handshake: ?token=... is exchanged
+                    # for an HttpOnly cookie, after which the page's same-origin fetches carry it.
+                    if request.url.path in ("/", "/dashboard") and request.method in ("GET", "HEAD"):
+                        return HTMLResponse(
+                            "<html><body style='font-family:system-ui;padding:2rem'>"
+                            "<h3>IP Pool control plane</h3>"
+                            "<p>Access requires a token. Open <code>/dashboard?token=&lt;YOUR_TOKEN&gt;</code>.</p>"
+                            "</body></html>",
+                            status_code=401,
+                        )
+                    return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+                # 仅有 per-service token 的部署: dashboard 走既有现状, 其余拒绝
+                return JSONResponse({"detail": "Unauthorized"}, status_code=401)
         if request.query_params.get("token") and request.url.path == "/dashboard":
             response = RedirectResponse(url="/dashboard", status_code=302)
             response.set_cookie(

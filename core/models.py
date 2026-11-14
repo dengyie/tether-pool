@@ -4,7 +4,7 @@ core/models.py - Domain models for IP Pool System
 
 from enum import Enum
 from typing import List, Optional, Dict, Union
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, AliasChoices, field_validator
 
 
 class EgressType(str, Enum):
@@ -196,9 +196,13 @@ class BanReportRequest(BaseModel):
 
     body_kind=html 的边缘页是判 IP 封的权威信号；应用层 JSON 3012 在 zcode
     语境多为「请求形状不对」，API 层对它强制 quarantine_hours=0（只记录）。
+
+    account 字段接受 account_id 别名（契约对齐 2026-11-14: acquire 端用
+    account_id、ban body 历史上用 account，两拼写均收，内部统一为 account）。
     """
+    model_config = ConfigDict(populate_by_name=True)
     service: str = Field(..., min_length=1)
-    account: str = Field(..., min_length=1)
+    account: str = Field(..., min_length=1, validation_alias=AliasChoices("account", "account_id"))
     node_id: Optional[str] = None                        # 缺省 = 该账号当前绑定节点
     reason: str = Field(..., min_length=1)
     evidence: Dict[str, object] = Field(default_factory=dict)

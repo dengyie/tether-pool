@@ -11,7 +11,7 @@ import pytest
 from starlette.testclient import TestClient
 
 import api.server
-from core.models import ProxyNode, EgressType, HealthStatus
+from core.models import ProxyNode, EgressType, HealthStatus, ProbeResult
 from core.storage import Storage
 from core.router import Router
 from core.ban import node_isp, ip_in_excluded_nets, build_ban_excluded_networks
@@ -516,3 +516,102 @@ def test_metrics_gauge_dedupes_nodes(client, seeded):
     mc = MetricsCollector(seeded)
     text = mc.generate_metrics()
     assert 'ip_pool_quarantine_active{service="zcode-hub"} 1' in text
+
+
+# --- per-service token auth (需求 §8, 2026-11-14) ---
+
+@pytest.fixture
+def svc_client(monkeypatch, seeded):
+    """per-service token 模式: 仅 zcode-hub 有专用令牌, 全局 API_TOKEN 不设。
+    端点走 conftest 隔离出的 api.server.storage, 种子与 client fixture 一致。"""
+    monkeypatch.setattr(api.server, "API_TOKEN", "")
+    monkeypatch.setattr(api.server, "SERVICE_TOKENS", {"zcode-hub": "tok-zh-123"})
+    _mk_node(api.server.storage, "clash-a", exit_ip="23.1.1.5", isp="comcast")
+    return TestClient(api.server.app)
+
+
+def test_service_token_required_for_target_service(svc_client):
+    # 目标 service 有专用 token: 无令牌 -> 401 (ban 走 body service)
+    r = svc_client.post("/v1/feedback/ban", json={"service": "zcode-hub", "account": "acc", "node_id": "clash-a", "reason": "edge_405_html"})
+    assert r.status_code == 401
+    # 错误令牌 -> 401
+    r2 = svc_client.post("/v1/feedback/ban",
+                         json={"service": "zcode-hub", "account_id": "acc", "node_id": "clash-a", "reason": "edge_405_html"},
+                         headers={"Authorization": "Bearer wrong"})
+    assert r2.status_code == 401
+    # 正确令牌 + account_id 别名 -> 202 (契约对齐一并验证)
+    r3 = svc_client.post("/v1/feedback/ban",
+                         json={"service": "zcode-hub", "account_id": "acc", "node_id": "clash-a", "reason": "edge_405_html"},
+                         headers={"Authorization": "Bearer tok-zh-123"})
+    assert r3.status_code == 202
+
+
+def test_service_token_scoped_to_service(svc_client):
+    # 专用令牌只对目标 service 生效: 拿 zcode-hub 令牌访问别的 service -> 401
+    r = svc_client.post("/v1/allocation/acquire?service=other-svc&account_id=acc&egress_preference=",
+                        headers={"Authorization": "Bearer tok-zh-123"})
+    assert r.status_code == 401
+
+
+def test_service_token_query_and_other_endpoints_open(svc_client):
+    # query 参数拼 service 的端点同样受控 (无令牌 401, 带令牌 200)
+    r = svc_client.get("/v1/allocation/status/account?service=zcode-hub&account=acc")
+    assert r.status_code == 401
+    r2 = svc_client.get("/v1/allocation/status/account?service=zcode-hub&account=acc",
+                        headers={"Authorization": "Bearer tok-zh-123"})
+    assert r2.status_code == 200
+    # /health 永远公开
+    assert svc_client.get("/health").status_code == 200
+    # 未配置专用 token 的 service 维持 Mesh 内网现状 (无令牌放行)
+    r3 = svc_client.post("/v1/allocation/acquire?service=other-svc&account_id=acc&egress_preference=")
+    assert r3.status_code == 200
+
+
+def test_service_token_body_peek_does_not_break_pydantic(svc_client, seeded):
+    # 中间件窥视 body 后端点仍能正常解析 (starlette body 缓存), 且正常落库
+    r = svc_client.post("/v1/feedback/ban",
+                        json={"service": "zcode-hub", "account": "acc", "node_id": "clash-a", "reason": "edge_405_html", "evidence": {"http_status": 405}},
+                        headers={"Authorization": "Bearer tok-zh-123"})
+    assert r.status_code == 202
+    assert r.json()["exit_ip"] == "23.1.1.5"
+
+
+# --- isp tag drift refresh (探活时按 exit_ip 段校正) ---
+
+def test_detect_isp_by_exit_ip():
+    from core.ban import detect_isp_by_exit_ip
+    assert detect_isp_by_exit_ip("23.230.200.77") == "comcast"
+    assert detect_isp_by_exit_ip("23.132.180.9") == "att"
+    assert detect_isp_by_exit_ip("99.8.7.6") is None
+    assert detect_isp_by_exit_ip(None) is None
+    assert detect_isp_by_exit_ip("garbage") is None
+
+
+def test_refresh_isp_tag_updates_stale_tag():
+    from core.ban import refresh_isp_tag
+    n = ProxyNode(name="x", host="h", port=1, region="r", egress_type="clash_proxy",
+                  tags=["clash", "isp=comcast"], exit_ip="23.132.180.9")
+    updated = refresh_isp_tag(n, "23.132.180.9")
+    assert updated is not None and "isp=att" in updated.tags and "isp=comcast" not in updated.tags
+    # tag 已正确 -> 不动 (返回 None 避免无谓写库)
+    n2 = ProxyNode(name="x", host="h", port=1, region="r", egress_type="clash_proxy",
+                   tags=["clash", "isp=att"], exit_ip="23.132.180.9")
+    assert refresh_isp_tag(n2, "23.132.180.9") is None
+    # 未知段 -> 保留现 tag
+    n3 = ProxyNode(name="x", host="h", port=1, region="r", egress_type="clash_proxy",
+                   tags=["clash", "isp=comcast"], exit_ip="99.8.7.6")
+    assert refresh_isp_tag(n3, "99.8.7.6") is None
+
+
+def test_probe_success_refreshes_isp_tag(storage):
+    # update_probe_result success 分支同事务校正: exit_ip 漂到 AT&T 段 -> tag 变 att
+    from core.prober import Prober
+    _mk_node(storage, "clash-a", exit_ip="23.230.200.5", isp="comcast")
+    p = Prober(storage)
+    p.storage.update_probe_result(ProbeResult(node_name="clash-a", success=True, exit_ip="23.132.180.77", latency_ms=100.0))
+    assert storage.get_node("clash-a").exit_ip == "23.132.180.77"
+    tags = storage.get_node("clash-a").tags
+    assert "isp=att" in tags and "isp=comcast" not in tags
+    # 无需校正时 tags 原样保留
+    p.storage.update_probe_result(ProbeResult(node_name="clash-a", success=True, exit_ip="23.132.180.9", latency_ms=100.0))
+    assert "isp=att" in storage.get_node("clash-a").tags
