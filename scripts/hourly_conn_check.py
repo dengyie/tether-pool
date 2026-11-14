@@ -14,6 +14,7 @@
 import base64, json, os, random, socket, sqlite3, sys, time
 
 DB = "/opt/ip-pool/data/ip_pool.db"
+STATE = "/tmp/hourly_conn_prev_fail"   # 上一轮失败池名单 (小样本瞬时抖动防误报)
 SAMPLES_PER_POOL = 5        # 每池抽样数; api 内部探活已 4min 全覆盖, 这里求独立验证
 GATEWAY_N = 3
 TIMEOUT = 8
@@ -138,8 +139,29 @@ def main():
 
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     if alarms:
-        print(f"[HOURLY_CONN_FAIL] {stamp} :: {'; '.join(report)} :: ALARMS={alarms}", file=sys.stderr)
-        return 1
+        # 连续两轮同池失败才真告警: 单池 5 样本对 ip-api 限流窗口/桥核瞬时
+        # 抖动太敏感 (2026-11-15 实测 cloud 0/5 与 skyward 0/5 均为瞬时,
+        # 2 分钟后复测全 OK)。首轮失败只落日志观察。
+        try:
+            prev = set(open(STATE).read().split())
+        except OSError:
+            prev = set()
+        curr = {a.split(":")[0] for a in alarms}
+        persistent = prev & curr
+        if persistent:
+            print(f"[HOURLY_CONN_FAIL] {stamp} :: {'; '.join(report)} :: "
+                  f"PERSISTENT_ALARMS={sorted(persistent)} (2nd consecutive round)", file=sys.stderr)
+            open(STATE, "w").write(" ".join(curr))
+            return 1
+        print(f"[HOURLY_CONN_WARN] {stamp} :: {'; '.join(report)} :: "
+              f"first-round alarms={alarms} (will FAIL if repeats next hour)", file=sys.stderr)
+        open(STATE, "w").write(" ".join(curr))
+        return 0
+    # 全绿: 清掉历史失败状态
+    try:
+        os.unlink(STATE)
+    except OSError:
+        pass
     print(f"[HOURLY_CONN_OK] {stamp} :: {'; '.join(report)}")
     return 0
 
