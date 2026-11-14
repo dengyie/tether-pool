@@ -25,8 +25,11 @@ POOLS = [
     ("sub", "name LIKE 'clash-5%-sub-%'"),
     ("pigeonw", "tags LIKE '%pigeonw%'"),
     ("gen", "tags LIKE '%genproxy%'"),
+    # cloud (teleapi 云端订阅): 出口共享网关 (实测 15 节点同一出口 IP), region
+    # 比对无意义 (db per-node exit_ip 与实际出口对不上, 2026-11-15 复盘), 只验连通。
     ("cloud", "host='127.0.0.1' AND tags NOT LIKE '%genproxy%' AND tags NOT LIKE '%teleapisub%' AND tags NOT LIKE '%skyward%' AND tags NOT LIKE '%pigeonw%' AND name NOT LIKE 'clash-5%-sub-%'"),
 ]
+NO_REGION_CHECK = {"cloud"}
 
 
 def region_matches(db_region, cc):
@@ -37,8 +40,9 @@ def region_matches(db_region, cc):
     return db_region == ("us-west" if c == "us" else c)
 
 
-def socks5_probe(ip, port, node_region):
-    """直连桥核 listener: SOCKS5 + ip-api /json, 返回 (ok, detail)。"""
+def socks5_probe(ip, port, node_region, region_check=True):
+    """直连桥核 listener: SOCKS5 + ip-api /json, 返回 (ok, detail)。
+    region_check=False 用于出口共享网关型池 (cloud), 只验连通不验归属。"""
     try:
         s = socket.create_connection(("127.0.0.1", port), timeout=TIMEOUT)
         s.settimeout(TIMEOUT)
@@ -62,7 +66,7 @@ def socks5_probe(ip, port, node_region):
         exit_ip, cc = j.get("query"), j.get("countryCode")
         if not exit_ip:
             return False, "no exit ip in response"
-        if cc and not region_matches(node_region, cc):
+        if region_check and cc and not region_matches(node_region, cc):
             return False, f"region mismatch db={node_region} actual={cc}"
         return True, f"{exit_ip}/{cc}"
     except Exception as e:
@@ -105,13 +109,18 @@ def main():
             continue
         oks, details = 0, []
         for name, port, region, _ in rows:
-            ok, detail = socks5_probe("127.0.0.1", port, region)
-            if not ok:
-                # 一次重试: cloud 池等共享出口的节点会集体撞 ip-api 对该出口 IP
-                # 的 45/min 限流窗口 (2026-11-15 首跑 0/5 复盘, 2s 后 15/15 OK),
-                # 单轮瞬时失败不算故障。
+            check = pool not in NO_REGION_CHECK
+            ok, detail = socks5_probe("127.0.0.1", port, region, region_check=check)
+            if not ok and "mismatch" in str(detail):
+                # 归属错配重试一次仍错才算 (个别节点出口漂移 vs 系统性错配区分)
                 time.sleep(2)
-                ok, detail = socks5_probe("127.0.0.1", port, region)
+                ok, detail = socks5_probe("127.0.0.1", port, region, region_check=check)
+            elif not ok:
+                # 连通类失败一次重试: 共享出口节点会集体撞 ip-api 对该出口 IP
+                # 的 45/min 限流窗口 (429 返回非法 JSON -> JSONDecodeError),
+                # 单轮瞬时失败不算故障。
+                time.sleep(5)
+                ok, detail = socks5_probe("127.0.0.1", port, region, region_check=check)
             oks += ok
             details.append(f"{name}:{'OK' if ok else detail}")
         tag = "OK" if oks > 0 else "FAIL"
