@@ -169,7 +169,7 @@ async def socks5_connect(
     target_port: int,
     timeout: float = CONNECT_TIMEOUT
 ) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-    """Establishes a single-hop connection to an upstream SOCKS5 proxy."""
+    """Establishes a single-hop connection to the upstream SOCKS5 proxy."""
     reader, writer = await asyncio.wait_for(
         asyncio.open_connection(proxy_host, proxy_port),
         timeout=timeout
@@ -177,7 +177,9 @@ async def socks5_connect(
     try:
         await socks5_handshake_on_stream(reader, writer, target_host, target_port, timeout=timeout)
         return reader, writer
-    except Exception:
+    except BaseException:
+        # BaseException 而非 Exception: attempt 超时时 wait_for 取消内层任务,
+        # CancelledError(BaseException 子类) 也必须关掉已建立的 socket, 否则泄漏 fd。
         writer.close()
         try:
             await writer.wait_closed()
@@ -209,7 +211,8 @@ async def socks5_relay_connect(
         # Hop 2: Connect through Target Proxy Node to Destination
         await socks5_handshake_on_stream(reader, writer, dest_host, dest_port, timeout=timeout)
         return reader, writer
-    except Exception:
+    except BaseException:
+        # 同 socks5_connect: 取消路径 (CancelledError) 也必须释放已建立的 socket
         writer.close()
         try:
             await writer.wait_closed()
@@ -1022,6 +1025,10 @@ class ForwardProxyGateway:
             f"Last error: {last_err}",
         )
 
+    def _metrics_exempt(self, method: str, target: str) -> bool:
+        """GET /metrics (含 query 串) 免密; 路径变形 (/metrics/, //metrics) 不豁免。"""
+        return method.upper() == "GET" and target.split("?")[0] == "/metrics"
+
     def _password_ok(self, auth_header: str) -> bool:
         """Constant-shape check of the Basic password part against GATEWAY_PASSWORD.
 
@@ -1035,7 +1042,11 @@ class ForwardProxyGateway:
         except Exception:
             return False
         presented = decoded.split(":", 1)[1] if ":" in decoded else ""
-        return hmac.compare_digest(presented, self.password or "")
+        # bytes 比较: compare_digest 对含非 ASCII (U+FFFD 替换符) 的 str 抛 TypeError,
+        # 会让畸形 auth 头绕过 407 路径静默断连。
+        return hmac.compare_digest(
+            presented.encode("utf-8", "replace"), (self.password or "").encode("utf-8")
+        )
 
     async def handle_client(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
         peer = client_writer.get_extra_info("peername")
@@ -1072,7 +1083,7 @@ class ForwardProxyGateway:
             # GATEWAY_PASSWORD is set, every request (CONNECT / plain HTTP / headers-only
             # routing) must present it in Proxy-Authorization. /metrics exempt so
             # Prometheus scrapers need no proxy credentials.
-            if self.password and not (method.upper() == "GET" and target.split("?")[0] == "/metrics"):
+            if self.password and not self._metrics_exempt(method, target):
                 if not self._password_ok(headers_dict.get("proxy-authorization", "")):
                     logger.warning("gateway auth rejected: peer=%s target=%s", client_ip, target[:80])
                     if method.upper() == "CONNECT":
@@ -1323,7 +1334,8 @@ class ForwardProxyGateway:
                             res = await prober.probe_target_service(node, url)
                         self.target_health.record(node.name, cls, res.success, res.error or "")
 
-                    await asyncio.gather(*[_one(n) for n in healthy])
+                    # return_exceptions: 单个探测异常不得吞掉本轮其余结果 (un-awaited 孤儿任务教训)
+                    await asyncio.gather(*[_one(n) for n in healthy], return_exceptions=True)
                 counts = self.target_health.bad_counts()
                 if counts != self._target_last_bad:
                     logger.info(

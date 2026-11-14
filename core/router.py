@@ -192,6 +192,20 @@ class Router:
                 return False
             return True
 
+        def _ban_rejects(node: ProxyNode) -> bool:
+            """完整 ban 谓词 (名字 ∨ /24 ∨ isp), 与候选过滤 _ban_filtered 同一语义。
+            fast path 守卫必须用这个 —— 只查名字会让同 /24 / 同 ISP 的健康粘性绑定
+            绕过过滤直接返回 (review P1: 与 Allocator._ban_node_ok 语义对齐)。"""
+            if node.name in ban_excluded_names:
+                return True
+            if ip_in_excluded_nets(node.exit_ip, ban_excluded_nets):
+                return True
+            if avoid_same_isp and ban_excluded_isps:
+                isp = node_isp(node)
+                if isp and isp in ban_excluded_isps:
+                    return True
+            return False
+
         # 1. Check existing lease if not forcing rebind
         alloc = self.storage.find_allocation_by_account(account_id, service=svc)
         steer_transient = False
@@ -200,12 +214,12 @@ class Router:
             # 1a. Universal Allocation Engine bindings check first
             if alloc:
                 node = self.storage.get_node(alloc["node_name"])
-                # 封禁排除先于一切: 绑定节点在 opt-in quarantine 集里时绝不走
-                # fast path 返回 (先于 healthy/excluded 分支判断)。
+                # 封禁排除先于一切: 绑定节点被完整 ban 谓词 (名字 ∨ /24 ∨ isp) 拒绝时
+                # 绝不走 fast path 返回 (先于 healthy/excluded 分支判断)。
                 if (
                     node
                     and node.status == HealthStatus.HEALTHY.value
-                    and node.name in ban_excluded_names
+                    and _ban_rejects(node)
                 ):
                     binding_conflict = True
                 elif (
@@ -270,8 +284,8 @@ class Router:
             )
             if existing:
                 node = self.storage.get_node(existing.node_name)
-                # 封禁排除先于一切 (同 1a): 被封绑定绝不走 fast path 返回。
-                if node and node.status == HealthStatus.HEALTHY.value and node.name in ban_excluded_names:
+                # 封禁排除先于一切 (同 1a): 完整 ban 谓词拒绝的绑定绝不走 fast path。
+                if node and node.status == HealthStatus.HEALTHY.value and _ban_rejects(node):
                     binding_conflict = True
                 # Ensure existing node is HEALTHY (Closed)
                 elif node and node.status == HealthStatus.HEALTHY.value and node.name not in excluded:

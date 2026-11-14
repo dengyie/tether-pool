@@ -188,6 +188,43 @@ def test_router_banned_binding_not_sticky(seeded):
     assert seeded.get_allocation("zcode-hub", "acc")["node_name"] == "clash-a"
 
 
+def test_router_banned_binding_slash24_not_sticky(seeded):
+    # review P1 回归: 绑定节点本身没被封, 但与被封节点同 /24 —— fast path 完整谓词
+    # (名字 ∨ /24 ∨ isp) 必须拒绝它, 不能只查名字让同段的健康粘性绑定绕过过滤。
+    seeded.record_ban("zcode-hub", "acc", "clash-a", "23.1.1.5", "comcast", "edge_405_html", {}, 24)
+    r = Router(seeded)
+    seeded.batch_save_allocations([("zcode-hub", "acc", "clash-b", "2026-11-14T00:00:00")])
+    lease = r.acquire_for_account("acc", egress_type=None, service="zcode-hub", avoid_banned=True)
+    assert lease is not None
+    assert lease.node_name != "clash-b"          # 23.1.1.9 在被封 23.1.1.0/24 里
+    assert lease.node_name == "clash-c" or lease.node_name == "clash-d"
+    # 绑定原地保留 (opt-in per-call 语义)
+    assert seeded.get_allocation("zcode-hub", "acc")["node_name"] == "clash-b"
+
+
+def test_router_banned_binding_same_isp_not_sticky(seeded):
+    # 同族: avoid_same_isp 时, 与被封节点同 ISP 的粘性绑定也必须被 fast path 拒绝
+    seeded.record_ban("zcode-hub", "acc", "clash-c", "45.6.7.8", "att", "edge_405_html", {}, 24)
+    r = Router(seeded)
+    seeded.batch_save_allocations([("zcode-hub", "acc", "clash-d", "2026-11-14T00:00:00")])
+    lease = r.acquire_for_account("acc", egress_type=None, service="zcode-hub",
+                                  avoid_banned=True, avoid_same_isp=True)
+    # clash-d 无 isp tag: 不参与 isp 判定, 应保留
+    assert lease is None or lease.node_name == "clash-d"
+
+
+def test_router_avoid_same_isp_alone_derives_isps(seeded):
+    # review P3 回归: 单独 avoid_same_isp (不带 avoid_banned) 也必须派生 ISP 集生效
+    seeded.record_ban("zcode-hub", "acc", "clash-c", "45.6.7.8", "att", "edge_405_html", {}, 24)
+    r = Router(seeded)
+    lease = r.acquire_for_account("new-acc", egress_type=None, service="zcode-hub", avoid_same_isp=True)
+    assert lease is not None
+    assert lease.node_name != "clash-c"          # att 被排除
+    # 无 avoid 参数时同一 quarantine 不影响
+    lease2 = r.acquire_for_account("new-acc2", egress_type=None, service="zcode-hub")
+    assert lease2 is not None
+
+
 def test_router_avoid_banned_exhausted_returns_none(storage):
     _mk_node(storage, "only-1", exit_ip="9.9.9.9")
     storage.record_ban("svc", "acc", "only-1", "9.9.9.9", None, "edge_405_html", {}, 24)

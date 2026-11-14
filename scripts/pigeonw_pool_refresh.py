@@ -14,11 +14,18 @@
 安全性: flock 互斥 / 探活门 (全死不部署) / mihomo -t 失败回滚 / 时间戳备份轮转 7 份 /
 部署后 ss -tln 实听校验 / 失败 [PIGEONW_REFRESH_FAIL] 可 grep 告警。
 """
-import fcntl, glob, json, os, re, socket, subprocess, sys, time, urllib.request
+import fcntl, glob, json, os, re, socket, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-SUB_URL = "https://nodes.pigeonw.com/s/jmQZPf7wiq1qXoET1K9irGu-5PFLp39seTefwDAz-kc/clash.yaml"
+# bearer-token 型订阅 URL 即凭据, 仓库不落盘: 从 /etc/ip-pool-secrets.env 读。
+def _sub_url() -> str:
+    url = os.environ.get("PIGEONW_SUB_URL", "").strip()
+    if not url:
+        print("[PIGEONW_REFRESH_FAIL] PIGEONW_SUB_URL not set (see /etc/ip-pool-secrets.env)", file=sys.stderr)
+        sys.exit(1)
+    return url
+
 CFG = Path("/opt/ip-pool/config/pigeonw-bridge.yaml")
 CFG_DIR = Path("/opt/ip-pool/config/pigeonw-bridge")
 NODES = Path("/opt/ip-pool/config/nodes.yaml")
@@ -44,22 +51,41 @@ def backup_with_rotation():
         os.unlink(old)
 
 
+def _unbool_proxies(proxies):
+    """YAML 1.1 陷阱: 凭据恰为 no/yes/on/off/y/n 时被 load 成 bool, dump 后变
+    true/false 损坏凭据且匹配逻辑恒判"变更"。回退为字符串原值。"""
+    for p in proxies:
+        for k in ("username", "password", "server"):
+            v = p.get(k)
+            if isinstance(v, bool):
+                p[k] = "true" if v else "false"
+    return proxies
+
+
 def fetch_and_parse():
-    """curl 子进程拉取 (python urllib 直连该域 TLS 握手易超时, curl 复用系统 TLS 稳定)."""
-    import yaml
-    last_err = None
-    for attempt in range(3):
-        r = subprocess.run(["curl", "-sS", "--max-time", "40", "-A", "clash-verge/1.6.6",
-                            SUB_URL, "-o", "/tmp/pigeonw-fetch.yaml"],
-                           capture_output=True, text=True)
-        if r.returncode == 0 and os.path.getsize("/tmp/pigeonw-fetch.yaml") > 100:
-            break
-        last_err = (r.returncode, r.stderr[-200:])
-        time.sleep(3)
-    else:
-        raise RuntimeError(f"fetch failed after 3 attempts: {last_err}")
-    d = yaml.safe_load(Path("/tmp/pigeonw-fetch.yaml").read_text())
-    return d.get("proxies", [])
+    """curl 子进程拉取 (python urllib 直连该域 TLS 握手易超时, curl 复用系统 TLS 稳定).
+
+    凭据文件落在 0700 私有临时目录, 解析后即删 (订阅含上游账密, /tmp 默认 0644)."""
+    import shutil, tempfile, yaml
+    work = Path(tempfile.mkdtemp(prefix="pigeonw-refresh-"))
+    try:
+        os.chmod(work, 0o700)
+        fetch_file = work / "fetch.yaml"
+        last_err = None
+        for attempt in range(3):
+            r = subprocess.run(["curl", "-sS", "--max-time", "40", "-A", "clash-verge/1.6.6",
+                                _sub_url(), "-o", str(fetch_file)],
+                               capture_output=True, text=True)
+            if r.returncode == 0 and fetch_file.exists() and fetch_file.stat().st_size > 100:
+                break
+            last_err = (r.returncode, r.stderr[-200:])
+            time.sleep(3)
+        else:
+            raise RuntimeError(f"fetch failed after 3 attempts: {last_err}")
+        d = yaml.safe_load(fetch_file.read_text())
+        return _unbool_proxies(d.get("proxies", []))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def probe_via_listeners(proxies):
@@ -70,14 +96,19 @@ def probe_via_listeners(proxies):
     cfg = {"proxies": proxies, "listeners": listeners, "mode": "global",
            "log-level": "warning", "ipv6": False, "allow-lan": False,
            "external-controller": ""}
-    tmp = Path("/tmp/pigeonw-refresh-probe.yaml")
-    tmp.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False))
-    proc = subprocess.run(["/opt/ip-pool/bin/mihomo", "-t", "-d", "/tmp/mihomo-probe", "-f", str(tmp)],
+    # datadir 独立 (sub 刷新脚本共享 /tmp/mihomo-probe 曾有并发写坏 geo 缓存风险)
+    probe_dir = Path("/tmp/mihomo-probe-pigeonw")
+    probe_dir.mkdir(exist_ok=True)
+    tmp = probe_dir / "probe.yaml"
+    fd = os.open(str(tmp), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False))
+    proc = subprocess.run(["/opt/ip-pool/bin/mihomo", "-t", "-d", str(probe_dir), "-f", str(tmp)],
                           capture_output=True, text=True)
     if "successful" not in proc.stdout + proc.stderr:
         print("probe config invalid:", proc.stdout[-300:], proc.stderr[-300:], file=sys.stderr)
         return []
-    core = subprocess.Popen(["/opt/ip-pool/bin/mihomo", "-d", "/tmp/mihomo-probe", "-f", str(tmp)],
+    core = subprocess.Popen(["/opt/ip-pool/bin/mihomo", "-d", str(probe_dir), "-f", str(tmp)],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(4)
 
@@ -115,6 +146,10 @@ def probe_via_listeners(proxies):
             return [r for r in ex.map(probe, enumerate(proxies)) if r]
     finally:
         core.terminate()
+        try:
+            core.wait(timeout=5)
+        except Exception:
+            core.kill()
 
 
 def slot_key(idx):
@@ -253,8 +288,16 @@ def main():
                 "weight": 100, "tier": "premium", "relay_mode": "direct_only",
                 "fault_domain": "huawei-pigeonw-bridge", "provider_region": "us-west"}
             node["port"] = k["port"]
-            if e["exit_ip"]:
-                node["exit_ip"] = e["exit_ip"]      # 探活成功才刷新 (瞬断不覆盖旧值)
+            if idx in changed or k["node"] not in old_node_names:
+                # 换宿/新扩容槽位: 旧 exit_ip 属于上一任上游, 必须丢弃 ——
+                # 探活瞬断时宁可缺值 (下次探活回填), 不能带错值进分配。
+                if e["exit_ip"]:
+                    node["exit_ip"] = e["exit_ip"]
+                else:
+                    node.pop("exit_ip", None)
+            elif e["exit_ip"]:
+                # 未变槽位: 探活成功才刷新 (瞬断不覆盖旧值)
+                node["exit_ip"] = e["exit_ip"]
             node["vendor_name"] = f"{PROXY_PREFIX}{idx:03d}"
             new_nodes.append(node)
         keep.extend(new_nodes)
@@ -274,7 +317,28 @@ def main():
             return 1
         NODES.write_text(yaml.safe_dump(nodes_d, allow_unicode=True, sort_keys=False))
 
-        # ---- 悬空绑定清理 (淘汰槽位) ----
+        subprocess.run(["systemctl", "restart", "pigeonw-bridge.service"], check=False)
+        subprocess.run(["systemctl", "restart", "ip-pool-api.service", "ip-pool-gateway.service"], check=False)
+        time.sleep(6)
+        r = subprocess.run(["ss", "-tln"], capture_output=True, text=True)
+        listening = sum(1 for idx in assign if str(":%d " % slot_key(idx)["port"]) in r.stdout)
+        if listening < len(assign) - 2:
+            # 新状态已生效, 报 FAIL 会误导 (以为旧状态还在) —— 真回滚到部署前备份再重启。
+            print("[PIGEONW_REFRESH_FAIL] listeners missing: %d/%d up -> rolling back" % (
+                listening, len(assign)), file=sys.stderr)
+            for latest, dst in ((sorted(glob.glob(str(BACKUP_DIR / "pigeonw-bridge.yaml.*-pigeonw")))[-1], CFG),
+                                (sorted(glob.glob(str(BACKUP_DIR / "nodes.yaml.*-pigeonw")))[-1], NODES)):
+                subprocess.run(["cp", latest, str(dst)], check=False)
+            subprocess.run(["systemctl", "restart", "pigeonw-bridge.service",
+                            "ip-pool-api.service", "ip-pool-gateway.service"], check=False)
+            time.sleep(6)
+            r2 = subprocess.run(["ss", "-tln"], capture_output=True, text=True)
+            listening2 = sum(1 for idx in assign if str(":%d " % slot_key(idx)["port"]) in r2.stdout)
+            print("[PIGEONW_REFRESH_ROLLBACK] restored pre-refresh state, listeners=%d/%d" % (
+                listening2, len(assign)), file=sys.stderr)
+            return 1
+
+        # ---- 悬空绑定清理 (部署验证通过后执行: 旧桥核活着时先清理, 请求可能重绑到已退役节点) ----
         dangling = old_node_names - new_names
         if dangling:
             import sqlite3
@@ -288,14 +352,6 @@ def main():
             conn.close()
             print(f"dangling bindings cleaned: {n_alloc} allocations over {len(dangling)} retired nodes")
 
-        subprocess.run(["systemctl", "restart", "pigeonw-bridge.service"])
-        subprocess.run(["systemctl", "restart", "ip-pool-api.service", "ip-pool-gateway.service"])
-        time.sleep(6)
-        r = subprocess.run(["ss", "-tln"], capture_output=True, text=True)
-        listening = sum(1 for idx in assign if str(":%d " % slot_key(idx)["port"]) in r.stdout)
-        if listening < len(assign) - 2:
-            print("[PIGEONW_REFRESH_FAIL] listeners missing: %d/%d up" % (listening, len(assign)), file=sys.stderr)
-            return 1
         print("deployed: %d slots (kept=%d changed=%d retired=%d), verified listening=%d, nodes=%d" % (
             len(assign), len(assign) - len(changed), len(changed), len(retired), listening, len(keep)))
         return 0

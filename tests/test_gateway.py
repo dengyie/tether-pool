@@ -269,10 +269,56 @@ def test_gateway_password_gate(temp_gateway, monkeypatch):
     assert not gw2._password_ok("Basic " + base64.b64encode(b"acct").decode())
     assert not gw2._password_ok("Basic !!!notb64!!!")
     assert not gw2._password_ok("")
+    # 非 ASCII (坏字节经 utf-8 replace 变 U+FFFD): 必须 False, 不得抛 TypeError
+    assert not gw2._password_ok("Basic " + base64.b64encode(b"\xff\xfe:pass").decode())
     # 默认（未设 env）: password None, 检查恒 False 但 handle_client 不会走到（门关闭）
     monkeypatch.delenv("GATEWAY_PASSWORD")
     gw3 = ForwardProxyGateway(storage, router, host="127.0.0.1", port=0)
     assert gw3.password is None
+
+
+def test_gateway_metrics_exempt_from_password(temp_gateway, monkeypatch):
+    """review 缺口回归: /metrics 免密必须真实可达 (含 query 串), 其他路径仍被门拦。"""
+    gateway, storage, router = temp_gateway
+    monkeypatch.setenv("GATEWAY_PASSWORD", "s3cret")
+    gw2 = ForwardProxyGateway(storage, router, host="127.0.0.1", port=0)
+    assert gw2._metrics_exempt("GET", "/metrics")
+    assert gw2._metrics_exempt("GET", "/metrics?x=1")
+    assert not gw2._metrics_exempt("GET", "/metrics/")       # 路径变形不豁免
+    assert not gw2._metrics_exempt("POST", "/metrics")
+    assert not gw2._metrics_exempt("CONNECT", "/metrics")
+    assert not gw2._metrics_exempt("GET", "/other")
+
+
+def test_gateway_plain_http_407(temp_gateway, monkeypatch):
+    """review 缺口回归: 非 CONNECT (明文 HTTP) 请求错密码也必须 407。"""
+    import asyncio
+    gateway, storage, router = temp_gateway
+    monkeypatch.setenv("GATEWAY_PASSWORD", "s3cret")
+    gw2 = ForwardProxyGateway(storage, router, host="127.0.0.1", port=0)
+
+    class FakeWriter:
+        def __init__(self):
+            self.buffer = b""
+            self.closed = False
+        def write(self, data): self.buffer += data
+        async def drain(self): pass
+        def close(self): self.closed = True
+        def get_extra_info(self, k): return ("127.0.0.1", 9999)
+
+    class FakeReader:
+        def __init__(self, payload): self._payload = payload
+        async def readuntil(self, sep):
+            idx = self._payload.index(sep) + len(sep)
+            data, self._payload = self._payload[:idx], self._payload[idx:]
+            return data
+
+    bad = b"Basic " + base64.b64encode(b"acct:wrong")
+    payload = (b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n"
+               b"Proxy-Authorization: " + bad + b"\r\n\r\n")
+    fw = FakeWriter()
+    asyncio.run(gw2.handle_client(FakeReader(payload), fw))
+    assert b"407" in fw.buffer and fw.closed
 
 
 def test_gateway_password_gate_end_to_end(temp_gateway, monkeypatch):

@@ -111,11 +111,14 @@ def collect_ban_exclusions(
 
     opt-in 语义 (用户拍板 2026-11-14): 三个 avoid_* 全部缺省时零查询、空集合,
     调用方完全不受 quarantine 影响。avoid_banned 才取 quarantine 行;
-    avoid_cidrs 显式网段独立生效; ISP 集只从 quarantine 行派生。"""
+    avoid_cidrs 显式网段独立生效; ISP 集从 quarantine 行派生 —— 单独 avoid_same_isp
+    (不带 avoid_banned) 也取行 (只派生 ISP 集, 不产节点名/网段排除)。"""
     if not (avoid_banned or avoid_cidrs or avoid_same_isp):
         return set(), [], set()
-    quarantines = storage.get_active_quarantines(service=service) if avoid_banned else []
-    names: Set[str] = {q.node_name for q in quarantines}
-    isps: Set[str] = {q.isp for q in quarantines if q.isp}
-    nets = build_ban_excluded_networks(quarantines, avoid_cidrs)
+    quarantines = storage.get_active_quarantines(service=service) if (avoid_banned or avoid_same_isp) else []
+    names: Set[str] = {q.node_name for q in quarantines} if avoid_banned else set()
+    isps: Set[str] = {q.isp for q in quarantines if q.isp} if avoid_same_isp else set()
+    # build_ban_excluded_networks 同时处理 quarantine /24 与显式 CIDR (str -> ip_network),
+    # avoid_banned=False 时传空 quarantine 行, 显式 CIDR 仍走同一转换, 不得绕过。
+    nets = build_ban_excluded_networks(quarantines if avoid_banned else [], avoid_cidrs)
     return names, nets, isps

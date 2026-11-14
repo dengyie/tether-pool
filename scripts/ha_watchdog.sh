@@ -4,13 +4,14 @@
 STATE=/tmp/ip_pool_watchdog_state
 declare -A FAIL
 
-# ① 服务
-for svc in ip-pool-api ip-pool-gateway ip-pool-huawei-bridge; do
+# ① 服务 (pigeonw-bridge 是独立生产桥核, 2026-11-14 review 补入守护)
+for svc in ip-pool-api ip-pool-gateway ip-pool-huawei-bridge pigeonw-bridge; do
   systemctl is-active --quiet "$svc" || FAIL[$svc]=1
 done
 # ② 桥核 listener (mihomo 静默跳过冲突端口的教训 -> 必须数端口)
+# 端段: teleapi 11101-11239 / pigeonw 12053-12099 (扩容上限) / gen 21001-24873 / sub 25001-25099
 if [ -z "${FAIL[ip-pool-huawei-bridge]:-}" ]; then
-  L=$(ss -tln | grep -cE ":(111[0-9]{2}|120[5-7][0-9]|2[1-4][0-9]{3}|250[0-7][0-9]) ")
+  L=$(ss -tln | grep -cE ":(111[0-9]{2}|120[5-9][0-9]|2[1-4][0-9]{3}|250[0-9][0-9]) ")
   if [ "${L:-0}" -lt 3000 ]; then FAIL[bridge_listeners]="$L"; fi
 fi
 # ③ api 健康
@@ -33,7 +34,7 @@ PREV=$(cat "$STATE" 2>/dev/null)
 if [ -z "$PREV" ]; then
   echo "$KEY" > "$STATE"
   echo "[HA_SELFHEAL] first-seen failures: $KEY — restarting services"
-  for svc in ip-pool-api ip-pool-gateway ip-pool-huawei-bridge; do
+  for svc in ip-pool-api ip-pool-gateway ip-pool-huawei-bridge pigeonw-bridge; do
     systemctl try-restart "$svc"
   done
   exit 0

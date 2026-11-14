@@ -4,6 +4,7 @@ api/server.py - FastAPI service for the IP Pool System
 
 import os
 import time
+import hmac
 import yaml
 import asyncio
 from datetime import datetime, timedelta
@@ -229,9 +230,16 @@ async def bearer_auth_middleware(request: Request, call_next):
         if request.url.path != "/health":
             token = _provided_token(request)
             svc = await _request_service(request) if SERVICE_TOKENS else None
-            if API_TOKEN and token == API_TOKEN:
+
+            def _tok_eq(a: Optional[str], b: Optional[str]) -> bool:
+                # 时序安全 + bytes 比较 (与网关 _password_ok 同源; str 比较对非 ASCII 也会抛)
+                if not a or not b:
+                    return False
+                return hmac.compare_digest(a.encode("utf-8", "replace"), b.encode("utf-8"))
+
+            if API_TOKEN and _tok_eq(token, API_TOKEN):
                 authorized = True
-            elif SERVICE_TOKENS and svc is not None and token and token == SERVICE_TOKENS.get(svc):
+            elif SERVICE_TOKENS and svc is not None and token and _tok_eq(token, SERVICE_TOKENS.get(svc)):
                 authorized = True
             elif API_TOKEN:
                 # 全局令牌模式 (既有行为): 除 /health 外一律要求全局令牌,
