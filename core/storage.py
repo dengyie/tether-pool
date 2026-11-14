@@ -20,6 +20,19 @@ from core.quality import IPQualityEvaluator
 DB_PATH = os.environ.get("IP_POOL_DB", os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "ip_pool.db"))
 
 
+def region_from_country(cc: Optional[str]) -> Optional[str]:
+    """出口国家码 -> 池内 region 约定值 (与 sub_pool_refresh.region_of 同语义):
+    us -> us-west (区域桶名), 其他国家 -> 小写 ISO 码 (de/ca/nl/...)。
+    输入为空/非法时返回 None (调用方据此跳过纠偏, 宁缺勿错)。
+    """
+    if not cc or not isinstance(cc, str):
+        return None
+    c = cc.strip().lower()
+    if len(c) != 2 or not c.isalpha():
+        return None
+    return "us-west" if c == "us" else c
+
+
 class Storage:
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
@@ -321,6 +334,7 @@ class Storage:
         """
         now_str = datetime.now().isoformat()
         transition_event: Optional[CircuitEvent] = None
+        drift_labels: Optional[Dict[str, str]] = None
 
         with self._get_conn() as conn:
             # 1. Record probe history
@@ -368,6 +382,22 @@ class Storage:
                 # 与 exit_ip 写入同一事务, avoid_same_isp 判定拿到的是新鲜 ISP。
                 from core.ban import refresh_isp_tag
                 updated_node = refresh_isp_tag(node, res.exit_ip)
+                new_tags = updated_node.tags if updated_node else node.tags
+                # gen 区域漂移纠偏 (R2 2026-11-14): CF trace loc= 是出口真实国家,
+                # gen 批次当初硬编码 us-west 但 ~50% 出口实际在 DE/CA —— 标签失真
+                # 击穿 region_strict 与 auto_rehome。与 exit_ip 同事务校正为真实
+                # 国家码 (us->us-west), 仅限 gen 池 (tags 含 genproxy); sub 池每日
+                # 刷新自带 region_of, pigeonw/teleapi 出界不动。
+                new_region, new_provider_region = node.region, node.provider_region
+                probe_region = region_from_country(res.country_code)
+                if probe_region and probe_region != node.region and "genproxy" in node.tags:
+                    new_region = probe_region
+                    new_provider_region = probe_region
+                    if "geo-fixed" not in new_tags:
+                        new_tags = list(new_tags) + ["geo-fixed"]
+                    # incr_metric 在 with 块外调 (线程本地连接复用下嵌套 with 的
+                    # commit 会截断本事务的原子性)
+                    drift_labels = {"from": node.region, "to": probe_region}
                 conn.execute("""
                     UPDATE nodes SET
                         exit_ip = ?,
@@ -381,14 +411,17 @@ class Storage:
                         last_probed_at = ?,
                         tier = ?,
                         quality_score = ?,
-                        tags = ?
+                        tags = ?,
+                        region = ?,
+                        provider_region = ?
                     WHERE name = ?
                 """, (
                     res.exit_ip, res.latency_ms, new_state, new_state,
                     new_fails, new_succs, next_allowed_str, now_str,
                     q_tier, q_score,
                     # 无需校正时原样回写 (JSON 序列化与列存储同形)
-                    json.dumps(updated_node.tags if updated_node else node.tags, ensure_ascii=False),
+                    json.dumps(new_tags, ensure_ascii=False),
+                    new_region, new_provider_region,
                     res.node_name
                 ))
             else:
@@ -425,6 +458,9 @@ class Storage:
                     reason=reason,
                     created_at=now_str
                 )
+
+        if drift_labels:
+            self.incr_metric("ip_pool_region_drift_fixed_total", drift_labels)
 
         return res, transition_event
 

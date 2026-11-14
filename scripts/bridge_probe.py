@@ -33,8 +33,10 @@ def probe_via_listeners(
     allow_lan: bool = None,
     max_workers: int = 50,
 ):
-    """临时 mihomo 核 + 明文 ip-api 探活, 返回 [(idx, proxy, exit_ip)] (仅活节点)。
+    """临时 mihomo 核 + 明文 ip-api 探活, 返回 [(idx, proxy, exit_ip, country_code)] (仅活节点)。
 
+    country_code 是 ip-api 的两字母国家码 (US/DE/...), 查不到时为 None;
+    gen 区域纠偏 (gen_region_fix) 依赖它, 旧调用方按位置取前三个不受影响。
     调用方传入互不重叠的 probe_pool / probe_dir, 两个刷新脚本即可并发运行。
     """
     import yaml
@@ -84,7 +86,7 @@ def probe_via_listeners(
             body = data.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in data else b""
             j = json.loads(body)
             if j.get("query"):
-                return (i, p, j["query"])
+                return (i, p, j["query"], j.get("countryCode") or None)
         except Exception:
             return None
         return None

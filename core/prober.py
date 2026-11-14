@@ -95,7 +95,9 @@ class Prober:
                         node_name=node.name,
                         success=True,
                         exit_ip=exit_ip,
-                        latency_ms=latency
+                        latency_ms=latency,
+                        # CF trace 自带 loc= 出口国家码 (区域漂移纠偏的免费 geo 信号)
+                        country_code=(parsed.get("loc") or None) if is_cf_trace else None
                     )
                     # sqlite 写移出事件环 (二轮 review #2): sweep 并发下每次同步
                     # 写库都是一次全事件环停顿。

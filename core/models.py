@@ -96,6 +96,9 @@ class ProbeResult(BaseModel):
     exit_ip: Optional[str] = None
     latency_ms: float = 0.0
     error: Optional[str] = None
+    # 出口国家码 (CF trace loc= 字段, ISO 两字母大写), 仅 clash 代理路径有;
+    # gen 区域漂移纠偏 (region_from_country) 依赖它, native v4 路径为 None。
+    country_code: Optional[str] = None
 
 
 class LeaseInfo(BaseModel):

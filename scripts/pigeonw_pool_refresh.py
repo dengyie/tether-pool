@@ -131,7 +131,7 @@ def main():
                 len(alive), len(fetched)), file=sys.stderr)
             return 1
         exit_ip_by_entry = {(p["server"], int(p.get("port", 0)), p.get("username"), p.get("password")): ip
-                            for (_, p, ip) in alive}
+                            for (_, p, ip, _cc) in alive}
 
         # ---- 读取现状 ----
         main_cfg = yaml.safe_load(CFG.read_text())

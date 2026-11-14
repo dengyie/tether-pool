@@ -113,6 +113,10 @@ class MetricsCollector:
                 "# HELP ip_pool_quarantine_gauge_errors_total Failed scrape-time reads of active quarantines (quarantine gauge unavailable, review F7)",
                 "# TYPE ip_pool_quarantine_gauge_errors_total counter",
             ),
+            "ip_pool_region_drift_fixed_total": (
+                "# HELP ip_pool_region_drift_fixed_total gen node region corrections on probe (exit country vs label drift, us->us-west else ISO)",
+                "# TYPE ip_pool_region_drift_fixed_total counter",
+            ),
         }
         for name, (help_line, type_line) in counters.items():
             emitted = False

@@ -103,7 +103,7 @@ def main():
         main["proxies"] = [p for p in main["proxies"] if not is_sub(p["name"])]
         main["listeners"] = [l for l in main["listeners"] if not str(l.get("name", "")).startswith("sub-bridge-")]
         new_proxies, new_listeners, new_nodes = [], [], []
-        for i, (_, p, ip) in enumerate(alive):
+        for i, (_, p, ip, _cc) in enumerate(alive):
             p["udp"] = False
             new_proxies.append(p)
             new_listeners.append({"name": f"sub-bridge-{i:03d}", "type": "socks",
