@@ -202,3 +202,10 @@ python3 scripts/import_standalone.py realize --group NAME
 ### 中转（dialer-proxy）判定
 
 华为云境内→上游直拨无跨 GFW RST（与 Mac §六场景相反），**本批未挂中转**。判定法：探活若出现大量 `TimeoutError`/连接重置而节点 vendor 侧正常，才按 §六 `relay` 流程接 AWS 中转。
+
+### 深度 review 加固（2026-11-14 高可用迭代）
+
+1. **网关共享密码门（P0，commit `185a715`）**：Basic password 历史上从不校验（文档约定 `tetherpool` 但代码无比对），mesh 内任意进程可用任意/空密码消费全池出口。新 `GATEWAY_PASSWORD` env 强制校验（`/metrics` 免密；未设 = 维持旧行为，测试零成本）；生产已设 `tetherpool`（zcode agent 凭据不变），错密码 407 / 对密码 200 线上验证。
+2. **磁盘水位（P0）**：40G 盘曾被 `/var/tmp` agent-fleet 验证残留（12.6G）+ journal（465M）+ 部署备份堆积顶到 97%（磁盘满 → sqlite 写坏 = 全池不可用）。清理后 53%；journal 持久化限额 `SystemMaxUse=200M`。
+3. **桥核开机自启（P1）**：`ip-pool-huawei-bridge.service` 曾 disabled——VPS 重启后 api/gateway 自启但桥核不回来 = 全池死。已 enable。
+4. **sub 刷新脚本加固（P1）**：flock 单实例锁（cron/手动互斥）；替换后旧节点悬空绑定 sqlite 清理；备份带时间戳滚动保留 7 份 + `-t` 失败自动回滚；失败 stderr 打 `[SUB_REFRESH_FAIL]` 可 grep 告警。实战抓出 2 个坑：订阅内部重名（免费池 master 偶发同名节点 → mihomo duplicate name 拒载，入池前必须去重后缀）、历史版本入池用裸名（`is_sub` 前缀匹配清不掉旧裸名 → 两批叠加撞名，识别特征需含【机房】/【商宽】）。
