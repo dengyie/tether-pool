@@ -9,9 +9,9 @@ for svc in ip-pool-api ip-pool-gateway ip-pool-huawei-bridge pigeonw-bridge; do
   systemctl is-active --quiet "$svc" || FAIL[$svc]=1
 done
 # ② 桥核 listener (mihomo 静默跳过冲突端口的教训 -> 必须数端口)
-# 端段: teleapi 11101-11239 / pigeonw 12053-12099 (扩容上限) / gen 21001-24873 / sub 25001-25099
+# 端段: teleapi 11101-11239 / pigeonw 12053-12099 (扩容上限) / gen 21001-24873 / sub 25001-25099 / skyward 25501-25699
 if [ -z "${FAIL[ip-pool-huawei-bridge]:-}" ]; then
-  L=$(ss -tln | grep -cE ":(111[0-9]{2}|120[5-9][0-9]|2[1-4][0-9]{3}|250[0-9][0-9]) ")
+  L=$(ss -tln | grep -cE ":(111[0-9]{2}|120[5-9][0-9]|2[1-4][0-9]{3}|25[05][0-9][0-9]) ")
   if [ "${L:-0}" -lt 3000 ]; then FAIL[bridge_listeners]="$L"; fi
 fi
 # ③ api 健康
