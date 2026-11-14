@@ -209,3 +209,10 @@ python3 scripts/import_standalone.py realize --group NAME
 2. **磁盘水位（P0）**：40G 盘曾被 `/var/tmp` agent-fleet 验证残留（12.6G）+ journal（465M）+ 部署备份堆积顶到 97%（磁盘满 → sqlite 写坏 = 全池不可用）。清理后 53%；journal 持久化限额 `SystemMaxUse=200M`。
 3. **桥核开机自启（P1）**：`ip-pool-huawei-bridge.service` 曾 disabled——VPS 重启后 api/gateway 自启但桥核不回来 = 全池死。已 enable。
 4. **sub 刷新脚本加固（P1）**：flock 单实例锁（cron/手动互斥）；替换后旧节点悬空绑定 sqlite 清理；备份带时间戳滚动保留 7 份 + `-t` 失败自动回滚；失败 stderr 打 `[SUB_REFRESH_FAIL]` 可 grep 告警。实战抓出 2 个坑：订阅内部重名（免费池 master 偶发同名节点 → mihomo duplicate name 拒载，入池前必须去重后缀）、历史版本入池用裸名（`is_sub` 前缀匹配清不掉旧裸名 → 两批叠加撞名，识别特征需含【机房】/【商宽】）。
+
+### 深度修复二轮（2026-11-14 下午，同日迭代）
+
+5. **HA 看门狗（P0）**：`ip-pool-watchdog.timer` 每 5min 自检五项——三服务 active、桥核 listener ≥3000（**必须数端口**：mihomo 静默跳过冲突端口的教训）、api `/health`、根分区 <90%、探活新鲜度 <15min（防 api 活着但探活线程挂死的盲区）。**分级处置**：首次异常 `[HA_SELFHEAL]` 自动 try-restart 三服务；持续异常 `[HA_ALERT]` 只告警不再重启（防重启风暴）。已注入故障验证两条路径。脚本入仓 `scripts/ha_watchdog.sh`（commit `e9b3236`）。
+6. **密钥迁移 secrets.env（P0）**：`IP_POOL_SERVICE_TOKENS`/`GATEWAY_PASSWORD` 原明文写在 unit 文件里且 unit 是 **644**（任何本地用户可读）。迁移 `/etc/ip-pool-secrets.env`（600 root），unit 改 `EnvironmentFile=`。门禁回归：401/200/407/200 全对。
+7. **sub 刷新脚本二轮**：写入强制 `s1-` 前缀（裸名事故根治）；部署后 sleep 6 用 `ss -tln` 实数 listener 在位数（<预期-2 判 FAIL）；epoch 表无 node 列（SQL 绑定数不匹配会炸——`binding_epoch_state` 只有 service/epoch/changed_at）。
+8. **备份轮换兜底**：pull_deploy 保留 3 份逻辑本身正常（当日 310M 是手工 db bak 混入）；补每日 05:00 cron 兜底轮换防部署脚本不跑时堆积。
