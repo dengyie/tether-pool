@@ -2,6 +2,7 @@
 core/circuit.py - Industrial-grade Circuit Breaker with Exponential Backoff & Jitter
 """
 
+import os
 import random
 from typing import Optional, Tuple
 from datetime import datetime, timedelta
@@ -41,27 +42,42 @@ class CircuitBreaker:
         node: ProxyNode,
         success: bool,
         latency_ms: float = 0.0,
-        error: Optional[str] = None
+        error: Optional[str] = None,
+        consecutive_successes: int = 0,
     ) -> Tuple[str, str, Optional[datetime]]:
         """
         Evaluates a probe result and determines the next circuit state,
         reason, and next_probe_allowed_at (if tripped into OPEN/DEAD).
         Returns: (new_state, reason, next_allowed_at)
+
+        Recovery gate (HAProxy rise=2 / Consul success_before_passing, 2026-11-15):
+        a DEAD/HALF_OPEN node's first canary success only enters a DEGRADED
+        observation period; a second consecutive success confirms HEALTHY.
+        consecutive_successes is the post-increment value the caller computed.
         """
         current_state = node.status
         now = datetime.now()
 
         if success:
             if current_state in (HealthStatus.DEAD.value, HealthStatus.HALF_OPEN.value):
+                # rise=2: canary success -> observation period, not full recovery.
+                # DEGRADED is excluded from the normal allocation ladder, giving
+                # a slowstart-style ramp before full traffic resumes.
                 return (
-                    HealthStatus.HEALTHY.value,
-                    "half_open_probe_succeeded_circuit_closed",
+                    HealthStatus.DEGRADED.value,
+                    "half_open_probe_succeeded_entering_observation",
                     None
                 )
             elif current_state == HealthStatus.DEGRADED.value:
+                if consecutive_successes >= 2:
+                    return (
+                        HealthStatus.HEALTHY.value,
+                        "recovery_confirmed_after_observation",
+                        None
+                    )
                 return (
-                    HealthStatus.HEALTHY.value,
-                    "degraded_recovered_to_healthy",
+                    HealthStatus.DEGRADED.value,
+                    "recovery_observation_continues",
                     None
                 )
             else:
@@ -108,6 +124,44 @@ class CircuitBreaker:
                     f"consecutive_failure_while_dead: {err_summary}",
                     next_allowed
                 )
+
+    # Envoy outlier-detection safeguards (2026-11-15): cap how far a single
+    # sweep may expand the DEAD set. Without this, one upstream-wide hiccup
+    # (subscription edge case, CF trace outage) could mass-eject the pool and
+    # starve the allocator. domain cap 50% fits our heterogeneous multi-source
+    # pool (each source = its own fault domain); global 30% is the panic backstop.
+    DOMAIN_DEAD_RATIO_CAP = 0.50
+    GLOBAL_DEAD_RATIO_CAP = 0.30
+    # Envoy success_rate_minimum_hosts 思想: 小样本不做统计性拒绝 —— 全池节点数
+    # 低于该值时 (单测/极小部署) guard 直接放行, 否则 1 个节点 dead = 100% 必拦。
+    MIN_POOL_FOR_GUARD = 20
+
+    @classmethod
+    def allow_trip(cls, node: ProxyNode, conn) -> Tuple[bool, str]:
+        """Decide whether a NEW DEAD transition may proceed (called inside the
+        update_probe_result transaction, conn = same sqlite connection).
+        Returns (allowed, reason). Renewals of already-DEAD nodes are checked
+        by the caller (this only guards the DEGRADED/HALF_OPEN -> DEAD edge).
+        Env `IP_POOL_MASS_GUARD=0` disables the guard entirely (kill-switch)."""
+        if os.environ.get("IP_POOL_MASS_GUARD", "1") in ("0", "false", "no"):
+            return True, "mass_guard_disabled_by_env"
+        row = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()
+        if (row[0] or 0) < cls.MIN_POOL_FOR_GUARD:
+            return True, "pool_too_small_for_guard"
+        domain = node.fault_domain or ""
+        if domain:
+            row = conn.execute(
+                "SELECT COUNT(*), SUM(CASE WHEN status='dead' THEN 1 ELSE 0 END) "
+                "FROM nodes WHERE fault_domain = ?", (domain,)).fetchone()
+            total, dead = (row[0] or 0), (row[1] or 0)
+            if total > 0 and (dead + 1) / total > cls.DOMAIN_DEAD_RATIO_CAP:
+                return False, f"ejection_capped_domain_over_{int(cls.DOMAIN_DEAD_RATIO_CAP * 100)}pct"
+        row = conn.execute(
+            "SELECT COUNT(*), SUM(CASE WHEN status='dead' THEN 1 ELSE 0 END) FROM nodes").fetchone()
+        total, dead = (row[0] or 0), (row[1] or 0)
+        if total > 0 and (dead + 1) / total > cls.GLOBAL_DEAD_RATIO_CAP:
+            return False, f"panic_mode_global_dead_over_{int(cls.GLOBAL_DEAD_RATIO_CAP * 100)}pct"
+        return True, "allowed"
 
     @staticmethod
     def is_cooldown_expired(node: ProxyNode) -> bool:

@@ -55,6 +55,12 @@ PROBE_INTERVAL_SECONDS = int(os.environ.get("IP_POOL_PROBE_INTERVAL", "300"))
 # 25 并发会把死节点多的轮次拖到 2.5 分钟以上。可用 env 调回保守值。
 PROBE_CONCURRENCY = int(os.environ.get("IP_POOL_PROBE_CONCURRENCY", "50"))
 PROBE_HISTORY_KEEP_DAYS = int(os.environ.get("IP_POOL_PROBE_HISTORY_KEEP_DAYS", "7"))
+# 病号加速探测 (Traefik unhealthyInterval / HAProxy downinter, 2026-11-15):
+# DEGRADED 节点单独走 60s 快轮, 恢复确认 (rise=2) 从最坏 600s 缩到 ~120s;
+# healthy 节点保持 300s 全量轮不变。
+PROBE_SICK_INTERVAL_SECONDS = int(os.environ.get("IP_POOL_PROBE_SICK_INTERVAL", "60"))
+PROBE_SICK_CONCURRENCY = int(os.environ.get("IP_POOL_PROBE_SICK_CONCURRENCY", "20"))
+PROBE_SICK_CAP = int(os.environ.get("IP_POOL_PROBE_SICK_CAP", "100"))
 # Prober 每次拨号的超时 (settings.probe_timeout_seconds / env 可覆盖)
 DEFAULT_PROBE_TIMEOUT = 12.0
 # Config files below this node count are treated as incomplete (e.g. a scratch
@@ -231,16 +237,38 @@ async def background_probe_loop():
         await asyncio.sleep(PROBE_INTERVAL_SECONDS)
 
 
+async def _sick_probe_sweep():
+    """One sick-sweep tick: fast re-probe of DEGRADED nodes only (extracted
+    for test drivability, same pattern as _scheduled_probe_sweep)."""
+    sick = [n for n in storage.list_nodes(status=HealthStatus.DEGRADED.value)][:PROBE_SICK_CAP]
+    if not sick:
+        return
+    results = await prober.probe_all(concurrency=PROBE_SICK_CONCURRENCY, nodes=sick)
+    recovered = sum(1 for r in results if r.success)
+    print(f"[+] Sick probe finished: {recovered}/{len(sick)} degraded nodes recovering.")
+
+
+async def background_sick_probe_loop():
+    while True:
+        try:
+            await _sick_probe_sweep()
+        except Exception as e:
+            print(f"[-] Sick probe error: {e}")
+        await asyncio.sleep(PROBE_SICK_INTERVAL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_initial_nodes()
     # Initial probe in background on startup
     probe_task = asyncio.create_task(background_probe_loop())
+    sick_task = asyncio.create_task(background_sick_probe_loop())
     yield
     # Await the cancellation so in-flight probe sockets are closed before shutdown
     # instead of being torn down mid-await during interpreter exit.
     probe_task.cancel()
-    await asyncio.gather(probe_task, return_exceptions=True)
+    sick_task.cancel()
+    await asyncio.gather(probe_task, sick_task, return_exceptions=True)
 
 
 app = FastAPI(
@@ -454,6 +482,75 @@ def update_node(name: str, req: NodeUpdateRequest):
         router.rehome_leases_for_node(name)
 
     return updated_node
+
+
+@app.post("/v1/nodes/bulk-disable")
+def bulk_disable_nodes(req: dict):
+    """批量管理员禁用: body {"tag": "skyward"} 或 {"region": "hk"} (单池级熔断处置)。
+    语义同单节点 disable: 探活不碰、不入分配、重启后仍生效; rehome 全部绑定。
+    返回 {disabled: [...], skipped: [...]}。"""
+    tag = (req.get("tag") or "").strip()
+    region = (req.get("region") or "").strip()
+    if not tag and not region:
+        raise HTTPException(status_code=422, detail="body must provide 'tag' or 'region'")
+    if tag and region:
+        raise HTTPException(status_code=422, detail="provide only one of 'tag' or 'region'")
+    reason = (req.get("reason") or f"bulk_disable:{tag or region}")[:80]
+    pool = [n for n in storage.list_nodes(region=region or None)
+            if tag in (n.tags or [])] if tag else storage.list_nodes(region=region)
+    targets = [n for n in pool if n.status != HealthStatus.DISABLED.value]
+    disabled, skipped = [], []
+    with BINDING_WRITE_LOCK:
+        for n in targets:
+            updated = storage.update_node(n.name, {"status": HealthStatus.DISABLED.value,
+                                                   "circuit_state": HealthStatus.DISABLED.value})
+            if not updated:
+                skipped.append(n.name)
+                continue
+            storage.record_circuit_event(n.name, n.status, HealthStatus.DISABLED.value, reason)
+            router.rehome_leases_for_node(n.name)
+            disabled.append(n.name)
+    return {"disabled": disabled, "skipped": skipped, "count": len(disabled)}
+
+
+@app.post("/v1/nodes/{name}/disable", response_model=ProxyNode)
+def disable_node(name: str, req: dict = None):
+    """管理员禁用 (2026-11-15): 与自动 DEAD 彻底分离 —— 探活跳过、永不自动恢复、
+    不入分配; 重启/yaml 重载后仍生效 (upsert 保 DISABLED); 订阅池刷新重建节点
+    条目时自然解除。节点上的绑定立即 rehome。"""
+    existing = storage.get_node(name)
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Node '{name}' not found")
+    if existing.status == HealthStatus.DISABLED.value:
+        return existing
+    reason = ((req or {}).get("reason") or "admin_disabled")[:80]
+    with BINDING_WRITE_LOCK:
+        updated = storage.update_node(name, {"status": HealthStatus.DISABLED.value,
+                                             "circuit_state": HealthStatus.DISABLED.value})
+        if not updated:
+            raise HTTPException(status_code=500, detail="Failed to disable node")
+        storage.record_circuit_event(name, existing.status, HealthStatus.DISABLED.value, reason)
+        router.rehome_leases_for_node(name)
+    return storage.get_node(name)
+
+
+@app.post("/v1/nodes/{name}/enable", response_model=ProxyNode)
+def enable_node(name: str):
+    """解除管理员禁用: 回 UNPROBED, 由下一轮探活重新定级 (不直接 HEALTHY,
+    避免 disabled 期间上游状态未知导致假阳性)。"""
+    existing = storage.get_node(name)
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Node '{name}' not found")
+    if existing.status != HealthStatus.DISABLED.value:
+        return existing
+    storage.update_node(name, {"status": HealthStatus.UNPROBED.value,
+                               "circuit_state": HealthStatus.UNPROBED.value,
+                               "consecutive_failures": 0,
+                               "consecutive_successes": 0,
+                               "next_probe_allowed_at": None})
+    storage.record_circuit_event(name, HealthStatus.DISABLED.value,
+                                 HealthStatus.UNPROBED.value, "admin_enabled")
+    return storage.get_node(name)
 
 
 @app.delete("/v1/nodes/{name}")

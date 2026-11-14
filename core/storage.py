@@ -299,8 +299,12 @@ class Storage:
                     configured_tier=COALESCE(excluded.configured_tier, nodes.configured_tier),
                     tier=CASE WHEN nodes.status != 'unprobed' AND excluded.status = 'unprobed' THEN nodes.tier ELSE excluded.tier END,
                     quality_score=CASE WHEN nodes.status != 'unprobed' AND excluded.status = 'unprobed' THEN nodes.quality_score ELSE excluded.quality_score END,
-                    status=CASE WHEN excluded.status != 'unprobed' THEN excluded.status ELSE nodes.status END,
-                    circuit_state=CASE WHEN excluded.circuit_state != 'unprobed' THEN excluded.circuit_state ELSE nodes.circuit_state END,
+                    status=CASE WHEN nodes.status = 'disabled' THEN nodes.status
+                                WHEN excluded.status != 'unprobed' THEN excluded.status
+                                ELSE nodes.status END,
+                    circuit_state=CASE WHEN nodes.status = 'disabled' THEN nodes.status
+                                       WHEN excluded.circuit_state != 'unprobed' THEN excluded.circuit_state
+                                       ELSE nodes.circuit_state END,
                     consecutive_failures=CASE WHEN excluded.status != 'unprobed' THEN excluded.consecutive_failures ELSE nodes.consecutive_failures END,
                     consecutive_successes=CASE WHEN excluded.status != 'unprobed' THEN excluded.consecutive_successes ELSE nodes.consecutive_successes END,
                     next_probe_allowed_at=CASE WHEN excluded.status != 'unprobed' THEN excluded.next_probe_allowed_at ELSE nodes.next_probe_allowed_at END,
@@ -352,18 +356,33 @@ class Storage:
             old_state = node.status
 
             # 3. Evaluate circuit transition
+            # Calculate updated counters BEFORE evaluate: rise=2 recovery gate
+            # (circuit.py) needs the post-increment consecutive_successes to
+            # decide observation -> HEALTHY promotion.
+            new_fails = 0 if res.success else (node.consecutive_failures + 1)
+            new_succs = (node.consecutive_successes + 1) if res.success else 0
+
             new_state, reason, next_allowed = CircuitBreaker.evaluate(
                 node=node,
                 success=res.success,
                 latency_ms=res.latency_ms,
-                error=res.error
+                error=res.error,
+                consecutive_successes=new_succs,
             )
 
-            next_allowed_str = next_allowed.isoformat() if next_allowed else None
+            # Mass-ejection guard (Envoy outlier safeguards, 2026-11-15): before
+            # committing a NEW DEAD transition (DEGRADED/HALF_OPEN -> DEAD edge),
+            # check the domain-bucket and global DEAD ratios. Renewals of
+            # already-DEAD nodes (cooldown extension) are never blocked.
+            if (not res.success and new_state == HealthStatus.DEAD.value
+                    and old_state != HealthStatus.DEAD.value):
+                allowed, guard_reason = CircuitBreaker.allow_trip(node, conn)
+                if not allowed:
+                    new_state = HealthStatus.DEGRADED.value
+                    reason = f"{guard_reason}: {reason[:40]}"
+                    next_allowed = None
 
-            # Calculate updated quality score & tier
-            new_fails = 0 if res.success else (node.consecutive_failures + 1)
-            new_succs = (node.consecutive_successes + 1) if res.success else 0
+            next_allowed_str = next_allowed.isoformat() if next_allowed else None
             cur_lat = res.latency_ms if res.success else node.latency_ms
             cur_ip = res.exit_ip if res.success else node.exit_ip
             q_score, q_tier, _ = IPQualityEvaluator.evaluate_node(

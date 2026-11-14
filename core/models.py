@@ -26,6 +26,9 @@ class HealthStatus(str, Enum):
     DEAD = "dead"            # Open circuit: isolated / failing
     HALF_OPEN = "half_open"  # Trial probe circuit: cooldown elapsed
     UNPROBED = "unprobed"
+    DISABLED = "disabled"    # Admin-disabled: never probed, never auto-recovers;
+                             # excluded from allocation. Only /v1/nodes/{name}/enable
+                             # (or a pool refresh rebuilding the node) lifts it.
 
 
 class Tier(str, Enum):

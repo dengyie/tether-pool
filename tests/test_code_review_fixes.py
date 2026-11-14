@@ -63,7 +63,18 @@ def test_finding1_configured_premium_recovers_after_temporary_failure():
         assert dead_node.status == HealthStatus.DEAD.value
         assert dead_node.tier == Tier.STANDARD.value  # Demoted while dead
 
-        # 2. Network recovers: probe succeeds with low latency (<350ms)
+        # 2. Network recovers: probe succeeds with low latency (<350ms).
+        # rise=2 (2026-11-15): first success enters DEGRADED observation, second
+        # consecutive success closes the circuit — premium restores on HEALTHY.
+        storage.update_probe_result(ProbeResult(
+            node_name=node.name,
+            success=True,
+            latency_ms=42.0,
+            exit_ip="1.1.1.1"
+        ))
+        observed_node = storage.get_node(node.name)
+        assert observed_node.status == HealthStatus.DEGRADED.value
+
         storage.update_probe_result(ProbeResult(
             node_name=node.name,
             success=True,

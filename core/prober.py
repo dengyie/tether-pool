@@ -31,6 +31,16 @@ class Prober:
         self.timeout = timeout
 
     async def probe_node(self, node: ProxyNode, retries: int = 1, force: bool = False) -> ProbeResult:
+        # Admin-disabled nodes are never probed (force override: explicit
+        # operator intent). Returns without touching storage — no fail_count
+        # bump, no circuit event, no probe_history row.
+        if not force and node.status == HealthStatus.DISABLED.value:
+            return ProbeResult(
+                node_name=node.name,
+                success=False,
+                latency_ms=0.0,
+                error="admin_disabled_probe_skipped"
+            )
         # Check circuit breaker cooldown if node is DEAD
         is_canary = (not force) and node.status == HealthStatus.HALF_OPEN.value
         if not force and node.status == HealthStatus.DEAD.value:
@@ -138,8 +148,14 @@ class Prober:
 
                 return res
 
-    async def probe_all(self, concurrency: int = 25, force: bool = False) -> List[ProbeResult]:
-        nodes = self.storage.list_nodes()
+    async def probe_all(self, concurrency: int = 25, force: bool = False,
+                        nodes: Optional[List[ProxyNode]] = None) -> List[ProbeResult]:
+        if nodes is None:
+            nodes = self.storage.list_nodes()
+            if not force:
+                # admin-disabled 节点不进探活 (force 除外): 管理员意图优先,
+                # 探活不碰 DISABLED, 不涨 fail_count, 不产生 circuit_event。
+                nodes = [n for n in nodes if n.status != HealthStatus.DISABLED.value]
         sem = asyncio.Semaphore(concurrency)
 
         async def _worker(node: ProxyNode) -> ProbeResult:

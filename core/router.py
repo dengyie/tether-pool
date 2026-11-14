@@ -527,12 +527,12 @@ class Router:
 
         # 3. Final fallback if cross-tier allowed (strictly exclude DEAD nodes to respect circuit breaker)
         if allow_cross_tier:
-            c = [n for n in self.storage.list_nodes(region=region, egress_type=egress_type) if n.status != HealthStatus.DEAD.value]
+            c = [n for n in self.storage.list_nodes(region=region, egress_type=egress_type) if n.status not in (HealthStatus.DEAD.value, HealthStatus.DISABLED.value)]
             if c:
                 return c
             if allow_region_relax:
-                return [n for n in self.storage.list_nodes() if n.status != HealthStatus.DEAD.value]
-            c_region = [n for n in self.storage.list_nodes(region=region) if n.status != HealthStatus.DEAD.value]
+                return [n for n in self.storage.list_nodes() if n.status not in (HealthStatus.DEAD.value, HealthStatus.DISABLED.value)]
+            c_region = [n for n in self.storage.list_nodes(region=region) if n.status not in (HealthStatus.DEAD.value, HealthStatus.DISABLED.value)]
             if c_region:
                 return c_region
 

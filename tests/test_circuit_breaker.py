@@ -67,15 +67,25 @@ def test_circuit_state_transitions(temp_env):
     n2_updated = storage.get_node("cb-tokyo-01")
     assert CircuitBreaker.is_cooldown_expired(n2_updated)
 
-    # 3. Successful probe -> Recovers to HEALTHY (Closed)
+    # 3. Successful probe -> DEGRADED observation (rise=2 recovery gate, 2026-11-15):
+    # canary success no longer closes the circuit immediately.
     res3, event3 = storage.update_probe_result(ProbeResult(node_name="cb-tokyo-01", success=True, exit_ip="2a09:bac5::1", latency_ms=100.0))
     assert event3 is not None
-    assert event3.to_state == HealthStatus.HEALTHY.value
+    assert event3.to_state == HealthStatus.DEGRADED.value
+    assert event3.reason == "half_open_probe_succeeded_entering_observation"
 
     n3 = storage.get_node("cb-tokyo-01")
-    assert n3.status == HealthStatus.HEALTHY.value
+    assert n3.status == HealthStatus.DEGRADED.value
     assert n3.consecutive_failures == 0
-    assert n3.next_probe_allowed_at is None
+    assert n3.consecutive_successes == 1
+
+    # 4. Second consecutive success -> recovery confirmed, circuit closes
+    res4, event4 = storage.update_probe_result(ProbeResult(node_name="cb-tokyo-01", success=True, exit_ip="2a09:bac5::1", latency_ms=100.0))
+    assert event4 is not None
+    assert event4.to_state == HealthStatus.HEALTHY.value
+    assert event4.reason == "recovery_confirmed_after_observation"
+    n4 = storage.get_node("cb-tokyo-01")
+    assert n4.status == HealthStatus.HEALTHY.value
 
 
 def test_lease_rehoming_on_node_trip(temp_env):

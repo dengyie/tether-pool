@@ -125,9 +125,9 @@ class AllocationEngine:
 
         # 3. Last fallback (must strictly exclude DEAD nodes)
         if not nodes and allow_cross_tier:
-            nodes = [n for n in self.storage.list_nodes(region=region, egress_type=egress_preference) if n.status != HealthStatus.DEAD.value]
+            nodes = [n for n in self.storage.list_nodes(region=region, egress_type=egress_preference) if n.status not in (HealthStatus.DEAD.value, HealthStatus.DISABLED.value)]
             if not nodes:
-                nodes = [n for n in self.storage.list_nodes() if n.status != HealthStatus.DEAD.value]
+                nodes = [n for n in self.storage.list_nodes() if n.status not in (HealthStatus.DEAD.value, HealthStatus.DISABLED.value)]
 
         # region_strict: 丢弃第三级跨区兜底带来的外区节点 (region 是硬承诺,
         # 候选剔空 -> 调用方 503, 与 Router region_strict 同语义)。
@@ -135,7 +135,7 @@ class AllocationEngine:
             nodes = [n for n in nodes if n.region == region]
 
         # Ensure no DEAD node ever passes through
-        nodes = [n for n in nodes if n.status != HealthStatus.DEAD.value]
+        nodes = [n for n in nodes if n.status not in (HealthStatus.DEAD.value, HealthStatus.DISABLED.value)]
 
         # Interleave nodes across regions for maximum geographical diversity
         region_buckets: Dict[str, List[ProxyNode]] = {}
