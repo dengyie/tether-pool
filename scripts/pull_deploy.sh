@@ -71,7 +71,16 @@ healthy() {
 }
 
 echo "[5/6] 健康门禁"
-if healthy; then
+# 宽限重试 (2026-11-14 假回退事故): api 装载 3000 节点需 ~7s, 单次 curl 在
+# startup 中途必失败 -> 误回退 (回退后的二次检查同样查得太早, 报"人工介入"
+# 实则服务稍后自行就绪)。30s x 6 次重试, 期间服务继续启动。
+gate_ok=0
+for _ in 1 2 3 4 5 6; do
+    if healthy; then gate_ok=1; break; fi
+    echo "      健康门禁未过, 5s 后重试..."
+    sleep 5
+done
+if [ "$gate_ok" = "1" ]; then
     echo "[6/6] 备份保留清理 (最近 3 份 + 每月 1 日份永久)"
     ls -1dt backups/2* 2>/dev/null | tail -n +4 | while read -r d; do
         b=$(basename "$d")
@@ -84,7 +93,12 @@ else
     git reset --hard "$PREV"
     systemctl restart ip-pool-api ip-pool-gateway
     sleep 5
-    if healthy; then
+    rollback_ok=0
+    for _ in 1 2 3 4 5 6; do
+        if healthy; then rollback_ok=1; break; fi
+        sleep 5
+    done
+    if [ "$rollback_ok" = "1" ]; then
         echo "[✓] 已回退并恢复: $PREV (故障 commit: $NEW)"
     else
         echo "[!!] 回退后仍不健康 — 需人工介入 (DB 备份: backups/$TAG/, 上一可用提交: $PREV)"
