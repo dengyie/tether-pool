@@ -93,8 +93,8 @@ def test_cmd_import_cleans_bridge_yaml_on_validation_failure(tmp_path, monkeypat
 
     rc = isa.cmd_import(argparse.Namespace(
         source="x", group="gtest", region="us-west", tier="standard", prefix=None,
-        filter_type="http", filter_server="", port_base=None, fault_domain=None,
-        replace=False, dry_run=False))
+        filter_type="http", filter_server="", tags="residential", port_base=None,
+        fault_domain=None, replace=False, dry_run=False))
     assert rc == 2
     assert not (tmp_path / "config/gtest-bridge.yaml").exists(), "校验失败必须清理残留核配置"
     assert manifest["groups"] == {}, "校验失败不得写 manifest"

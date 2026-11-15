@@ -203,11 +203,19 @@ def declared_ports(group: dict) -> list[int]:
 
 
 def realized_ports(group: dict) -> list[int]:
-    """桥接端口列表: 优先 per-node realized_map, 否则 realized 区间(按节点顺序)."""
-    rmap = group.get("bridge_ports", {}).get("realized_map") or {}
+    """桥接端口列表: 优先 per-node realized_map, 其次 realized 区间(按节点顺序);
+    首次 realize (两者皆空) 回退 declared 区间. realized_map 缺项 (死口未映射)
+    以 declared 序占位 — KeyError 会让 check 对部分死组直接崩溃."""
+    bp = group.get("bridge_ports") or {}
+    rmap = bp.get("realized_map") or {}
     if rmap:
-        return [int(rmap[str(n["idx"])]) for n in group["nodes"]]
-    lo, hi = group["bridge_ports"]["realized"].split("-")
+        declared = declared_ports(group)
+        return [int(rmap[str(n["idx"])]) if str(n["idx"]) in rmap
+                else declared[n["idx"] - 1] for n in group["nodes"]]
+    realized = bp.get("realized") or ""
+    if not realized:
+        return declared_ports(group)
+    lo, hi = realized.split("-")
     return list(range(int(lo), int(hi) + 1))
 
 
@@ -471,10 +479,16 @@ def cmd_check(args):
         # L4 只验自有核 listener 在位; L1/L3/L5 照常。
         standalone = is_standalone(group)
 
-        # L1 manifest 内部完备性 (server 必填; username/password 成对出现 — 兼容无认证代理)
-        complete = all(
-            n.get("server") and bool(n.get("username")) == bool(n.get("password"))
-            for n in group["nodes"])
+        # L1 manifest 内部完备性 (server 必填; username/password 成对 — http vendor
+        # 语义; 协议型节点 (vless/hysteria2/tuic 等) 无 Basic Auth 概念, 凭据以
+        # uuid/password/sni 等原始字段存在 manifest 节点里, 只要求 server+type 在位)
+        def _l1_ok(n: dict) -> bool:
+            if not n.get("server"):
+                return False
+            if str(n.get("type", "")).lower() in ("vless", "vmess", "hysteria2", "tuic", "hysteria", "ss", "ssr", "trojan", "snell", "wireguard"):
+                return bool(n.get("type"))
+            return bool(n.get("username")) == bool(n.get("password"))
+        complete = all(_l1_ok(n) for n in group["nodes"])
         all_ok &= layer("L1 manifest 完备性", complete,
                         f"{len(group['nodes'])} nodes" if complete else "缺 server 或凭据不成对")
 
@@ -695,7 +709,7 @@ def cmd_import(args):
         "bridge_ports": {"declared": f"{declared[0]}-{declared[-1]}", "realized": ""},
         "gateway_route": f"region={args.region}&type=clash_proxy",
         "nodes": [
-            {"idx": i + 1, "name": clash_names[i], "type": group["protocol"],
+            {"idx": i + 1, "name": clash_names[i], "type": str(proxies[0].get("type", "http")).lower(),
              "server": p["server"], "port": p["port"],
              "username": p.get("username", ""), "password": p.get("password", ""),
              "exit_ip": exits_i}

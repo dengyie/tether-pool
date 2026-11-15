@@ -27,14 +27,22 @@ PID_GW="$DATA_DIR/gateway.pid"
 LOG_API="$LOG_DIR/ip_pool.log"
 LOG_GW="$LOG_DIR/gateway.log"
 
-# Standalone mihomo bridge core (TetherPool-owned, e.g. teleapi residential
+# Standalone mihomo bridge cores (TetherPool-owned, e.g. teleapi residential
 # batch): per-node socks listeners that the gateway dials as socks5 upstream.
 # NOT the user's Clash Verge / tebi / pxed configs — lives entirely in ip-pool.
+# Multi-core since 2026-11-15: every config/*-bridge.yaml gets its own keeper
+# (manifest bridge_core.managed_by=start.sh 承诺对所有 standalone 组成立).
 BRIDGE_BIN="$DIR/bin/mihomo"
-BRIDGE_CFG="$DIR/config/teleapi-bridge.yaml"
-BRIDGE_HOME="$DIR/config/teleapi-bridge"
-PID_BRIDGE="$DATA_DIR/teleapi-bridge.pid"
-LOG_BRIDGE="$LOG_DIR/teleapi-bridge.log"
+PID_BRIDGE_DIR="$DIR/data/bridge-keepers"
+
+bridge_configs() {
+    ls "$DIR"/config/*-bridge.yaml 2>/dev/null | sort
+}
+
+bridge_slug() {
+    # config/teleapi-bridge.yaml -> teleapi (PID/日志命名沿用旧约定不变)
+    basename "$1" -bridge.yaml
+}
 
 if [ -n "$PYTEST_CURRENT_TEST" ]; then
     echo "[-] Refusing to start production daemons from pytest execution: $PYTEST_CURRENT_TEST" >&2
@@ -69,16 +77,30 @@ wait_for_pid_exit() {
 
 stop_services() {
     echo "[*] Stopping IP Pool services..."
-    if [ -f "$PID_BRIDGE" ]; then
-        PID=$(cat "$PID_BRIDGE")
+    # 兼容旧单核 PID 文件（teleapi 升级前落盘位置）
+    if [ -f "$DATA_DIR/teleapi-bridge.pid" ]; then
+        PID=$(cat "$DATA_DIR/teleapi-bridge.pid")
         if ps -p "$PID" > /dev/null 2>&1; then
-            wait_for_pid_exit "$PID" "Bridge Core Keeper"
+            wait_for_pid_exit "$PID" "Bridge Core Keeper (teleapi)"
         fi
-        rm -f "$PID_BRIDGE"
+        rm -f "$DATA_DIR/teleapi-bridge.pid"
     fi
     # PID 文件漂移兜底: 按命令行特征清扫自家桥核残留 (绝不匹配 Verge 的 core)。
-    pkill -f "bin/mihomo -d .*config/teleapi-bridge" 2>/dev/null && \
-        echo "[+] Swept stray teleapi-bridge mihomo processes" || true
+    pkill -f "$BRIDGE_BIN -d .*config/.*-bridge" 2>/dev/null && \
+        echo "[+] Swept stray bridge-core mihomo processes" || true
+    for cfg in $(bridge_configs); do
+        slug=$(bridge_slug "$cfg")
+        PID_FILE="$PID_BRIDGE_DIR/$slug.pid"
+        if [ -f "$PID_FILE" ]; then
+            PID=$(cat "$PID_FILE")
+            if ps -p "$PID" > /dev/null 2>&1; then
+                wait_for_pid_exit "$PID" "Bridge Core Keeper ($slug)"
+            fi
+            rm -f "$PID_FILE"
+        fi
+        # 各组专属清扫 (keeper 特征含组配置路径)
+        pkill -f "bridge_keeper.sh.*$slug-bridge" 2>/dev/null || true
+    done
 
     if [ -f "$PID_API" ]; then
         PID=$(cat "$PID_API")
@@ -98,24 +120,30 @@ stop_services() {
 }
 
 start_services() {
-    # 0. Start standalone mihomo bridge core (if configured & binary present)
-    if [ -f "$BRIDGE_CFG" ] && [ -x "$BRIDGE_BIN" ]; then
-        if [ -f "$PID_BRIDGE" ] && ps -p "$(cat "$PID_BRIDGE")" > /dev/null 2>&1; then
-            echo "[*] Bridge Core already running with PID $(cat "$PID_BRIDGE")"
+    # 0. Start standalone mihomo bridge cores (one keeper per config/*-bridge.yaml)
+    if [ ! -x "$BRIDGE_BIN" ] && ls "$DIR"/config/*-bridge.yaml >/dev/null 2>&1; then
+        echo "[!] Bridge Core 配置存在但 bin/mihomo 缺失 — 跳过 (从 Clash Verge 复制: cp \"/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo\" bin/mihomo)"
+    fi
+    for cfg in $(bridge_configs); do
+        [ -x "$BRIDGE_BIN" ] || break
+        slug=$(bridge_slug "$cfg")
+        HOME_DIR="$DIR/config/$slug-bridge"
+        LOG_BRIDGE="$LOG_DIR/$slug-bridge.log"
+        mkdir -p "$PID_BRIDGE_DIR" "$HOME_DIR"
+        PID_FILE="$PID_BRIDGE_DIR/$slug.pid"
+        if [ -f "$PID_FILE" ] && ps -p "$(cat "$PID_FILE")" > /dev/null 2>&1; then
+            echo "[*] Bridge Core [$slug] already running with PID $(cat "$PID_FILE")"
         else
-            echo "[*] Starting Bridge Core (mihomo, keeper-supervised) on 127.0.0.1:11101-11239..."
-            mkdir -p "$BRIDGE_HOME"
+            echo "[*] Starting Bridge Core [$slug] (mihomo, keeper-supervised)..."
             # keeper 守护: mihomo 崩溃 2s 内自动拉起 (SPOF 根修, 2026-11-12);
             # PID 文件记 keeper, stop 时 trap 连带杀 mihomo 子进程。
             nohup "$DIR/scripts/bridge_keeper.sh" \
-                "$BRIDGE_BIN" "$BRIDGE_HOME" "$BRIDGE_CFG" "$LOG_BRIDGE" \
+                "$BRIDGE_BIN" "$HOME_DIR" "$cfg" "$LOG_BRIDGE" \
                 > /dev/null 2>&1 &
-            echo $! > "$PID_BRIDGE"
+            echo $! > "$PID_FILE"
             sleep 1
         fi
-    elif [ -f "$BRIDGE_CFG" ]; then
-        echo "[!] Bridge Core 配置存在但 bin/mihomo 缺失 — 跳过 (从 Clash Verge 复制: cp \"/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo\" bin/mihomo)"
-    fi
+    done
 
     # 1. Start Control Plane (FastAPI) on :9100
     if [ -f "$PID_API" ] && ps -p "$(cat "$PID_API")" > /dev/null 2>&1; then
@@ -168,11 +196,15 @@ start_services() {
 
 status_services() {
     echo "=== IP Pool Service Status ==="
-    if [ -f "$PID_BRIDGE" ] && ps -p "$(cat "$PID_BRIDGE")" > /dev/null 2>&1; then
-        echo "  [●] Bridge Core mihomo (PID $(cat "$PID_BRIDGE")) is RUNNING (11101-11239)"
-    else
-        echo "  [○] Bridge Core mihomo is STOPPED"
-    fi
+    for cfg in $(bridge_configs); do
+        slug=$(bridge_slug "$cfg")
+        PID_FILE="$PID_BRIDGE_DIR/$slug.pid"
+        if [ -f "$PID_FILE" ] && ps -p "$(cat "$PID_FILE")" > /dev/null 2>&1; then
+            echo "  [●] Bridge Core [$slug] mihomo (PID $(cat "$PID_FILE")) is RUNNING"
+        else
+            echo "  [○] Bridge Core [$slug] is STOPPED"
+        fi
+    done
     if [ -f "$PID_API" ] && ps -p "$(cat "$PID_API")" > /dev/null 2>&1; then
         echo "  [●] Control Plane (PID $(cat "$PID_API")) is RUNNING on :$PORT"
     else

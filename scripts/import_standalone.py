@@ -122,7 +122,7 @@ def cmd_import(args):
         "region": args.region,
         "tier": args.tier,
         "egress_type": "clash_proxy",
-        "tags": ["clash", "bridge", str(parsed[0].get("type", "http")).lower(), args.group, "residential"],
+        "tags": ["clash", "bridge", str(parsed[0].get("type", "http")).lower(), args.group] + args.tags.split(","),
         "relay_mode": "direct_only",
         "bridge_core": {
             "type": "standalone-mihomo",
@@ -139,12 +139,10 @@ def cmd_import(args):
         "listener_prefix": f"{args.group}-bridge-",
         "gateway_route": f"region={args.region}&type=clash_proxy",
         "nodes": [
-            {"idx": i + 1,
+            {**{k: v for k, v in p.items() if not k.startswith("_")},
+             "idx": i + 1,
              "name": f"{prefix}{i + 1:0{width}d}",
-             "server": p["server"], "port": p["port"],
-             "username": p.get("username", ""), "password": p.get("password", ""),
-             "exit_ip": p["_exit_ip"], "type": str(p.get("type", "http")).lower(),
-             "city": p["_city"], "vendor_name": p.get("name", "")}
+             "exit_ip": p["_exit_ip"], "city": p["_city"], "vendor_name": p.get("name", "")}
             for i, p in enumerate(parsed)
         ],
     }
@@ -153,10 +151,14 @@ def cmd_import(args):
         "mode": "global", "log-level": "warning", "ipv6": False, "allow-lan": False,
         "external-controller": "", "unified-delay": False, "tcp-concurrent": False,
         "keep-alive-interval": 30, "disable-keep-alive": False,
+        # 原始定义透传（vless reality / hysteria2 / tuic 等协议字段不能按 http vendor
+        # 假设重构——uuid/reality-opts/sni 丢了配置即无效；只重命名不改语义）。
+        # 剥离导入期临时键 (_exit_ip/_city)；name 冲突免疫：mihomo duplicate name
+        # 直接拒载（§八教训 3）。
         "proxies": [
-            {"name": n["name"], "type": n["type"], "server": n["server"], "port": n["port"],
-             "username": n["username"], "password": n["password"], "udp": False}
-            for n in group["nodes"]
+            {k: v for k, v in p.items() if not k.startswith("_")}
+            | {"name": n["name"]}
+            for p, n in zip(parsed, group["nodes"])
         ],
         "listeners": [
             {"name": f"{args.group}-bridge-{i + 1:03d}", "type": "socks",
@@ -225,16 +227,28 @@ def cmd_realize(args):
     ip_to_idx, ambiguous = {}, set()
     for n in group["nodes"]:
         eip = n.get("exit_ip", "")
+        if not eip:
+            continue  # 导入期未知出口的组 (exit_ip 空) 不参与反查
         if eip in ip_to_idx:
             ambiguous.add(eip)
         ip_to_idx[eip] = n["idx"]
 
+    dead_set = {p for p, e in zip(ports, exits) if not e}
     mapping, unknown = {}, []
+    if not ip_to_idx:
+        # 组无任何固定出口信息 (exit_ip 全空, 如单 VPS 多协议分享): exit_ip
+        # 反查先天无区分度, 活端口按声明端口序恒等映射——探活已证明端口活。
+        mapping = {group["nodes"][i]["idx"]: p for i, p in enumerate(ports) if p not in dead_set}
     for port, eip in zip(ports, exits):
-        if not eip:
+        if not eip or not ip_to_idx:
             continue
-        if eip not in ip_to_idx or eip in ambiguous:
+        if eip not in ip_to_idx:
             unknown.append((port, eip))
+            continue
+        if eip in ambiguous:
+            # 同出口多节点: 按声明端口序回退, 映射取 declared 即恒等语义。
+            idx = group["nodes"][ports.index(port)]["idx"]
+            mapping[idx] = port
             continue
         mapping[ip_to_idx[eip]] = port
 
@@ -314,6 +328,7 @@ def main():
     p_imp.add_argument("--prefix", default=None)
     p_imp.add_argument("--filter-type", default="http", help="按 type 过滤 (空串=不过滤)")
     p_imp.add_argument("--filter-server", default="", help="按 server 子串过滤")
+    p_imp.add_argument("--tags", default="residential", help="逗号分隔追加标签 (机房 IP 用 datacenter)")
     p_imp.add_argument("--port-base", type=int, default=None, help="桥接起始端口 (默认取 manifest 之上空闲段)")
     p_imp.add_argument("--fault-domain", default=None, help="显式故障域 (默认 mac-<group>)")
     p_imp.add_argument("--replace", action="store_true")
