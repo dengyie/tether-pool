@@ -156,6 +156,11 @@ class Prober:
                 # admin-disabled 节点不进探活 (force 除外): 管理员意图优先,
                 # 探活不碰 DISABLED, 不涨 fail_count, 不产生 circuit_event。
                 nodes = [n for n in nodes if n.status != HealthStatus.DISABLED.value]
+                # janitor 冻结层 (2026-11-15): 连续 DEAD >= 24h 已打 frozen tag,
+                # 探活降频 —— 全量轮不再碰它们, 只由 janitor 周期性复核; 节点若
+                # 真的恢复, 需人工 POST /v1/probe?force 或 revive, 防止 dead_since
+                # 锚点被偶然探活抖动清掉、驱逐倒计时被打断。
+                nodes = [n for n in nodes if "frozen" not in n.tags]
         sem = asyncio.Semaphore(concurrency)
 
         async def _worker(node: ProxyNode) -> ProbeResult:

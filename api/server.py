@@ -7,7 +7,7 @@ import time
 import hmac
 import yaml
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from typing import Optional, List, Dict
 from fastapi import FastAPI, Query, BackgroundTasks, HTTPException, Request
@@ -61,6 +61,11 @@ PROBE_HISTORY_KEEP_DAYS = int(os.environ.get("IP_POOL_PROBE_HISTORY_KEEP_DAYS", 
 PROBE_SICK_INTERVAL_SECONDS = int(os.environ.get("IP_POOL_PROBE_SICK_INTERVAL", "60"))
 PROBE_SICK_CONCURRENCY = int(os.environ.get("IP_POOL_PROBE_SICK_CONCURRENCY", "20"))
 PROBE_SICK_CAP = int(os.environ.get("IP_POOL_PROBE_SICK_CAP", "100"))
+# 节点生命周期 janitor (2026-11-15): 连续 DEAD 24h -> 冻结 (frozen tag, 全量探活
+# 排除), 连续 7d -> 驱逐 (DB 删除 + tombstone + yaml 同步删除)。env 可调。
+JANITOR_INTERVAL_SECONDS = int(os.environ.get("IP_POOL_JANITOR_INTERVAL", "3600"))
+JANITOR_FREEZE_HOURS = int(os.environ.get("IP_POOL_JANITOR_FREEZE_HOURS", "24"))
+JANITOR_EVICT_DAYS = int(os.environ.get("IP_POOL_JANITOR_EVICT_DAYS", "7"))
 # Prober 每次拨号的超时 (settings.probe_timeout_seconds / env 可覆盖)
 DEFAULT_PROBE_TIMEOUT = 12.0
 # Config files below this node count are treated as incomplete (e.g. a scratch
@@ -147,6 +152,17 @@ def load_initial_nodes():
             overridden += 1
     if overridden:
         print(f"[+] geo-fixed guard: {overridden} node(s) region taken from DB (probe is source of truth)")
+    # tombstone 护栏 (janitor 2026-11-15): 连续 DEAD 7d 已被驱逐的节点不在
+    # yaml 重载/自上报里复活 —— 否则驱逐会被每次重启撤销。
+    tombstones = storage.get_tombstones()
+    skipped_tombstoned = 0
+    if tombstones:
+        before = len(nodes_data)
+        nodes_data = [item for item in nodes_data if item.get("name") not in tombstones]
+        skipped_tombstoned = before - len(nodes_data)
+        if skipped_tombstoned:
+            print(f"[+] tombstone guard: {skipped_tombstoned} evicted node(s) skipped on reload "
+                  f"(POST /v1/nodes/{{name}}/revive to lift)")
     for item in nodes_data:
             configured_tier = item.get("tier")
             score, init_tier, _ = IPQualityEvaluator.evaluate_node(
@@ -257,18 +273,97 @@ async def background_sick_probe_loop():
         await asyncio.sleep(PROBE_SICK_INTERVAL_SECONDS)
 
 
+def _remove_from_config(name: str) -> bool:
+    """把被驱逐的节点条目从 nodes.yaml 中同步删除 (块级: 从该条目的 'name:' 行
+    到下一个 '- name:' 行或文件尾), 使驱逐与配置仓库一致, 防 reload 复活。
+    删除前先写 .bak 备份。返回是否删了条目。"""
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    start = None
+    for i, line in enumerate(lines):
+        if line.rstrip("\n") == f"- name: {name}" or line.strip() == f"- name: {name}":
+            start = i
+            break
+    if start is None:
+        return False
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].startswith("- name:") or lines[j].strip() == "- name:":
+            end = j
+            break
+    with open(CONFIG_FILE + ".bak", "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    del lines[start:end]
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    return True
+
+
+def _node_lifecycle_janitor_sweep():
+    """One janitor tick (sync; DB/文件操作为主, 不需要 async)。
+
+    探活优先级分层的最末端 (用户需求 2026-11-15): healthy 300s 全量轮 /
+    degraded 60s 病号轮 / dead 正常退避冷却 / **连续 DEAD 24h 冻结 (frozen tag,
+    全量轮不再探它)** / **连续 DEAD 7d 驱逐 (DB 删 + tombstone + yaml 删)**。
+    冻结与驱逐都以 dead_since 为锚, 节点一旦探活恢复 (DEAD 离开) anchor 即被
+    update_probe_result 清空, 自然退出冻结/驱逐倒计时。
+    """
+    now = datetime.now(timezone.utc)
+    evicted, frozen = [], []
+    # ---- 驱逐层 (7d): 必须先于冻结层跑, 否则同批节点先被 freeze 改 tag ----
+    evict_cutoff = (now - timedelta(days=JANITOR_EVICT_DAYS)).isoformat()
+    for node in storage.list_dead_since_before(evict_cutoff):
+        reason = f"janitor_evicted_dead_{JANITOR_EVICT_DAYS}d"
+        try:
+            storage.record_tombstone(node.name, reason)
+            with BINDING_WRITE_LOCK:
+                storage.update_node(node.name, {"status": HealthStatus.DEAD.value,
+                                                "circuit_state": HealthStatus.DEAD.value})
+                router.rehome_leases_for_node(node.name)
+                storage.delete_node(node.name, prune_bindings=True)
+            _remove_from_config(node.name)
+            evicted.append(node.name)
+        except Exception as e:
+            print(f"[-] Janitor evict {node.name} failed: {e}")
+    # ---- 冻结层 (24h): 只处理未冻结的 (idempotent) ----
+    freeze_cutoff = (now - timedelta(hours=JANITOR_FREEZE_HOURS)).isoformat()
+    for node in storage.list_dead_since_before(freeze_cutoff):
+        if "frozen" in node.tags:
+            continue
+        if storage.freeze_node(node.name):
+            frozen.append(node.name)
+    if evicted:
+        print(f"[JANITOR] evicted {len(evicted)} node(s) dead >= {JANITOR_EVICT_DAYS}d "
+              f"(DB + tombstone + yaml): {', '.join(evicted[:20])}")
+    if frozen:
+        print(f"[JANITOR] frozen {len(frozen)} node(s) dead >= {JANITOR_FREEZE_HOURS}h "
+              f"(probe downgraded): {', '.join(frozen[:20])}")
+    return {"evicted": evicted, "frozen": frozen}
+
+
+async def background_node_janitor_loop():
+    while True:
+        try:
+            await asyncio.to_thread(_node_lifecycle_janitor_sweep)
+        except Exception as e:
+            print(f"[-] Node janitor error: {e}")
+        await asyncio.sleep(JANITOR_INTERVAL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_initial_nodes()
     # Initial probe in background on startup
     probe_task = asyncio.create_task(background_probe_loop())
     sick_task = asyncio.create_task(background_sick_probe_loop())
+    janitor_task = asyncio.create_task(background_node_janitor_loop())
     yield
     # Await the cancellation so in-flight probe sockets are closed before shutdown
     # instead of being torn down mid-await during interpreter exit.
     probe_task.cancel()
     sick_task.cancel()
-    await asyncio.gather(probe_task, sick_task, return_exceptions=True)
+    janitor_task.cancel()
+    await asyncio.gather(probe_task, sick_task, janitor_task, return_exceptions=True)
 
 
 app = FastAPI(
@@ -537,19 +632,53 @@ def disable_node(name: str, req: dict = None):
 @app.post("/v1/nodes/{name}/enable", response_model=ProxyNode)
 def enable_node(name: str):
     """解除管理员禁用: 回 UNPROBED, 由下一轮探活重新定级 (不直接 HEALTHY,
-    避免 disabled 期间上游状态未知导致假阳性)。"""
+    避免 disabled 期间上游状态未知导致假阳性)。同时清 frozen tag —— 管理员
+    明确按了恢复键, janitor 冻结层应让节点重新进全量探活。"""
     existing = storage.get_node(name)
     if not existing:
         raise HTTPException(status_code=404, detail=f"Node '{name}' not found")
     if existing.status != HealthStatus.DISABLED.value:
         return existing
+    new_tags = [t for t in (existing.tags or []) if t != "frozen"]
     storage.update_node(name, {"status": HealthStatus.UNPROBED.value,
                                "circuit_state": HealthStatus.UNPROBED.value,
                                "consecutive_failures": 0,
                                "consecutive_successes": 0,
-                               "next_probe_allowed_at": None})
+                               "next_probe_allowed_at": None,
+                               "dead_since": None,
+                               "tags": new_tags})
     storage.record_circuit_event(name, HealthStatus.DISABLED.value,
                                  HealthStatus.UNPROBED.value, "admin_enabled")
+    return storage.get_node(name)
+
+
+@app.post("/v1/nodes/{name}/revive", response_model=ProxyNode)
+def revive_node(name: str):
+    """人工复活被 janitor 驱逐的节点 (tombstone 护栏只在 load_initial_nodes 挡
+    yaml 重载; 管理员确认节点真的回来了, 显式清 tombstone + 重建条目)。"""
+    if not storage.revive_tombstoned(name):
+        raise HTTPException(status_code=404, detail=f"No tombstone for '{name}'")
+    if not storage.get_node(name):
+        # DB 条目已删: 从 yaml 重新入库 (此刻 tombstone 已清, load 路径放行)
+        import yaml as _yaml
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            cfg = _yaml.safe_load(f) or {}
+        for item in (cfg.get("nodes") or []):
+            if item.get("name") == name:
+                storage.upsert_node(ProxyNode(**{k: v for k, v in item.items()
+                                                 if k in ProxyNode.model_fields}))
+                break
+    node = storage.get_node(name)
+    if not node:
+        raise HTTPException(status_code=404, detail=f"'{name}' not in config file either")
+    storage.update_node(name, {"status": HealthStatus.UNPROBED.value,
+                               "circuit_state": HealthStatus.UNPROBED.value,
+                               "consecutive_failures": 0,
+                               "next_probe_allowed_at": None,
+                               "dead_since": None,
+                               "tags": [t for t in (node.tags or []) if t != "frozen"]})
+    storage.record_circuit_event(name, HealthStatus.DEAD.value,
+                                 HealthStatus.UNPROBED.value, "admin_revived_from_tombstone")
     return storage.get_node(name)
 
 

@@ -73,6 +73,9 @@ class ProxyNode(BaseModel):
     provider_region: str = ""
     # Node-side last liveness heartbeat (e.g. EasyTier peer timestamp).
     self_reported_at: Optional[str] = None
+    # 连续 DEAD 锚点 (janitor 2026-11-15): DEAD 落锤时写, 离开 DEAD 清空。
+    # 连续 24h -> 冻结 (frozen tag, 探活降频), 连续 7d -> 驱逐。
+    dead_since: Optional[str] = None
 
     @property
     def proxy_url(self) -> str:

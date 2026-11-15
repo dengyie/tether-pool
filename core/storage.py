@@ -234,7 +234,11 @@ class Storage:
                 ("configured_tier", "TEXT", "NULL"),
                 ("fault_domain", "TEXT", "''"),
                 ("provider_region", "TEXT", "''"),
-                ("self_reported_at", "TEXT", "NULL")
+                ("self_reported_at", "TEXT", "NULL"),
+                # 节点生命周期 janitor (2026-11-15): 连续 DEAD 24h -> 冻结
+                # (探活降频 + 不进分配), 连续 7d -> 驱逐 (DB 删除 + tombstone
+                # 防 yaml 重载复活)。DEAD 落锤时写, 离开 DEAD 时清。
+                ("dead_since", "TEXT", "NULL")
             ]:
                 if col not in existing_cols:
                     conn.execute(f"ALTER TABLE nodes ADD COLUMN {col} {col_type} DEFAULT {default_val}")
@@ -283,9 +287,9 @@ class Storage:
                     exit_ip, latency_ms, status, fail_count, last_probed_at,
                     circuit_state, consecutive_failures, consecutive_successes, next_probe_allowed_at,
                     relay_mode, relay_hop_node, tier, configured_tier, quality_score,
-                    fault_domain, provider_region, self_reported_at
+                    fault_domain, provider_region, self_reported_at, dead_since
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     host=excluded.host,
                     port=excluded.port,
@@ -310,7 +314,10 @@ class Storage:
                     next_probe_allowed_at=CASE WHEN excluded.status != 'unprobed' THEN excluded.next_probe_allowed_at ELSE nodes.next_probe_allowed_at END,
                     fault_domain=CASE WHEN excluded.fault_domain != '' THEN excluded.fault_domain ELSE nodes.fault_domain END,
                     provider_region=CASE WHEN excluded.provider_region != '' THEN excluded.provider_region ELSE nodes.provider_region END,
-                    self_reported_at=COALESCE(excluded.self_reported_at, nodes.self_reported_at)
+                    self_reported_at=COALESCE(excluded.self_reported_at, nodes.self_reported_at),
+                    -- janitor 锚点: upsert 不得清掉既有 DEAD 倒计时 (探活恢复由
+                    -- update_probe_result 清); 新节点携带的种子值也照写
+                    dead_since=COALESCE(excluded.dead_since, nodes.dead_since)
             """, (
                 node.name, node.host, node.port, node.protocol, node.region,
                 node.egress_type, json.dumps(node.tags), node.weight,
@@ -319,7 +326,8 @@ class Storage:
                 node.consecutive_successes, node.next_probe_allowed_at,
                 node.relay_mode, node.relay_hop_node,
                 node.tier or Tier.STANDARD.value, node.configured_tier, node.quality_score or 50,
-                node.fault_domain or "", node.provider_region or "", node.self_reported_at
+                node.fault_domain or "", node.provider_region or "", node.self_reported_at,
+                node.dead_since
             ))
 
     def update_node_status(self, node_name: str, status: str):
@@ -432,7 +440,8 @@ class Storage:
                         quality_score = ?,
                         tags = ?,
                         region = ?,
-                        provider_region = ?
+                        provider_region = ?,
+                        dead_since = NULL
                     WHERE name = ?
                 """, (
                     res.exit_ip, res.latency_ms, new_state, new_state,
@@ -444,6 +453,13 @@ class Storage:
                     res.node_name
                 ))
             else:
+                # dead_since 生命周期锚 (2026-11-15): 新落 DEAD 时记录锚点, 已
+                # DEAD 续期保持原锚 (连续不可达时长不因续期重置)。离开 DEAD
+                # (成功分支) 时清空。
+                dead_since_val = node.dead_since if old_state == HealthStatus.DEAD.value else (
+                    getattr(node, "dead_since", None) or now_str if new_state == HealthStatus.DEAD.value else None)
+                if new_state != HealthStatus.DEAD.value:
+                    dead_since_val = None
                 conn.execute("""
                     UPDATE nodes SET
                         fail_count = fail_count + 1,
@@ -454,12 +470,13 @@ class Storage:
                         next_probe_allowed_at = ?,
                         last_probed_at = ?,
                         tier = ?,
-                        quality_score = ?
+                        quality_score = ?,
+                        dead_since = ?
                     WHERE name = ?
                 """, (
                     new_state, new_state, new_fails, new_succs,
                     next_allowed_str, now_str,
-                    q_tier, q_score, res.node_name
+                    q_tier, q_score, dead_since_val, res.node_name
                 ))
 
             # 4. Record circuit event if state changed
@@ -537,6 +554,7 @@ class Storage:
             consecutive_failures=row["consecutive_failures"] if "consecutive_failures" in keys and row["consecutive_failures"] else 0,
             consecutive_successes=row["consecutive_successes"] if "consecutive_successes" in keys and row["consecutive_successes"] else 0,
             next_probe_allowed_at=row["next_probe_allowed_at"] if "next_probe_allowed_at" in keys else None,
+            dead_since=row["dead_since"] if "dead_since" in keys else None,
             relay_mode=row["relay_mode"] if "relay_mode" in keys and row["relay_mode"] else RelayMode.RELAY_FALLBACK.value,
             relay_hop_node=row["relay_hop_node"] if "relay_hop_node" in keys else None,
             tier=row["tier"] if "tier" in keys and row["tier"] else Tier.STANDARD.value,
@@ -680,11 +698,63 @@ class Storage:
                     circuit_state = 'healthy',
                     fail_count = 0,
                     consecutive_failures = 0,
-                    next_probe_allowed_at = NULL
+                    next_probe_allowed_at = NULL,
+                    dead_since = NULL
                 WHERE name = ?
             """, (node_name,))
         self.record_circuit_event(node_name, node.status, "healthy", "operator_manual_reset")
         return True
+
+    # ---- 节点生命周期 janitor (2026-11-15): 连续 DEAD 24h 冻结 / 7d 驱逐 ----
+
+    def list_dead_since_before(self, iso_cutoff: str) -> List[ProxyNode]:
+        """连续 DEAD 且 dead_since 早于 cutoff 的节点 (janitor 候选集)。"""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM nodes WHERE status = 'dead' AND dead_since IS NOT NULL "
+                "AND dead_since <= ? ORDER BY dead_since ASC", (iso_cutoff,)).fetchall()
+            return [self._row_to_node(r) for r in rows]
+
+    def freeze_node(self, node_name: str) -> bool:
+        """冻结: tags 加 frozen + status 保持 dead (探活降频由 prober 按标签识别,
+        分配本就排除 DEAD)。幂等。"""
+        node = self.get_node(node_name)
+        if not node:
+            return False
+        tags = list(node.tags or [])
+        if "frozen" not in tags:
+            tags.append("frozen")
+            self.update_node(node_name, {"tags": tags})
+            self.record_circuit_event(node_name, "dead", "dead", "janitor_frozen_dead_24h")
+        return True
+
+    def record_tombstone(self, node_name: str, reason: str):
+        """驱逐登记: node_tombstones 表防 yaml 重载/自上报复活。"""
+        with self._get_conn() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS node_tombstones (
+                    node_name TEXT PRIMARY KEY,
+                    reason TEXT,
+                    created_at TEXT
+                )
+            """)
+            conn.execute(
+                "INSERT INTO node_tombstones (node_name, reason, created_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(node_name) DO UPDATE SET reason = excluded.reason",
+                (node_name, reason, datetime.now().isoformat()))
+
+    def get_tombstones(self) -> set:
+        try:
+            with self._get_conn() as conn:
+                return {r[0] for r in conn.execute("SELECT node_name FROM node_tombstones").fetchall()}
+        except Exception:
+            return set()
+
+    def revive_tombstoned(self, node_name: str) -> bool:
+        """人工复活: 清 tombstone (管理员判断节点真的回来了)。"""
+        with self._get_conn() as conn:
+            cur = conn.execute("DELETE FROM node_tombstones WHERE node_name = ?", (node_name,))
+            return cur.rowcount > 0
 
     def get_stats(self) -> PoolStats:
         with self._get_conn() as conn:
@@ -1746,7 +1816,8 @@ class Storage:
             "host", "port", "protocol", "region", "egress_type", "tags",
             "weight", "status", "circuit_state", "tier", "configured_tier",
             "relay_mode", "relay_hop_node", "quality_score",
-            "fault_domain", "provider_region", "self_reported_at"
+            "fault_domain", "provider_region", "self_reported_at",
+            "dead_since"
         }
         valid_updates = {k: v for k, v in updates.items() if k in allowed_fields}
         if not valid_updates:
