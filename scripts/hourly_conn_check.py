@@ -140,7 +140,6 @@ def main():
             alarms.append(f"{pool}:0/{len(rows)}-alive")
         elif oks < len(rows) // 2:
             alarms.append(f"{pool}:majority-degraded({oks}/{len(rows)})")
-    conn.close()
 
     gw_ok = gateway_probe()
     report.append(f"gateway: {gw_ok}/{GATEWAY_N} ok")
@@ -232,12 +231,15 @@ def main():
                     os.unlink(STATE)
                 except OSError:
                     pass
+                conn.close()
                 return 1 if any("still-bad" in r for r in restarted) else 0
             open(STATE, "w").write(" ".join(curr))
+            conn.close()
             return rc
         print(f"[HOURLY_CONN_WARN] {stamp} :: {'; '.join(report)} :: "
               f"first-round alarms={alarms} (will FAIL if repeats next hour)", file=sys.stderr)
         open(STATE, "w").write(" ".join(curr))
+        conn.close()
         return 0
     # 全绿: 清掉历史失败状态
     try:
@@ -245,6 +247,7 @@ def main():
     except OSError:
         pass
     print(f"[HOURLY_CONN_OK] {stamp} :: {'; '.join(report)}")
+    conn.close()
     return 0
 
 

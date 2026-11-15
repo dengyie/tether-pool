@@ -79,7 +79,7 @@ def test_gemini_adapter(temp_adapter_env):
     assert gw["gateway_url"] == "http://127.0.0.1:9101"
     # Routing tags must be proxy credentials (headers are absent on HTTPS CONNECT)
     assert gw["proxy"]["username"] == "gemini_user_1__type_warp_ipv6__region_tokyo"
-    assert gw["proxy"]["password"] == "tetherpool"
+    assert gw["proxy"]["password"] == ""  # 2026-11-15: SDK 无默认密码 (公开仓库)
 
 
 def test_playwright_adapter(temp_adapter_env):
@@ -93,4 +93,4 @@ def test_playwright_adapter(temp_adapter_env):
     gw_cfg = manager.get_unified_gateway_proxy("crawler_02", region="tokyo")
     assert gw_cfg["proxy"]["server"] == "http://127.0.0.1:9101"
     assert gw_cfg["proxy"]["username"] == "crawler_02__region_tokyo"
-    assert gw_cfg["proxy"]["password"] == "tetherpool"
+    assert gw_cfg["proxy"]["password"] == ""  # 2026-11-15: SDK 无默认密码 (公开仓库)

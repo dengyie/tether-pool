@@ -20,7 +20,9 @@ from core.storage import Storage
 
 
 def _iso(days_ago: float = 0.0, hours_ago: float = 0.0) -> str:
-    return (datetime.now(timezone.utc)
+    # 2026-11-15 review P2: dead_since 锚点统一 naive local 钟 (与 storage
+    # 写入侧 datetime.now() 一致, 字符串比较才不错位)。
+    return (datetime.now()
             - timedelta(days=days_ago, hours=hours_ago)).isoformat()
 
 
@@ -69,10 +71,8 @@ def test_dead_since_renewal_keeps_original_anchor(env):
     from core.models import ProbeResult
     storage.update_probe_result(ProbeResult(node_name="ds-02", success=False, error="again"))
     n = storage.get_node("ds-02")
-    assert n.dead_since == _iso(days_ago=3)[:19] or n.dead_since.startswith(
-        datetime.now(timezone.utc).date().isoformat()[:8]) or True  # format-agnostic
-    # 真正要紧的断言: anchor 没有被改成 "now"
-    delta = datetime.now(timezone.utc) - datetime.fromisoformat(n.dead_since)
+    # 真正要紧的断言: anchor 没有被改成 "now" (naive local 钟, 与写入侧一致)
+    delta = datetime.now() - datetime.fromisoformat(n.dead_since)
     assert delta >= timedelta(days=2, hours=23)
 
 

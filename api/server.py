@@ -326,7 +326,10 @@ def _node_lifecycle_janitor_sweep():
     冻结与驱逐都以 dead_since 为锚, 节点一旦探活恢复 (DEAD 离开) anchor 即被
     update_probe_result 清空, 自然退出冻结/驱逐倒计时。
     """
-    now = datetime.now(timezone.utc)
+    # 2026-11-15 review P2: dead_since 锚点是 naive local 时间 (storage 全部
+    # datetime.now().isoformat()), cutoff 必须同钟面 —— aware UTC 的 isoformat
+    # 带 +00:00 后缀, 字符串比较混两种格式会偏移整个时区差 (CST=8h)。
+    now = datetime.now()
     evicted, frozen = [], []
     # ---- 驱逐层 (7d): 必须先于冻结层跑, 否则同批节点先被 freeze 改 tag ----
     evict_cutoff = (now - timedelta(days=JANITOR_EVICT_DAYS)).isoformat()
@@ -541,7 +544,15 @@ def create_or_upsert_node(req: NodeCreateRequest):
     Directly creates or updates a proxy node in the pool via API.
     Evaluates quality scores and configures quality tiers dynamically.
     Tags node with 'api_managed' to prevent pruning or demotion during static config reloads.
+
+    2026-11-15 review P2: 被驱逐 (7d 死亡) 的节点名带 tombstone —— 任何消费方
+    重新 POST 同名节点都会绕过 reload 护栏无声复活。必须走 /revive 显式通道。
     """
+    if req.name in storage.get_tombstones():
+        raise HTTPException(
+            status_code=409,
+            detail=f"Node '{req.name}' is tombstoned (janitor-evicted); "
+                   f"use POST /v1/nodes/{req.name}/revive to restore it")
     configured_tier = req.configured_tier or req.tier
     tags = list(req.tags)
     if "api_managed" not in tags:

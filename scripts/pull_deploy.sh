@@ -46,18 +46,34 @@ fi
 TAG=$(date +%Y%m%d-%H%M%S)
 echo "[3/6] DB 在线备份 → backups/$TAG/"
 mkdir -p "backups/$TAG"
+# 2026-11-15 review P2: 备份失败 (WAL 忙/磁盘满) 必须中止部署 —— 无备份重启
+# 生产库, 健康门禁失败后的回退就没有恢复点。--skip-backup 显式豁免。
+SKIP_BACKUP="${1:-}"
+backup_ok=0
 .venv/bin/python - "$TAG" <<'PYEOF'
-import sqlite3, sys
+import sqlite3, sys, os
 tag = sys.argv[1]
+if not os.path.exists("data/ip_pool.db"):
+    print("      (无 DB 文件 — 全新部署, 视为备份成功)")
+    sys.exit(0)
 try:
     src = sqlite3.connect("data/ip_pool.db")
     dst = sqlite3.connect(f"backups/{tag}/ip_pool.db")
     src.backup(dst)
     dst.close(); src.close()
     print("      ip_pool.db 已备份")
-except sqlite3.OperationalError as e:
-    print(f"      (无 DB 或不可读, 跳过: {e})")
+    sys.exit(0)
+except sqlite3.Error as e:
+    print(f"      (备份失败: {e})")
+    sys.exit(1)
 PYEOF
+if [ $? -eq 0 ]; then backup_ok=1; fi
+if [ "$backup_ok" != "1" ] && [ "$SKIP_BACKUP" != "--skip-backup" ]; then
+    echo "[-] DB 备份失败且未指定 --skip-backup → 中止部署 (服务未动, 仍跑 $PREV)"
+    rmdir "backups/$TAG" 2>/dev/null || true
+    exit 1
+fi
+[ "$backup_ok" != "1" ] && echo "(!!) --skip-backup: 无备份继续部署"
 echo "$PREV" > "backups/$TAG/prev_commit.txt"
 
 echo "[4/6] systemd restart"

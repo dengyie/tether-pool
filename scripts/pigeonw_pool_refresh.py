@@ -250,8 +250,9 @@ def main():
             nodes_d["nodes"] = keep
         new_names = {n["name"] for n in new_nodes}
 
-        # ---- 落盘 + 校验门 ----
-        CFG.write_text(yaml.safe_dump(main_cfg, allow_unicode=True, sort_keys=False))
+        # ---- 落盘 + 校验门 (2026-11-15 review P2: 原子写) ----
+        from atomic_yaml import atomic_write_text
+        atomic_write_text(CFG, yaml.safe_dump(main_cfg, allow_unicode=True, sort_keys=False))
         t = subprocess.run(["/opt/ip-pool/bin/mihomo", "-t", "-d", str(CFG_DIR), "-f", str(CFG)],
                            capture_output=True, text=True)
         if "successful" not in t.stdout + t.stderr:
@@ -260,7 +261,7 @@ def main():
             latest = sorted(glob.glob(str(BACKUP_DIR / "pigeonw-bridge.yaml.*-pigeonw")))[-1]
             subprocess.run(["cp", latest, str(CFG)])
             return 1
-        NODES.write_text(yaml.safe_dump(nodes_d, allow_unicode=True, sort_keys=False))
+        atomic_write_text(NODES, yaml.safe_dump(nodes_d, allow_unicode=True, sort_keys=False))
 
         subprocess.run(["systemctl", "restart", "pigeonw-bridge.service"], check=False)
         subprocess.run(["systemctl", "restart", "ip-pool-api.service", "ip-pool-gateway.service"], check=False)
@@ -287,15 +288,39 @@ def main():
         dangling = old_node_names - new_names
         if dangling:
             import sqlite3
+            from datetime import datetime as _dt
             conn = sqlite3.connect(str(DB))
             cur = conn.cursor()
             ph = ",".join("?" * len(dangling))
+            # 2026-11-15 review P1: epoch 推进 + change 行 (to_node=NULL),
+            # 不删 binding_changes 历史 (保留窗由 prune_binding_changes 管)。
+            orphaned = cur.execute(
+                f"SELECT service, account_id, node_name FROM account_allocations "
+                f"WHERE node_name IN ({ph})", tuple(dangling)).fetchall()
             cur.execute(f"DELETE FROM account_allocations WHERE node_name IN ({ph})", tuple(dangling))
             n_alloc = cur.rowcount
-            cur.execute(f"DELETE FROM binding_changes WHERE to_node IN ({ph}) OR from_node IN ({ph})", tuple(dangling) * 2)
+            now_str = _dt.now().isoformat()
+            services = sorted({r[0] for r in orphaned})
+            for svc in services:
+                cur.execute("""
+                    INSERT INTO binding_epoch_state (service, epoch, changed_at)
+                    VALUES (?, 1, ?)
+                    ON CONFLICT(service) DO UPDATE SET
+                        epoch = binding_epoch_state.epoch + 1, changed_at = excluded.changed_at
+                """, (svc, now_str))
+                epoch = cur.execute(
+                    "SELECT epoch FROM binding_epoch_state WHERE service = ?", (svc,)).fetchone()[0]
+                for s, acct, node in orphaned:
+                    if s != svc:
+                        continue
+                    cur.execute("""
+                        INSERT INTO binding_changes (service, epoch, account_id, from_node, to_node, reason, created_at)
+                        VALUES (?, ?, ?, ?, NULL, 'node_retired_dangling_cleanup', ?)
+                    """, (svc, epoch, acct, node, now_str))
             conn.commit()
             conn.close()
-            print(f"dangling bindings cleaned: {n_alloc} allocations over {len(dangling)} retired nodes")
+            print(f"dangling bindings cleaned: {n_alloc} allocations over {len(dangling)} retired nodes "
+                  f"(epoch advanced for {services or 'no services'})")
 
         print("deployed: %d slots (kept=%d changed=%d retired=%d), verified listening=%d, nodes=%d" % (
             len(assign), len(assign) - len(changed), len(changed), len(retired), listening, len(keep)))

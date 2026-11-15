@@ -160,10 +160,15 @@ class CircuitBreaker:
             return True, "pool_too_small_for_guard"
         domain = node.effective_fault_domain
         if domain:
+            # 2026-11-15 二轮 review P1: 域查询必须实现 host fallback ——
+            # host 派生域的节点 fault_domain 列是 '', 只按 fault_domain = ? 查
+            # 会命中 0 行, 50% domain cap 对这类域 (mesh host 的常见布局) 完全失效。
+            # 与 storage.list_nodes_by_domain / mark_domain_dead 同一规则。
             row = conn.execute(
                 "SELECT COUNT(*), SUM(CASE WHEN status='dead' THEN 1 ELSE 0 END) "
-                "FROM nodes WHERE fault_domain = ? AND status != 'disabled' "
-                "AND tags NOT LIKE '%\"frozen\"%'", (domain,)).fetchone()
+                "FROM nodes WHERE (fault_domain = ? OR (fault_domain = '' AND host = ?)) "
+                "AND status != 'disabled' AND tags NOT LIKE '%\"frozen\"%'",
+                (domain, domain)).fetchone()
             total, dead = (row[0] or 0), (row[1] or 0)
             if total > 0 and (dead + 1) / total > cls.DOMAIN_DEAD_RATIO_CAP:
                 return False, f"ejection_capped_domain_over_{int(cls.DOMAIN_DEAD_RATIO_CAP * 100)}pct"

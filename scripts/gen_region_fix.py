@@ -217,7 +217,8 @@ def main():
         item["tags"] = db_tags
     if isinstance(data, dict):
         data["nodes"] = nl
-    NODES_YAML.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False))
+    from atomic_yaml import atomic_write_text
+    atomic_write_text(NODES_YAML, yaml.safe_dump(data, allow_unicode=True, sort_keys=False))
     print("nodes.yaml synced: %d entries region-updated" % y_fixed)
 
     conn.close()

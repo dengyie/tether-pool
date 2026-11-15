@@ -276,6 +276,7 @@ def test_prune_nodes_except_removes_stale_nodes_and_bindings(storage):
     storage.batch_save_allocations([("svc", "acc", "drop-me", "2026-11-04T00:00:00")])
     storage.set_lease("acc", "drop-me")
 
+    epoch_before = storage.get_binding_epoch("svc")["epoch"]
     pruned = storage.prune_nodes_except(["keep-me"])
 
     assert pruned == ["drop-me"]
@@ -283,6 +284,52 @@ def test_prune_nodes_except_removes_stale_nodes_and_bindings(storage):
     assert storage.get_node("keep-me") is not None
     assert storage.get_allocation("svc", "acc") is None
     assert storage.get_lease("acc") is None
+    # 2026-11-15 review P1: 删除也是绑定变更 —— epoch 推进 + change 行
+    # (to_node=NULL), 否则下游 reconcile 永远看不到这批释放
+    epoch_after = storage.get_binding_epoch("svc")["epoch"]
+    assert epoch_after == epoch_before + 1
+    changes = storage.list_binding_changes_since("svc", epoch_before)
+    assert len(changes) == 1 and changes[0].to_node is None
+    assert changes[0].from_node == "drop-me"
+    assert changes[0].reason == "node_pruned_binding_orphaned"
+
+
+def test_delete_allocation_advances_epoch_and_logs(storage):
+    """delete_allocation / delete_node 删除路径同样推进 epoch (R5b 下游可见)。"""
+    storage.upsert_node(_node("del-node", exit_ip="198.51.100.5"))
+    storage.batch_save_allocations([("svc", "acct-del", "del-node", "2026-11-04T00:00:00")])
+    epoch_before = storage.get_binding_epoch("svc")["epoch"]
+
+    assert storage.delete_allocation("svc", "acct-del") is True
+    assert storage.get_allocation("svc", "acct-del") is None
+    assert storage.get_binding_epoch("svc")["epoch"] == epoch_before + 1
+    changes = storage.list_binding_changes_since("svc", epoch_before)
+    assert len(changes) == 1 and changes[0].to_node is None
+
+    # 幂等: 再删一次无行可删, 不推进 epoch
+    assert storage.delete_allocation("svc", "acct-del") is False
+    assert storage.get_binding_epoch("svc")["epoch"] == epoch_before + 1
+
+
+def test_delete_node_orphans_advance_epoch(storage):
+    storage.upsert_node(_node("gone-node", exit_ip="198.51.100.6"))
+    storage.upsert_node(_node("stay-node", exit_ip="198.51.100.7"))
+    storage.batch_save_allocations([
+        ("svcA", "acct-1", "gone-node", "2026-11-04T00:00:00"),
+        ("svcB", "acct-2", "gone-node", "2026-11-04T00:00:01"),
+        ("svcA", "acct-3", "stay-node", "2026-11-04T00:00:02"),
+    ])
+    epochs_before = {s: storage.get_binding_epoch(s)["epoch"] for s in ("svcA", "svcB")}
+
+    assert storage.delete_node("gone-node") is True
+    assert storage.get_allocation("svcA", "acct-1") is None
+    assert storage.get_allocation("svcB", "acct-2") is None
+    assert storage.get_allocation("svcA", "acct-3") is not None  # 不误伤
+    for svc in ("svcA", "svcB"):
+        assert storage.get_binding_epoch(svc)["epoch"] == epochs_before[svc] + 1
+    changes = storage.list_binding_changes_since("svcA", epochs_before["svcA"])
+    assert len(changes) == 1 and changes[0].account_id == "acct-1"
+    assert changes[0].to_node is None
 
 
 # ------------------------------------------------------------------- gateway

@@ -53,7 +53,7 @@ TetherPool 对外提供两个核心服务端口（部署于中心节点，如 Ea
   http://<account_id>[__param1_value][__param2_value]:<password>@10.144.144.9:9101
   ```
   *(密码来自网关侧 `GATEWAY_PASSWORD` 环境变量；消费方 SDK/adapter 统一经
-  `adapters.tetherpool_client.gateway_password()` 读取，默认回退 `tetherpool`。
+  `adapters.tetherpool_client.gateway_password()` 读取（消费方环境必须配置 `GATEWAY_PASSWORD`，SDK 无默认值）。
   线上启用密码门后，SDK/adapter 必须在消费方环境配置 `GATEWAY_PASSWORD`)*
 
 #### 支持的参数化指令表：
@@ -70,8 +70,8 @@ TetherPool 对外提供两个核心服务端口（部署于中心节点，如 Ea
 > **约束语义（2026-11-12）**：凭据携带的约束集（region / region_strict / egress / tier / policy）在绑定时持久化（`account_allocations.bound_*` 列）。节点故障后的 auto_rehome 只会在约束集内迁移；约束区域内无健康候选时保持原绑定不动并计入 `ip_pool_rehome_blocked_total` 指标（`rehome_blocked`），绝不迁移到约束区域外。
 
 > **示例**：
-> - 账号 `bot_user_01` 绑定东京节点：`bot_user_01__region_tokyo:tetherpool@10.144.144.9:9101`
-> - 核心账号 `vip_99` 强制走新加坡优质原生池：`vip_99__region_singapore__tier_premium__policy_premium_only:tetherpool@10.144.144.9:9101`
+> - 账号 `bot_user_01` 绑定东京节点：`bot_user_01__region_tokyo:<GATEWAY_PASSWORD>@10.144.144.9:9101`
+> - 核心账号 `vip_99` 强制走新加坡优质原生池：`vip_99__region_singapore__tier_premium__policy_premium_only:<GATEWAY_PASSWORD>@10.144.144.9:9101`
 
 ---
 
@@ -100,7 +100,7 @@ TetherPool 对外提供两个核心服务端口（部署于中心节点，如 Ea
 PROXY_URL=http://10.144.144.9:9101
 
 # 或者针对特定账号使用动态参数化代理
-# 格式：http://grok_user_{id}__tier_standard:tetherpool@10.144.144.9:9101
+# 格式：http://grok_user_{id}__tier_standard:<GATEWAY_PASSWORD>@10.144.144.9:9101
 ```
 
 #### 进阶风控联动（429 自动换绑）：
@@ -145,8 +145,8 @@ curl -s http://10.144.144.9:9100/v1/export/cpa
 ```
 返回输出格式标准：
 ```text
-http://10.144.144.9:9101:cpa_task_01:tetherpool
-http://10.144.144.9:9101:cpa_task_02:tetherpool
+http://10.144.144.9:9101:cpa_task_01:<GATEWAY_PASSWORD>
+http://10.144.144.9:9101:cpa_task_02:<GATEWAY_PASSWORD>
 ...
 ```
 在 CPA 后台导入该 URL 或批量粘贴，即可实现每个任务固定独立出口。
@@ -180,7 +180,7 @@ const { chromium } = require('playwright');
       server: 'http://10.144.144.9:9101',
       // 用户名携带参数：指定走日本节点、优质池、自动粘性
       username: `${accountId}__region_tokyo__tier_premium__policy_premium_first`,
-      password: 'tetherpool'
+      password: '<GATEWAY_PASSWORD>'
     }
   });
 
@@ -203,7 +203,7 @@ import httpx
 
 # 1. 直接通过网关出网 (零 API 调用，自动按 account_id 粘性)
 account_id = "user_883"
-proxy_url = f"http://{account_id}__region_tokyo__tier_standard:tetherpool@10.144.144.9:9101"
+proxy_url = f"http://{account_id}__region_tokyo__tier_standard:<GATEWAY_PASSWORD>@10.144.144.9:9101"
 
 with httpx.Client(proxies=proxy_url, timeout=15.0) as client:
     resp = client.get("https://api64.ipify.org?format=json")
@@ -231,7 +231,7 @@ import (
 
 func main() {
 	// 网关代理地址，带账号与路由参数
-	proxyRaw := "http://user_golang_01__region_singapore:tetherpool@10.144.144.9:9101"
+	proxyRaw := "http://user_golang_01__region_singapore:<GATEWAY_PASSWORD>@10.144.144.9:9101"
 	proxyURL, _ := url.Parse(proxyRaw)
 
 	client := &http.Client{
@@ -255,11 +255,11 @@ func main() {
 
 ```bash
 # 测试 1：常规默认出网（轮询 WARP IPv6 出口）
-curl -x http://test_curl:tetherpool@10.144.144.9:9101 https://api64.ipify.org?format=json
+curl -x http://test_curl:<GATEWAY_PASSWORD>@10.144.144.9:9101 https://api64.ipify.org?format=json
 
 # 测试 2：强制指定使用日本原生/优质池
-curl -x http://test_curl__region_tokyo__tier_premium:tetherpool@10.144.144.9:9101 https://api.ipify.org?format=json
+curl -x http://test_curl__region_tokyo__tier_premium:<GATEWAY_PASSWORD>@10.144.144.9:9101 https://api.ipify.org?format=json
 
 # 测试 3：强制重置换绑节点 (rebind_true)
-curl -x http://test_curl__rebind_true:tetherpool@10.144.144.9:9101 https://api64.ipify.org?format=json
+curl -x http://test_curl__rebind_true:<GATEWAY_PASSWORD>@10.144.144.9:9101 https://api64.ipify.org?format=json
 ```

@@ -76,7 +76,10 @@ def test_batch_allocate_2100_accounts_balanced_sharding(temp_storage, warp_100_n
     assert first_acc.service == "grok2api"
     assert first_acc.egress_type == "warp_ipv6"
     assert first_acc.proxy_url.startswith("socks5")
-    assert "tetherpool@" in first_acc.gateway_proxy_url
+    # 2026-11-15: SDK 密码默认值已移除 (公开仓库不得携带生产凭据), URL 里密码
+    # 段为空串 — 格式仍然是 "user:<pw>@" 结构
+    assert first_acc.gateway_proxy_url.count("@") == 1
+    assert first_acc.gateway_proxy_url.endswith(":@127.0.0.1:9101")
     assert first_acc.exit_ip is not None
 
 
@@ -215,10 +218,17 @@ def test_api_allocation_endpoints():
     assert rel_resp.json()["success"] is True
 
 
-def test_tetherpool_client_sdk_url_generation():
+def test_tetherpool_client_sdk_url_generation(monkeypatch):
+    monkeypatch.delenv("GATEWAY_PASSWORD", raising=False)
     sdk = TetherPoolClient(gateway_base="http://127.0.0.1:9101")
     url = sdk.get_gateway_proxy_url("my_acc", egress_type="warp_ipv6", region="tokyo", service="grok2api")
-    assert url == "http://my_acc__type_warp_ipv6__region_tokyo__service_grok2api:tetherpool@127.0.0.1:9101"
+    # 2026-11-15: 无默认密码 (公开仓库不携带生产凭据) — 密码段为空
+    assert url == "http://my_acc__type_warp_ipv6__region_tokyo__service_grok2api:@127.0.0.1:9101"
+    # 显式 env 时密码注入
+    monkeypatch.setenv("GATEWAY_PASSWORD", "test-pw-123")
+    sdk2 = TetherPoolClient(gateway_base="http://127.0.0.1:9101")
+    url2 = sdk2.get_gateway_proxy_url("my_acc", egress_type="warp_ipv6", region="tokyo", service="grok2api")
+    assert url2.endswith(":test-pw-123@127.0.0.1:9101")
 
 
 def test_gateway_router_reuses_universal_allocation(temp_storage, warp_100_nodes):

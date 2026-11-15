@@ -149,7 +149,9 @@ class BindingChangeRecord(BaseModel):
     epoch: int
     account_id: str
     from_node: Optional[str] = None
-    to_node: str
+    # 2026-11-15 review P1: 删除类变更 to_node=NULL ("绑定已消失"),
+    # 下游 reconcile 据此把这批账户摘除而非改绑。
+    to_node: Optional[str] = None
     reason: str
     created_at: str
 

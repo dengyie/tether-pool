@@ -14,9 +14,10 @@ from typing import List, Dict, Optional, Any
 
 def gateway_password() -> str:
     """网关密码统一从 GATEWAY_PASSWORD 读取 (F1, 二轮 review): 硬编码默认值在
-    线上启密码门后必然 407。未配置 env 时保留 'tetherpool' 以兼容本地无密码门
-    开发环境 (密码门未开时密码值被忽略)。"""
-    return os.environ.get("GATEWAY_PASSWORD") or "tetherpool"
+    线上启密码门后必然 407 —— 且公开仓库里的默认值等于泄露生产凭据。未配置
+    env 时回退空串: 本地无密码门时网关忽略密码值, 不影响开发; 线上必须配置。
+    """
+    return os.environ.get("GATEWAY_PASSWORD") or ""
 
 
 class TetherPoolClient:
@@ -169,7 +170,7 @@ class TetherPoolClient:
         """
         Generates a transparent gateway proxy URL with parametric authentication.
         Downstream services can use this single URL in requests/httpx/Playwright without API pre-registration!
-        Example: http://user_001__type_warp_ipv6__region_tokyo__tier_premium__service_grok2api:tetherpool@127.0.0.1:9101
+        Example: http://user_001__type_warp_ipv6__region_tokyo__tier_premium__service_grok2api:<GATEWAY_PASSWORD>@127.0.0.1:9101
         """
         parsed = urlparse(self.gateway_base)
         netloc = parsed.netloc or f"{parsed.hostname or '127.0.0.1'}:{parsed.port or 9101}"

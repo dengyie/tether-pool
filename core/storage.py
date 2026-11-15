@@ -5,6 +5,7 @@ core/storage.py - SQLite storage engine for IP Pool System with Circuit Breaker 
 import sqlite3
 import json
 import os
+import logging
 import threading
 from typing import List, Optional, Dict, Tuple, Any
 from datetime import datetime, timedelta
@@ -216,7 +217,7 @@ class Storage:
                     epoch INTEGER NOT NULL,
                     account_id TEXT NOT NULL,
                     from_node TEXT,
-                    to_node TEXT NOT NULL,
+                    to_node TEXT,
                     reason TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
@@ -265,6 +266,37 @@ class Storage:
             ]:
                 if col not in existing_cols:
                     conn.execute(f"ALTER TABLE nodes ADD COLUMN {col} {col_type} DEFAULT {default_val}")
+
+            # 2026-11-15 review P1: 删除类绑定变更 (to_node=NULL, "绑定已消失")
+            # 需要可空 to_node —— 存量库按旧 schema 建的表是 NOT NULL, 重建。
+            bc_info = conn.execute("PRAGMA table_info(binding_changes)").fetchall()
+            to_node_notnull = any(
+                r["name"] == "to_node" and r["notnull"] for r in bc_info
+            )
+            if to_node_notnull:
+                conn.execute("ALTER TABLE binding_changes RENAME TO binding_changes_old")
+                conn.execute("""
+                    CREATE TABLE binding_changes (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        service TEXT NOT NULL,
+                        epoch INTEGER NOT NULL,
+                        account_id TEXT NOT NULL,
+                        from_node TEXT,
+                        to_node TEXT,
+                        reason TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    )
+                """)
+                conn.execute("""
+                    INSERT INTO binding_changes
+                        (id, service, epoch, account_id, from_node, to_node, reason, created_at)
+                    SELECT id, service, epoch, account_id, from_node, to_node, reason, created_at
+                    FROM binding_changes_old
+                """)
+                conn.execute("DROP TABLE binding_changes_old")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_binding_changes_epoch ON binding_changes(service, epoch);")
+                logging.getLogger("tetherpool.storage").info(
+                    "[schema] binding_changes.to_node relaxed to nullable (deletion change rows)")
 
             # janitor 存量回填 (2026-11-15): 升级前已 DEAD 的节点没有 dead_since
             # 锚点, 续期分支会一直保留 NULL —— 它们永远进不了冻结/驱逐倒计时。
@@ -403,6 +435,19 @@ class Storage:
 
                 node = self._row_to_node(row)
                 old_state = node.status
+
+                # 管理态防护 (2026-11-15 review P1): DISABLED 是管理员显式禁用,
+                # 探活不碰、永不自动恢复。全量轮 3400 节点耗时 ~14min, 轮内
+                # disable/冻结的节点可能仍有在途探活结果飞回来 —— 这里在事务内
+                # 重读状态, 飞回的旧结果不再把 admin_disabled 覆写回活
+                # (upsert_node CASE 守卫与 prober 过滤之外的第三层)。
+                # tags 含 "frozen" 同理: janitor 冻结节点的复核探活不应把它写
+                # 回 degraded/healthy (恢复走 revive/enable 管理通道)。
+                # row_tags 取自事务内重读的行, 而非外层快照 node.tags。
+                row_tags = json.loads(row["tags"]) if row["tags"] else []
+                if (old_state == HealthStatus.DISABLED.value or "frozen" in row_tags) \
+                        and not res.force:
+                    return res, None
 
                 # 3. Evaluate circuit transition
                 # Calculate updated counters BEFORE evaluate: rise=2 recovery gate
@@ -761,14 +806,19 @@ class Storage:
 
     def freeze_node(self, node_name: str) -> bool:
         """冻结: tags 加 frozen + status 保持 dead (探活降频由 prober 按标签识别,
-        分配本就排除 DEAD)。幂等。"""
+        分配本就排除 DEAD)。幂等。
+        2026-11-15 review P2: 快照与写入之间节点可能被 revive/enable 成
+        UNPROBED —— 状态复检不过就不冻 (否则活节点被 frozen 标签挡出探活)。"""
         node = self.get_node(node_name)
         if not node:
+            return False
+        if node.status != HealthStatus.DEAD.value:
             return False
         tags = list(node.tags or [])
         if "frozen" not in tags:
             tags.append("frozen")
-            self.update_node(node_name, {"tags": tags})
+            self.update_node(node_name, {"tags": tags, "status": HealthStatus.DEAD.value,
+                                         "circuit_state": HealthStatus.DEAD.value})
             self.record_circuit_event(node_name, "dead", "dead", "janitor_frozen_dead_24h")
         return True
 
@@ -912,23 +962,27 @@ class Storage:
         cooled_until = (now + timedelta(seconds=cooldown_seconds)).isoformat()
         now_str = now.isoformat()
         with self._get_conn() as conn:
-            # Keep one live row per (exit_ip, target_service) instead of appending duplicates
-            conn.execute(
-                "DELETE FROM ip_cooldowns WHERE exit_ip = ? AND target_service = ?",
-                (exit_ip, target_service)
-            )
-            cur = conn.execute("""
-                INSERT INTO ip_cooldowns (exit_ip, target_service, node_name, cooled_until, created_at)
-                VALUES (?, ?, ?, ?, ?)
-            """, (exit_ip, target_service, node_name, cooled_until, now_str))
-            return IpCooldownRecord(
-                id=cur.lastrowid,
-                exit_ip=exit_ip,
-                target_service=target_service,
-                node_name=node_name,
-                cooled_until=cooled_until,
-                created_at=now_str
-            )
+            # Keep one live row per (exit_ip, target_service) instead of appending
+            # duplicates. 2026-11-15 review P2: DELETE+INSERT 原子化 —— 并发 add
+            # 曾交错成 DELETE/DELETE/INSERT/INSERT 落两行活记录。
+            with self._immediate_txn(conn):
+                conn.execute(
+                    "DELETE FROM ip_cooldowns WHERE exit_ip = ? AND target_service = ?",
+                    (exit_ip, target_service)
+                )
+                cur = conn.execute("""
+                    INSERT INTO ip_cooldowns (exit_ip, target_service, node_name, cooled_until, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (exit_ip, target_service, node_name, cooled_until, now_str))
+                _rowid = cur.lastrowid
+        return IpCooldownRecord(
+            id=_rowid,
+            exit_ip=exit_ip,
+            target_service=target_service,
+            node_name=node_name,
+            cooled_until=cooled_until,
+            created_at=now_str
+        )
 
     def is_ip_cooled(self, exit_ip: str, target_service: str) -> bool:
         """Checks if an exit IP is currently cooled for the specific target service."""
@@ -1405,19 +1459,36 @@ class Storage:
         cleared in the same transaction once the account has no bindings left anywhere.
         Otherwise `acquire_for_account` would resurrect the released lease and the
         account would silently remain bound while no longer counting against capacity.
+
+        2026-11-15 review P1: 删除也是绑定变更 —— epoch 不推进的话下游
+        (grok2api /v1/bindings/epoch 轮询) 永远看不到这次释放, 继续拨已解绑
+        的出口。to_node=NULL 即 "绑定已消失" 的 change 语义。
         """
+        now_str = datetime.now().isoformat()
         with self._get_conn() as conn:
-            cur = conn.execute("""
-                DELETE FROM account_allocations
-                WHERE service = ? AND account_id = ?
-            """, (service, account_id))
-            remaining = conn.execute(
-                "SELECT COUNT(*) FROM account_allocations WHERE account_id = ?",
-                (account_id,)
-            ).fetchone()[0]
-            if remaining == 0:
-                conn.execute("DELETE FROM leases WHERE account_id = ?", (account_id,))
-            return cur.rowcount > 0
+            with self._immediate_txn(conn):
+                prev = conn.execute(
+                    "SELECT node_name FROM account_allocations WHERE service = ? AND account_id = ?",
+                    (service, account_id)
+                ).fetchone()
+                if not prev:
+                    return False
+                cur = conn.execute("""
+                    DELETE FROM account_allocations
+                    WHERE service = ? AND account_id = ?
+                """, (service, account_id))
+                remaining = conn.execute(
+                    "SELECT COUNT(*) FROM account_allocations WHERE account_id = ?",
+                    (account_id,)
+                ).fetchone()[0]
+                if remaining == 0:
+                    conn.execute("DELETE FROM leases WHERE account_id = ?", (account_id,))
+                epoch = self._advance_binding_epochs(conn, {service}, now_str)[service]
+                conn.execute("""
+                    INSERT INTO binding_changes (service, epoch, account_id, from_node, to_node, reason, created_at)
+                    VALUES (?, ?, ?, ?, NULL, 'allocation_deleted', ?)
+                """, (service, epoch, account_id, prev["node_name"], now_str))
+                return cur.rowcount > 0
 
     def migrate_legacy_leases(self, service: str = "default") -> int:
         """
@@ -1591,60 +1662,114 @@ class Storage:
         operator explicitly opts in (see `prune_nodes_except`).
         """
         with self._get_conn() as conn:
-            existing = [
-                r["name"] for r in conn.execute(
-                    "SELECT name FROM nodes WHERE tags NOT LIKE '%\"api_managed\"%'"
-                ).fetchall()
-            ]
-            keep = set(keep_names)
-            stale = [n for n in existing if n not in keep]
-            if not stale:
-                return []
-            placeholders = ",".join("?" * len(stale))
-            # 2026-11-15 review #2: 非探活路径落 DEAD 也必须写 dead_since 锚点,
-            # 否则续期分支永远保留 NULL —— 这批节点永远进不了冻结/驱逐倒计时
-            conn.execute(
-                f"UPDATE nodes SET status = ?, circuit_state = ?, "
-                f"dead_since = COALESCE(dead_since, ?) "
-                f"WHERE name IN ({placeholders})",
-                [HealthStatus.DEAD.value, HealthStatus.DEAD.value,
-                 datetime.now().isoformat(), *stale]
-            )
-            return stale
+            # 读改写原子化 (2026-11-15 review storage#2): SELECT 基线与批量
+            # UPDATE 曾跨事务, 探活成功可在两步之间把节点救活, 随后被本方法
+            # 用陈旧基线无条件的 UPDATE 盖回 dead。加 status != 'dead' 条件,
+            # 只标记仍非 dead 的节点 (且 COALESCE 保锚点)。
+            with self._immediate_txn(conn):
+                existing = [
+                    r["name"] for r in conn.execute(
+                        "SELECT name FROM nodes WHERE tags NOT LIKE '%\"api_managed\"%'"
+                    ).fetchall()
+                ]
+                keep = set(keep_names)
+                stale = [n for n in existing if n not in keep]
+                if not stale:
+                    return []
+                placeholders = ",".join("?" * len(stale))
+                # 2026-11-15 review #2: 非探活路径落 DEAD 也必须写 dead_since 锚点,
+                # 否则续期分支永远保留 NULL —— 这批节点永远进不了冻结/驱逐倒计时
+                conn.execute(
+                    f"UPDATE nodes SET status = ?, circuit_state = ?, "
+                    f"dead_since = COALESCE(dead_since, ?) "
+                    f"WHERE status != 'dead' AND name IN ({placeholders})",
+                    [HealthStatus.DEAD.value, HealthStatus.DEAD.value,
+                     datetime.now().isoformat(), *stale]
+                )
+                return stale
 
     def prune_nodes_except(self, keep_names: List[str]) -> List[str]:
         """
         Removes nodes absent from the authoritative inventory along with their bindings.
         Excludes dynamic API-managed nodes (tagged 'api_managed') from being pruned.
         Returns the pruned node names. Callers must validate `keep_names` first.
+
+        2026-11-15 review P1: 与 delete_node 同理, 被清节点的绑定必须推进
+        epoch + 落 change 行, 否则下游 reconcile 看不到这批释放。
         """
+        now_str = datetime.now().isoformat()
         with self._get_conn() as conn:
-            existing = [
-                r["name"] for r in conn.execute(
-                    "SELECT name FROM nodes WHERE tags NOT LIKE '%\"api_managed\"%'"
-                ).fetchall()
-            ]
-            stale = [n for n in existing if n not in set(keep_names)]
-            if not stale:
-                return []
-            placeholders = ",".join("?" * len(stale))
-            conn.execute(f"DELETE FROM leases WHERE node_name IN ({placeholders})", stale)
-            conn.execute(f"DELETE FROM account_allocations WHERE node_name IN ({placeholders})", stale)
-            conn.execute(f"DELETE FROM nodes WHERE name IN ({placeholders})", stale)
-            return stale
+            with self._immediate_txn(conn):
+                existing = [
+                    r["name"] for r in conn.execute(
+                        "SELECT name FROM nodes WHERE tags NOT LIKE '%\"api_managed\"%'"
+                    ).fetchall()
+                ]
+                stale = [n for n in existing if n not in set(keep_names)]
+                if not stale:
+                    return []
+                orphaned = [
+                    (r["service"], r["account_id"], r["node_name"])
+                    for r in conn.execute(
+                        "SELECT service, account_id, node_name FROM account_allocations "
+                        f"WHERE node_name IN ({','.join('?' * len(stale))})",
+                        stale,
+                    ).fetchall()
+                ]
+                placeholders = ",".join("?" * len(stale))
+                conn.execute(f"DELETE FROM leases WHERE node_name IN ({placeholders})", stale)
+                conn.execute(f"DELETE FROM account_allocations WHERE node_name IN ({placeholders})", stale)
+                conn.execute(f"DELETE FROM nodes WHERE name IN ({placeholders})", stale)
+                if orphaned:
+                    touched = {s for s, _, _ in orphaned}
+                    epoch = self._advance_binding_epochs(conn, touched, now_str)
+                    for service, account_id, node_name in orphaned:
+                        conn.execute("""
+                            INSERT INTO binding_changes
+                                (service, epoch, account_id, from_node, to_node, reason, created_at)
+                            VALUES (?, ?, ?, ?, NULL, 'node_pruned_binding_orphaned', ?)
+                        """, (service, epoch[service], account_id, node_name, now_str))
+                return stale
 
     def delete_node(self, name: str, prune_bindings: bool = True) -> bool:
         """
         Deletes a single node by name.
         If prune_bindings is True, also deletes any attached allocations and leases.
         Returns True if the node existed and was deleted, False otherwise.
+
+        2026-11-15 review P1: 被删节点上的绑定必须推进 epoch 并落 change 行
+        (to_node=NULL), 否则下游 reconcile 永远不知道这些账户已失效 —— 正是
+        R5b 要防的 "N 个账户挂在已消失出口" 故障类。janitor 驱逐路径
+        (api/server.py) 在调用本方法前已先 rehome, 这里兜的是剩余绑定。
         """
+        now_str = datetime.now().isoformat()
         with self._get_conn() as conn:
-            if prune_bindings:
-                conn.execute("DELETE FROM leases WHERE node_name = ?", (name,))
-                conn.execute("DELETE FROM account_allocations WHERE node_name = ?", (name,))
-            cur = conn.execute("DELETE FROM nodes WHERE name = ?", (name,))
-            return cur.rowcount > 0
+            with self._immediate_txn(conn):
+                cur = conn.execute("SELECT 1 FROM nodes WHERE name = ?", (name,)).fetchone()
+                if not cur:
+                    return False
+                orphaned: List[tuple] = []
+                if prune_bindings:
+                    orphaned = [
+                        (r["service"], r["account_id"], r["node_name"])
+                        for r in conn.execute(
+                            "SELECT service, account_id, node_name FROM account_allocations "
+                            "WHERE node_name = ?", (name,)
+                        ).fetchall()
+                    ]
+                    conn.execute("DELETE FROM leases WHERE node_name = ?", (name,))
+                    conn.execute("DELETE FROM account_allocations WHERE node_name = ?", (name,))
+                conn.execute("DELETE FROM nodes WHERE name = ?", (name,))
+                if orphaned:
+                    touched = {s for s, _, _ in orphaned}
+                    epoch = self._advance_binding_epochs(conn, touched, now_str)
+                    for service, account_id, node_name in orphaned:
+                        conn.execute("""
+                            INSERT INTO binding_changes
+                                (service, epoch, account_id, from_node, to_node, reason, created_at)
+                            VALUES (?, ?, ?, ?, NULL, 'node_deleted_binding_orphaned', ?)
+                        """, (service, epoch[service], account_id, node_name, now_str))
+                return True
 
     # --- Binding Epoch & Change Log (R5 downstream reconciliation) ---
 
@@ -1804,38 +1929,43 @@ class Storage:
         now_str = now.isoformat()
 
         with self._get_conn() as conn:
-            rows = conn.execute("""
-                SELECT * FROM nodes
-                WHERE (fault_domain = ? OR (fault_domain = '' AND host = ?))
-                  AND status != ?
-                ORDER BY name ASC
-            """, (fault_domain, fault_domain, HealthStatus.DEAD.value)).fetchall()
-            affected = [self._row_to_node(r) for r in rows]
-            if not affected:
-                return [], None
+            # 读改写原子化 (2026-11-15 review storage#2): SELECT 快照与 UPDATE
+            # 之间探活可能把节点救活, UPDATE 用陈旧基线盖回 dead。
+            # UPDATE 自带 status != 'dead' 条件兜底, 快照 affected 仅用于返回值
+            # 与事件计数 (标签为 domain 级, 个别漂移可接受)。
+            with self._immediate_txn(conn):
+                rows = conn.execute("""
+                    SELECT * FROM nodes
+                    WHERE (fault_domain = ? OR (fault_domain = '' AND host = ?))
+                      AND status != ?
+                    ORDER BY name ASC
+                """, (fault_domain, fault_domain, HealthStatus.DEAD.value)).fetchall()
+                affected = [self._row_to_node(r) for r in rows]
+                if not affected:
+                    return [], None
 
-            names = [n.name for n in affected]
-            placeholders = ",".join("?" * len(names))
-            # 2026-11-15 review #2: 域级隔离落 DEAD 同样要写 dead_since 锚点
-            conn.execute(
-                f"UPDATE nodes SET status = ?, circuit_state = ?, consecutive_failures = MAX(consecutive_failures, 2), "
-                f"consecutive_successes = 0, next_probe_allowed_at = ?, last_probed_at = ?, "
-                f"dead_since = COALESCE(dead_since, ?) WHERE name IN ({placeholders})",
-                [HealthStatus.DEAD.value, HealthStatus.DEAD.value, next_allowed, now_str,
-                 now_str, *names]
-            )
-            cur = conn.execute("""
-                INSERT INTO circuit_events (node_name, from_state, to_state, reason, created_at)
-                VALUES (?, 'domain_healthy', 'dead', ?, ?)
-            """, (fault_domain, f"{reason}_{len(affected)}_listeners", now_str))
-            event = CircuitEvent(
-                id=cur.lastrowid,
-                node_name=fault_domain,
-                from_state="domain_healthy",
-                to_state=HealthStatus.DEAD.value,
-                reason=f"{reason}_{len(affected)}_listeners",
-                created_at=now_str
-            )
+                names = [n.name for n in affected]
+                placeholders = ",".join("?" * len(names))
+                # 2026-11-15 review #2: 域级隔离落 DEAD 同样要写 dead_since 锚点
+                conn.execute(
+                    f"UPDATE nodes SET status = ?, circuit_state = ?, consecutive_failures = MAX(consecutive_failures, 2), "
+                    f"consecutive_successes = 0, next_probe_allowed_at = ?, last_probed_at = ?, "
+                    f"dead_since = COALESCE(dead_since, ?) WHERE status != 'dead' AND name IN ({placeholders})",
+                    [HealthStatus.DEAD.value, HealthStatus.DEAD.value, next_allowed, now_str,
+                     now_str, *names]
+                )
+                cur = conn.execute("""
+                    INSERT INTO circuit_events (node_name, from_state, to_state, reason, created_at)
+                    VALUES (?, 'domain_healthy', 'dead', ?, ?)
+                """, (fault_domain, f"{reason}_{len(affected)}_listeners", now_str))
+                event = CircuitEvent(
+                    id=cur.lastrowid,
+                    node_name=fault_domain,
+                    from_state="domain_healthy",
+                    to_state=HealthStatus.DEAD.value,
+                    reason=f"{reason}_{len(affected)}_listeners",
+                    created_at=now_str
+                )
         return affected, event
 
     def get_allocations_for_domain(self, fault_domain: str) -> List[Dict[str, Any]]:
@@ -1943,29 +2073,33 @@ class Storage:
         if "tags" in valid_updates and isinstance(valid_updates["tags"], list):
             valid_updates["tags"] = json.dumps(valid_updates["tags"])
 
-        current_node = self.get_node(name)
-        if not current_node:
-            return None
-
-        set_clauses = [f"{k} = ?" for k in valid_updates.keys()]
-        values = list(valid_updates.values())
-        values.append(name)
-
         now_str = datetime.now().isoformat()
         with self._get_conn() as conn:
-            cur = conn.execute(
-                f"UPDATE nodes SET {', '.join(set_clauses)} WHERE name = ?",
-                values
-            )
-            if cur.rowcount == 0:
-                return None
+            # 读改写原子化 (2026-11-15 review storage#1): get_node + UPDATE 曾是
+            # 两个独立事务 —— janitor freeze 读 tags=[a], 并发探活成功提交
+            # tags=[a,isp=x], freeze 再写 tags=[a,frozen] 会静默丢掉 isp=x。
+            with self._immediate_txn(conn):
+                row = conn.execute("SELECT * FROM nodes WHERE name = ?", (name,)).fetchone()
+                if not row:
+                    return None
+                current_node = self._row_to_node(row)
 
-            # Record circuit audit transition event if status changed
-            if "status" in valid_updates and current_node.status != valid_updates["status"]:
-                conn.execute("""
-                    INSERT INTO circuit_events (node_name, from_state, to_state, reason, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (name, current_node.status, valid_updates["status"], "api_manual_patch", now_str))
+                set_clauses = [f"{k} = ?" for k in valid_updates.keys()]
+                values = list(valid_updates.values())
+                values.append(name)
+                cur = conn.execute(
+                    f"UPDATE nodes SET {', '.join(set_clauses)} WHERE name = ?",
+                    values
+                )
+                if cur.rowcount == 0:
+                    return None
+
+                # Record circuit audit transition event if status changed
+                if "status" in valid_updates and current_node.status != valid_updates["status"]:
+                    conn.execute("""
+                        INSERT INTO circuit_events (node_name, from_state, to_state, reason, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (name, current_node.status, valid_updates["status"], "api_manual_patch", now_str))
 
         return self.get_node(name)
 
