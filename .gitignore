@@ -30,3 +30,5 @@ config/relay-nodes.local.yaml
 config/nodes.yaml
 # 本地运维备份 (含 DB 全量, 永不入库)
 backups/
+config/tethepool-bridge.yaml
+config/tethepool-bridge/
