@@ -56,6 +56,10 @@ class Storage:
                 # (探活线程池) 存在时可能压不住, WAL 无限增长最终打满磁盘
                 # (97% 事故同型)。10000 页 ≈ 40MB, checkpoint 由后续写自然触发。
                 conn.execute("PRAGMA wal_autocheckpoint = 10000;")
+                # busy_timeout 必须每连接设置 (2026-11-15 review storage#6:
+                # init 线程的 5000 pragma 只作用于那一根连接, 其余连接的
+                # 实际锁等待由 connect timeout=10.0 决定, pragma 是误导)
+                conn.execute("PRAGMA busy_timeout = 10000;")
             except sqlite3.OperationalError:
                 pass  # 只读连接/磁盘异常时不阻断建连
             self._thread_local.conn = conn
@@ -64,6 +68,25 @@ class Storage:
             conn.commit()
         except Exception:
             conn.rollback()
+            raise
+
+    @contextmanager
+    def _immediate_txn(self, conn):
+        """显式 BEGIN IMMEDIATE 写事务 (2026-11-15 review storage#3):
+        python sqlite3 默认延迟开事务, SELECT 在 autocommit 里跑 —— 读改写
+        方法的 SELECT 与 UPDATE 不是同一快照, 并发写互相 clobber (熔断计数
+        丢失、状态回退、mass-guard 用陈旧比率)。IMMEDIATE 在事务开头就抓
+        写锁, 读在锁内, 整段原子。调用方仍处在外层 _get_conn 的 commit 里,
+        这里的 COMMIT/RALLBACK 只结束 IMMEDIATE 事务本身。"""
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass  # 连接级故障时 rollback 自身不可用, 外层 _get_conn 再兜底
             raise
 
     def _init_db(self):
@@ -362,151 +385,156 @@ class Storage:
         drift_labels: Optional[Dict[str, str]] = None
 
         with self._get_conn() as conn:
-            # 1. Record probe history
-            conn.execute("""
-                INSERT INTO probe_history (node_name, success, exit_ip, latency_ms, error, probed_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (res.node_name, 1 if res.success else 0, res.exit_ip, res.latency_ms, res.error, now_str))
-
-            # 2. Get current node state
-            row = conn.execute("SELECT * FROM nodes WHERE name = ?", (res.node_name,)).fetchone()
-            if not row:
-                return res, None
-
-            node = self._row_to_node(row)
-            old_state = node.status
-
-            # 3. Evaluate circuit transition
-            # Calculate updated counters BEFORE evaluate: rise=2 recovery gate
-            # (circuit.py) needs the post-increment consecutive_successes to
-            # decide observation -> HEALTHY promotion.
-            new_fails = 0 if res.success else (node.consecutive_failures + 1)
-            new_succs = (node.consecutive_successes + 1) if res.success else 0
-
-            new_state, reason, next_allowed = CircuitBreaker.evaluate(
-                node=node,
-                success=res.success,
-                latency_ms=res.latency_ms,
-                error=res.error,
-                consecutive_successes=new_succs,
-            )
-
-            # Mass-ejection guard (Envoy outlier safeguards, 2026-11-15): before
-            # committing a NEW DEAD transition (DEGRADED/HALF_OPEN -> DEAD edge),
-            # check the domain-bucket and global DEAD ratios. Renewals of
-            # already-DEAD nodes (cooldown extension) are never blocked.
-            if (not res.success and new_state == HealthStatus.DEAD.value
-                    and old_state != HealthStatus.DEAD.value):
-                allowed, guard_reason = CircuitBreaker.allow_trip(node, conn)
-                if not allowed:
-                    new_state = HealthStatus.DEGRADED.value
-                    reason = f"{guard_reason}: {reason[:40]}"
-                    next_allowed = None
-
-            next_allowed_str = next_allowed.isoformat() if next_allowed else None
-            cur_lat = res.latency_ms if res.success else node.latency_ms
-            cur_ip = res.exit_ip if res.success else node.exit_ip
-            q_score, q_tier, _ = IPQualityEvaluator.evaluate_node(
-                tags=node.tags,
-                egress_type=node.egress_type,
-                latency_ms=cur_lat,
-                status=new_state,
-                consecutive_failures=new_fails,
-                exit_ip=cur_ip,
-                configured_tier=node.configured_tier
-            )
-
-            if res.success:
-                # isp tag 防漂移 (ban-aware 2026-11-14): pigeonw 等家宽节点的上游
-                # 出口会在 ISP 段间漂移, 探活成功时按 exit_ip 段校正 (core/ban),
-                # 与 exit_ip 写入同一事务, avoid_same_isp 判定拿到的是新鲜 ISP。
-                from core.ban import refresh_isp_tag
-                updated_node = refresh_isp_tag(node, res.exit_ip)
-                new_tags = updated_node.tags if updated_node else node.tags
-                # gen 区域漂移纠偏 (R2 2026-11-14): CF trace loc= 是出口真实国家,
-                # gen 批次当初硬编码 us-west 但 ~50% 出口实际在 DE/CA —— 标签失真
-                # 击穿 region_strict 与 auto_rehome。与 exit_ip 同事务校正为真实
-                # 国家码 (us->us-west), 仅限 gen 池 (tags 含 genproxy); sub 池每日
-                # 刷新自带 region_of, pigeonw/teleapi 出界不动。
-                new_region, new_provider_region = node.region, node.provider_region
-                probe_region = region_from_country(res.country_code)
-                if probe_region and probe_region != node.region and "genproxy" in node.tags:
-                    new_region = probe_region
-                    new_provider_region = probe_region
-                    if "geo-fixed" not in new_tags:
-                        new_tags = list(new_tags) + ["geo-fixed"]
-                    # incr_metric 在 with 块外调 (线程本地连接复用下嵌套 with 的
-                    # commit 会截断本事务的原子性)
-                    drift_labels = {"from": node.region, "to": probe_region}
+            # 读改写必须整段原子 (2026-11-15 review storage#3): 默认延迟事务下
+            # SELECT 在 autocommit 跑, 两个并发 probe 各读到同一基线, 后写 clobber
+            # 前写 (熔断计数丢失 / DEAD 状态回退 / mass-guard 用陈旧比率)。
+            # BEGIN IMMEDIATE 在事务头抓写锁, 以下 SELECT/UPDATE 全在同一快照。
+            with self._immediate_txn(conn):
+                # 1. Record probe history
                 conn.execute("""
-                    UPDATE nodes SET
-                        exit_ip = ?,
-                        latency_ms = ?,
-                        status = ?,
-                        circuit_state = ?,
-                        fail_count = 0,
-                        consecutive_failures = ?,
-                        consecutive_successes = ?,
-                        next_probe_allowed_at = ?,
-                        last_probed_at = ?,
-                        tier = ?,
-                        quality_score = ?,
-                        tags = ?,
-                        region = ?,
-                        provider_region = ?,
-                        dead_since = NULL
-                    WHERE name = ?
-                """, (
-                    res.exit_ip, res.latency_ms, new_state, new_state,
-                    new_fails, new_succs, next_allowed_str, now_str,
-                    q_tier, q_score,
-                    # 无需校正时原样回写 (JSON 序列化与列存储同形)
-                    json.dumps(new_tags, ensure_ascii=False),
-                    new_region, new_provider_region,
-                    res.node_name
-                ))
-            else:
-                # dead_since 生命周期锚 (2026-11-15): 新落 DEAD 时记录锚点, 已
-                # DEAD 续期保持原锚 (连续不可达时长不因续期重置)。离开 DEAD
-                # (成功分支) 时清空。
-                dead_since_val = node.dead_since if old_state == HealthStatus.DEAD.value else (
-                    getattr(node, "dead_since", None) or now_str if new_state == HealthStatus.DEAD.value else None)
-                if new_state != HealthStatus.DEAD.value:
-                    dead_since_val = None
-                conn.execute("""
-                    UPDATE nodes SET
-                        fail_count = fail_count + 1,
-                        status = ?,
-                        circuit_state = ?,
-                        consecutive_failures = ?,
-                        consecutive_successes = ?,
-                        next_probe_allowed_at = ?,
-                        last_probed_at = ?,
-                        tier = ?,
-                        quality_score = ?,
-                        dead_since = ?
-                    WHERE name = ?
-                """, (
-                    new_state, new_state, new_fails, new_succs,
-                    next_allowed_str, now_str,
-                    q_tier, q_score, dead_since_val, res.node_name
-                ))
+                    INSERT INTO probe_history (node_name, success, exit_ip, latency_ms, error, probed_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (res.node_name, 1 if res.success else 0, res.exit_ip, res.latency_ms, res.error, now_str))
 
-            # 4. Record circuit event if state changed
-            if old_state != new_state:
-                cur = conn.execute("""
-                    INSERT INTO circuit_events (node_name, from_state, to_state, reason, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (res.node_name, old_state, new_state, reason, now_str))
-                event_id = cur.lastrowid
-                transition_event = CircuitEvent(
-                    id=event_id,
-                    node_name=res.node_name,
-                    from_state=old_state,
-                    to_state=new_state,
-                    reason=reason,
-                    created_at=now_str
+                # 2. Get current node state
+                row = conn.execute("SELECT * FROM nodes WHERE name = ?", (res.node_name,)).fetchone()
+                if not row:
+                    return res, None
+
+                node = self._row_to_node(row)
+                old_state = node.status
+
+                # 3. Evaluate circuit transition
+                # Calculate updated counters BEFORE evaluate: rise=2 recovery gate
+                # (circuit.py) needs the post-increment consecutive_successes to
+                # decide observation -> HEALTHY promotion.
+                new_fails = 0 if res.success else (node.consecutive_failures + 1)
+                new_succs = (node.consecutive_successes + 1) if res.success else 0
+
+                new_state, reason, next_allowed = CircuitBreaker.evaluate(
+                    node=node,
+                    success=res.success,
+                    latency_ms=res.latency_ms,
+                    error=res.error,
+                    consecutive_successes=new_succs,
                 )
+
+                # Mass-ejection guard (Envoy outlier safeguards, 2026-11-15): before
+                # committing a NEW DEAD transition (DEGRADED/HALF_OPEN -> DEAD edge),
+                # check the domain-bucket and global DEAD ratios. Renewals of
+                # already-DEAD nodes (cooldown extension) are never blocked.
+                if (not res.success and new_state == HealthStatus.DEAD.value
+                        and old_state != HealthStatus.DEAD.value):
+                    allowed, guard_reason = CircuitBreaker.allow_trip(node, conn)
+                    if not allowed:
+                        new_state = HealthStatus.DEGRADED.value
+                        reason = f"{guard_reason}: {reason[:40]}"
+                        next_allowed = None
+
+                next_allowed_str = next_allowed.isoformat() if next_allowed else None
+                cur_lat = res.latency_ms if res.success else node.latency_ms
+                cur_ip = res.exit_ip if res.success else node.exit_ip
+                q_score, q_tier, _ = IPQualityEvaluator.evaluate_node(
+                    tags=node.tags,
+                    egress_type=node.egress_type,
+                    latency_ms=cur_lat,
+                    status=new_state,
+                    consecutive_failures=new_fails,
+                    exit_ip=cur_ip,
+                    configured_tier=node.configured_tier
+                )
+
+                if res.success:
+                    # isp tag 防漂移 (ban-aware 2026-11-14): pigeonw 等家宽节点的上游
+                    # 出口会在 ISP 段间漂移, 探活成功时按 exit_ip 段校正 (core/ban),
+                    # 与 exit_ip 写入同一事务, avoid_same_isp 判定拿到的是新鲜 ISP。
+                    from core.ban import refresh_isp_tag
+                    updated_node = refresh_isp_tag(node, res.exit_ip)
+                    new_tags = updated_node.tags if updated_node else node.tags
+                    # gen 区域漂移纠偏 (R2 2026-11-14): CF trace loc= 是出口真实国家,
+                    # gen 批次当初硬编码 us-west 但 ~50% 出口实际在 DE/CA —— 标签失真
+                    # 击穿 region_strict 与 auto_rehome。与 exit_ip 同事务校正为真实
+                    # 国家码 (us->us-west), 仅限 gen 池 (tags 含 genproxy); sub 池每日
+                    # 刷新自带 region_of, pigeonw/teleapi 出界不动。
+                    new_region, new_provider_region = node.region, node.provider_region
+                    probe_region = region_from_country(res.country_code)
+                    if probe_region and probe_region != node.region and "genproxy" in node.tags:
+                        new_region = probe_region
+                        new_provider_region = probe_region
+                        if "geo-fixed" not in new_tags:
+                            new_tags = list(new_tags) + ["geo-fixed"]
+                        # incr_metric 在 with 块外调 (线程本地连接复用下嵌套 with 的
+                        # commit 会截断本事务的原子性)
+                        drift_labels = {"from": node.region, "to": probe_region}
+                    conn.execute("""
+                        UPDATE nodes SET
+                            exit_ip = ?,
+                            latency_ms = ?,
+                            status = ?,
+                            circuit_state = ?,
+                            fail_count = 0,
+                            consecutive_failures = ?,
+                            consecutive_successes = ?,
+                            next_probe_allowed_at = ?,
+                            last_probed_at = ?,
+                            tier = ?,
+                            quality_score = ?,
+                            tags = ?,
+                            region = ?,
+                            provider_region = ?,
+                            dead_since = NULL
+                        WHERE name = ?
+                    """, (
+                        res.exit_ip, res.latency_ms, new_state, new_state,
+                        new_fails, new_succs, next_allowed_str, now_str,
+                        q_tier, q_score,
+                        # 无需校正时原样回写 (JSON 序列化与列存储同形)
+                        json.dumps(new_tags, ensure_ascii=False),
+                        new_region, new_provider_region,
+                        res.node_name
+                    ))
+                else:
+                    # dead_since 生命周期锚 (2026-11-15): 新落 DEAD 时记录锚点, 已
+                    # DEAD 续期保持原锚 (连续不可达时长不因续期重置)。离开 DEAD
+                    # (成功分支) 时清空。
+                    dead_since_val = node.dead_since if old_state == HealthStatus.DEAD.value else (
+                        getattr(node, "dead_since", None) or now_str if new_state == HealthStatus.DEAD.value else None)
+                    if new_state != HealthStatus.DEAD.value:
+                        dead_since_val = None
+                    conn.execute("""
+                        UPDATE nodes SET
+                            fail_count = fail_count + 1,
+                            status = ?,
+                            circuit_state = ?,
+                            consecutive_failures = ?,
+                            consecutive_successes = ?,
+                            next_probe_allowed_at = ?,
+                            last_probed_at = ?,
+                            tier = ?,
+                            quality_score = ?,
+                            dead_since = ?
+                        WHERE name = ?
+                    """, (
+                        new_state, new_state, new_fails, new_succs,
+                        next_allowed_str, now_str,
+                        q_tier, q_score, dead_since_val, res.node_name
+                    ))
+
+                # 4. Record circuit event if state changed
+                if old_state != new_state:
+                    cur = conn.execute("""
+                        INSERT INTO circuit_events (node_name, from_state, to_state, reason, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (res.node_name, old_state, new_state, reason, now_str))
+                    event_id = cur.lastrowid
+                    transition_event = CircuitEvent(
+                        id=event_id,
+                        node_name=res.node_name,
+                        from_state=old_state,
+                        to_state=new_state,
+                        reason=reason,
+                        created_at=now_str
+                    )
 
         if drift_labels:
             self.incr_metric("ip_pool_region_drift_fixed_total", drift_labels)
@@ -581,25 +609,28 @@ class Storage:
     def set_lease(self, account_id: str, node_name: str, rebind_reason: Optional[str] = None) -> LeaseInfo:
         now_str = datetime.now().isoformat()
         with self._get_conn() as conn:
-            # A rebind (as opposed to a first bind) bumps the account's counter so the
-            # "hot account" signal in R2 is observable.
-            existing = conn.execute(
-                "SELECT node_name FROM leases WHERE account_id = ?", (account_id,)
-            ).fetchone()
-            is_rebind = bool(existing and existing["node_name"] != node_name)
-            conn.execute("""
-                INSERT INTO leases (account_id, node_name, assigned_at, rebind_count, last_rebind_reason)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(account_id) DO UPDATE SET
-                    node_name = excluded.node_name,
-                    assigned_at = excluded.assigned_at,
-                    rebind_count = leases.rebind_count + CASE WHEN leases.node_name != excluded.node_name THEN 1 ELSE 0 END,
-                    last_rebind_reason = CASE WHEN leases.node_name != excluded.node_name THEN excluded.last_rebind_reason ELSE leases.last_rebind_reason END
-            """, (account_id, node_name, now_str, 1 if is_rebind else 0, rebind_reason or ""))
-            row = conn.execute(
-                "SELECT rebind_count, last_rebind_reason FROM leases WHERE account_id = ?",
-                (account_id,)
-            ).fetchone()
+            # 读改写原子化 (2026-11-15 review storage#3): rebind 计数基线 SELECT
+            # 与 INSERT 并发下必须同快照
+            with self._immediate_txn(conn):
+                # A rebind (as opposed to a first bind) bumps the account's counter so the
+                # "hot account" signal in R2 is observable.
+                existing = conn.execute(
+                    "SELECT node_name FROM leases WHERE account_id = ?", (account_id,)
+                ).fetchone()
+                is_rebind = bool(existing and existing["node_name"] != node_name)
+                conn.execute("""
+                    INSERT INTO leases (account_id, node_name, assigned_at, rebind_count, last_rebind_reason)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(account_id) DO UPDATE SET
+                        node_name = excluded.node_name,
+                        assigned_at = excluded.assigned_at,
+                        rebind_count = leases.rebind_count + CASE WHEN leases.node_name != excluded.node_name THEN 1 ELSE 0 END,
+                        last_rebind_reason = CASE WHEN leases.node_name != excluded.node_name THEN excluded.last_rebind_reason ELSE leases.last_rebind_reason END
+                """, (account_id, node_name, now_str, 1 if is_rebind else 0, rebind_reason or ""))
+                row = conn.execute(
+                    "SELECT rebind_count, last_rebind_reason FROM leases WHERE account_id = ?",
+                    (account_id,)
+                ).fetchone()
 
         node = self.get_node(node_name)
         return LeaseInfo(
@@ -1083,9 +1114,7 @@ class Storage:
         (封禁历史是归因审计数据, 比其他 event 表的 7 天窗口长)。直接调用时可
         传 keep_days=0 清空 (测试/运维)。"""
         cutoff = (datetime.now() - timedelta(days=keep_days)).isoformat()
-        with self._get_conn() as conn:
-            cur = conn.execute("DELETE FROM ban_events WHERE created_at < ?", (cutoff,))
-            return cur.rowcount
+        return self._chunked_prune("ban_events", "created_at", cutoff)
 
     # --- Battery Lifecycle Events ---
 
@@ -1141,123 +1170,148 @@ class Storage:
         with self._get_conn() as conn:
             # Pre-image lookup so rebind counts and change logs reflect real transitions.
             # Later duplicates win, matching the upsert ordering executemany applies.
+            # 2026-11-15 review storage#6: 2100 个逐行 SELECT (N+1) 换成两条
+            # 集合 IN 查询 —— 每行一次往返既慢又拉长写锁持有时间。
             desired: Dict[Tuple[str, str], str] = {}
             for service, account_id, node_name, _ in records:
                 desired[(service, account_id)] = node_name
             pre_images: Dict[Tuple[str, str], Optional[str]] = {}
-            for key in desired:
-                row = conn.execute(
-                    "SELECT node_name FROM account_allocations WHERE service = ? AND account_id = ?",
-                    key
-                ).fetchone()
-                pre_images[key] = row["node_name"] if row else None
+            keys = list(desired)
+            # sqlite IN 参数上限 999 (老版本 32766): 按 900 一批切片
+            for i in range(0, len(keys), 900):
+                chunk = keys[i:i + 900]
+                by_service: Dict[str, List[str]] = {}
+                for svc, acc in chunk:
+                    by_service.setdefault(svc, []).append(acc)
+                for svc, accs in by_service.items():
+                    ph = ",".join("?" * len(accs))
+                    for row in conn.execute(
+                        f"SELECT account_id, node_name FROM account_allocations "
+                        f"WHERE service = ? AND account_id IN ({ph})",
+                        [svc, *accs]
+                    ):
+                        pre_images[(svc, row["account_id"])] = row["node_name"]
+            for key in keys:
+                pre_images.setdefault(key, None)
 
-            def _c(key: Tuple[str, str]) -> Tuple[int, str, int, str, str, str]:
-                c = constraints_by_account.get(key)
-                if not c:
-                    return (0, "", 0, "", "", "")
-                return (
-                    1,
-                    c.get("region") or "",
-                    1 if c.get("region_strict") else 0,
-                    c.get("egress_type") or "",
-                    c.get("tier") or "",
-                    c.get("tier_policy") or "",
-                )
+        def _c(key: Tuple[str, str]) -> Tuple[int, str, int, str, str, str]:
+            c = constraints_by_account.get(key)
+            if not c:
+                return (0, "", 0, "", "", "")
+            return (
+                1,
+                c.get("region") or "",
+                1 if c.get("region_strict") else 0,
+                c.get("egress_type") or "",
+                c.get("tier") or "",
+                c.get("tier_policy") or "",
+            )
 
-            conn.executemany("""
-                INSERT INTO account_allocations (
-                    service, account_id, node_name, allocated_at,
-                    bound_region, bound_region_strict, bound_egress_type, bound_tier, bound_tier_policy
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(service, account_id) DO UPDATE SET
-                    node_name = excluded.node_name,
-                    allocated_at = excluded.allocated_at,
-                    rebind_count = CASE WHEN account_allocations.node_name != excluded.node_name
-                                        THEN account_allocations.rebind_count + 1
-                                        ELSE account_allocations.rebind_count END,
-                    last_rebind_reason = CASE WHEN account_allocations.node_name != excluded.node_name
-                                              THEN ?
-                                              ELSE account_allocations.last_rebind_reason END,
-                    bound_region = CASE WHEN ?=1 THEN ? ELSE account_allocations.bound_region END,
-                    bound_region_strict = CASE WHEN ?=1 THEN ? ELSE account_allocations.bound_region_strict END,
-                    bound_egress_type = CASE WHEN ?=1 THEN ? ELSE account_allocations.bound_egress_type END,
-                    bound_tier = CASE WHEN ?=1 THEN ? ELSE account_allocations.bound_tier END,
-                    bound_tier_policy = CASE WHEN ?=1 THEN ? ELSE account_allocations.bound_tier_policy END
-            """, [
-                (
-                    service, account_id, node_name, allocated_at,
-                    _c((service, account_id))[1], _c((service, account_id))[2],
-                    _c((service, account_id))[3], _c((service, account_id))[4], _c((service, account_id))[5],
-                    reason,
-                    _c((service, account_id))[0], _c((service, account_id))[1],
-                    _c((service, account_id))[0], _c((service, account_id))[2],
-                    _c((service, account_id))[0], _c((service, account_id))[3],
-                    _c((service, account_id))[0], _c((service, account_id))[4],
-                    _c((service, account_id))[0], _c((service, account_id))[5],
-                )
-                for service, account_id, node_name, allocated_at in records
-            ])
+        # 2026-11-15 review storage#6: 单事务写 2100 行会长期持有 WAL 写锁,
+        # 探活写全部排队 (超过 busy timeout 直接 OperationalError)。按 500 一批
+        # 分事务提交 —— 每批自身原子 (pre-image/epoch/变更日志同批计算), 批间
+        # 短暂可见属可接受 (下游 reconciler 按 epoch 增量拉, 不会看到半迁移行)。
+        CH = 500
+        for i in range(0, len(records), CH):
+            recs = records[i:i + CH]
+            sub_desired: Dict[Tuple[str, str], str] = {}
+            for service, account_id, node_name, _ in recs:
+                sub_desired[(service, account_id)] = node_name
+            with self._get_conn() as conn:
+                with self._immediate_txn(conn):
+                    conn.executemany("""
+                        INSERT INTO account_allocations (
+                            service, account_id, node_name, allocated_at,
+                            bound_region, bound_region_strict, bound_egress_type, bound_tier, bound_tier_policy
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(service, account_id) DO UPDATE SET
+                            node_name = excluded.node_name,
+                            allocated_at = excluded.allocated_at,
+                            rebind_count = CASE WHEN account_allocations.node_name != excluded.node_name
+                                                THEN account_allocations.rebind_count + 1
+                                                ELSE account_allocations.rebind_count END,
+                            last_rebind_reason = CASE WHEN account_allocations.node_name != excluded.node_name
+                                                      THEN ?
+                                                      ELSE account_allocations.last_rebind_reason END,
+                            bound_region = CASE WHEN ?=1 THEN ? ELSE account_allocations.bound_region END,
+                            bound_region_strict = CASE WHEN ?=1 THEN ? ELSE account_allocations.bound_region_strict END,
+                            bound_egress_type = CASE WHEN ?=1 THEN ? ELSE account_allocations.bound_egress_type END,
+                            bound_tier = CASE WHEN ?=1 THEN ? ELSE account_allocations.bound_tier END,
+                            bound_tier_policy = CASE WHEN ?=1 THEN ? ELSE account_allocations.bound_tier_policy END
+                    """, [
+                        (
+                            service, account_id, node_name, allocated_at,
+                            _c((service, account_id))[1], _c((service, account_id))[2],
+                            _c((service, account_id))[3], _c((service, account_id))[4], _c((service, account_id))[5],
+                            reason,
+                            _c((service, account_id))[0], _c((service, account_id))[1],
+                            _c((service, account_id))[0], _c((service, account_id))[2],
+                            _c((service, account_id))[0], _c((service, account_id))[3],
+                            _c((service, account_id))[0], _c((service, account_id))[4],
+                            _c((service, account_id))[0], _c((service, account_id))[5],
+                        )
+                        for service, account_id, node_name, allocated_at in recs
+                    ])
 
-            # Advance each service's epoch once per call and append one change row per move.
-            changed = [
-                (s, a, old, desired[(s, a)])
-                for (s, a), old in pre_images.items()
-                if old != desired[(s, a)]
-            ]
-            if changed:
-                epochs = self._advance_binding_epochs(conn, {s for s, _, _, _ in changed}, now_str)
-                conn.executemany("""
-                    INSERT INTO binding_changes (service, epoch, account_id, from_node, to_node, reason, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, [
-                    (s, epochs[s], a, old, new, reason, now_str)
-                    for s, a, old, new in changed
-                ])
+                    # Advance each service's epoch once per chunk and append one change row per move.
+                    changed = [
+                        (s, a, pre_images.get((s, a)), sub_desired[(s, a)])
+                        for (s, a) in sub_desired
+                        if pre_images.get((s, a)) != sub_desired[(s, a)]
+                    ]
+                    if changed:
+                        epochs = self._advance_binding_epochs(conn, {s for s, _, _, _ in changed}, now_str)
+                        conn.executemany("""
+                            INSERT INTO binding_changes (service, epoch, account_id, from_node, to_node, reason, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """, [
+                            (s, epochs[s], a, old, new, reason, now_str)
+                            for s, a, old, new in changed
+                        ])
 
-                # Keep the legacy account-keyed lease mirror in the SAME transaction as the
-                # allocation it mirrors. The old code did this with one `set_lease` call per
-                # account, which turned a whole-host rehome into N separate commits.
-                lease_moves: Dict[str, Tuple[str, int]] = {}
-                for s, a, old, new in changed:
-                    # A first bind is not a rebind; a move is. If the account has several
-                    # services, any pre-existing binding makes this a rebind.
-                    lease_moves[a] = (new, 1 if old is not None else 0)
-                # The mirror is account-keyed while constraints are (service, account)-keyed;
-                # prebuild the per-account lookup once (first service wins in insertion
-                # order) instead of scanning the map for every lease row.
-                first_c_by_acc: Dict[str, Tuple[int, str, int, str, str, str]] = {}
-                if constraints_by_account:
-                    for (s, a) in constraints_by_account.keys():
-                        if a not in first_c_by_acc:
-                            first_c_by_acc[a] = _c((s, a))
-                conn.executemany("""
-                    INSERT INTO leases (account_id, node_name, assigned_at, rebind_count, last_rebind_reason,
-                                        bound_region, bound_region_strict, bound_egress_type, bound_tier, bound_tier_policy)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(account_id) DO UPDATE SET
-                        node_name = excluded.node_name,
-                        assigned_at = excluded.assigned_at,
-                        rebind_count = leases.rebind_count + CASE WHEN leases.node_name != excluded.node_name THEN 1 ELSE 0 END,
-                        last_rebind_reason = CASE WHEN leases.node_name != excluded.node_name THEN excluded.last_rebind_reason ELSE leases.last_rebind_reason END,
-                        bound_region = CASE WHEN ?=1 THEN ? ELSE leases.bound_region END,
-                        bound_region_strict = CASE WHEN ?=1 THEN ? ELSE leases.bound_region_strict END,
-                        bound_egress_type = CASE WHEN ?=1 THEN ? ELSE leases.bound_egress_type END,
-                        bound_tier = CASE WHEN ?=1 THEN ? ELSE leases.bound_tier END,
-                        bound_tier_policy = CASE WHEN ?=1 THEN ? ELSE leases.bound_tier_policy END
-                """, [
-                    (acc, node, now_str, initial, reason,
-                     _lc[1], _lc[2], _lc[3], _lc[4], _lc[5],
-                     _lc[0], _lc[1],
-                     _lc[0], _lc[2],
-                     _lc[0], _lc[3],
-                     _lc[0], _lc[4],
-                     _lc[0], _lc[5],
-                     )
-                    for acc, (node, initial) in lease_moves.items()
-                    for _lc in (first_c_by_acc.get(acc, (0, "", 0, "", "", "")),)
-                ])
+                        # Keep the legacy account-keyed lease mirror in the SAME transaction as the
+                        # allocation it mirrors. The old code did this with one `set_lease` call per
+                        # account, which turned a whole-host rehome into N separate commits.
+                        lease_moves: Dict[str, Tuple[str, int]] = {}
+                        for s, a, old, new in changed:
+                            # A first bind is not a rebind; a move is. If the account has several
+                            # services, any pre-existing binding makes this a rebind.
+                            lease_moves[a] = (new, 1 if old is not None else 0)
+                        # The mirror is account-keyed while constraints are (service, account)-keyed;
+                        # prebuild the per-account lookup once (first service wins in insertion
+                        # order) instead of scanning the map for every lease row.
+                        first_c_by_acc: Dict[str, Tuple[int, str, int, str, str, str]] = {}
+                        if constraints_by_account:
+                            for (s, a) in constraints_by_account.keys():
+                                if a not in first_c_by_acc:
+                                    first_c_by_acc[a] = _c((s, a))
+                        conn.executemany("""
+                            INSERT INTO leases (account_id, node_name, assigned_at, rebind_count, last_rebind_reason,
+                                                bound_region, bound_region_strict, bound_egress_type, bound_tier, bound_tier_policy)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(account_id) DO UPDATE SET
+                                node_name = excluded.node_name,
+                                assigned_at = excluded.assigned_at,
+                                rebind_count = leases.rebind_count + CASE WHEN leases.node_name != excluded.node_name THEN 1 ELSE 0 END,
+                                last_rebind_reason = CASE WHEN leases.node_name != excluded.node_name THEN excluded.last_rebind_reason ELSE leases.last_rebind_reason END,
+                                bound_region = CASE WHEN ?=1 THEN ? ELSE leases.bound_region END,
+                                bound_region_strict = CASE WHEN ?=1 THEN ? ELSE leases.bound_region_strict END,
+                                bound_egress_type = CASE WHEN ?=1 THEN ? ELSE leases.bound_egress_type END,
+                                bound_tier = CASE WHEN ?=1 THEN ? ELSE leases.bound_tier END,
+                                bound_tier_policy = CASE WHEN ?=1 THEN ? ELSE leases.bound_tier_policy END
+                        """, [
+                            (acc, node, now_str, initial, reason,
+                             _lc[1], _lc[2], _lc[3], _lc[4], _lc[5],
+                             _lc[0], _lc[1],
+                             _lc[0], _lc[2],
+                             _lc[0], _lc[3],
+                             _lc[0], _lc[4],
+                             _lc[0], _lc[5],
+                             )
+                            for acc, (node, initial) in lease_moves.items()
+                            for _lc in (first_c_by_acc.get(acc, (0, "", 0, "", "", "")),)
+                        ])
 
     def find_allocation_by_account(self, account_id: str, service: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
@@ -1454,26 +1508,47 @@ class Storage:
             ).fetchall()
             return [dict(r) for r in rows]
 
-    def prune_probe_history(self, keep_days: int = 7) -> int:
-        """Deletes probe_history rows older than keep_days to bound table growth."""
-        cutoff = (datetime.now() - timedelta(days=keep_days)).isoformat()
+    # 单块删除上限: 每块独立事务, 避免百万行级 retention 清扫长时间持写锁 /
+    # WAL 暴涨阻塞探活写入 (2026-11-15 storage review #7)。表名/列名均为内部
+    # 常量, 不走用户输入, 无注入面。
+    _PRUNE_CHUNK_SIZE = 5000
+
+    def _chunked_prune(self, table: str, where_col: str, cutoff: str) -> int:
+        """按 rowid 分块删除 `<where_col> < cutoff` 的旧行, 每块一个
+        BEGIN IMMEDIATE 事务, 返回删除总行数。"""
+        total = 0
         with self._get_conn() as conn:
-            cur = conn.execute("DELETE FROM probe_history WHERE probed_at < ?", (cutoff,))
-            return cur.rowcount
+            while True:
+                with self._immediate_txn(conn):
+                    cur = conn.execute(
+                        f"DELETE FROM {table} WHERE rowid IN "
+                        f"(SELECT rowid FROM {table} WHERE {where_col} < ? "
+                        f"LIMIT {self._PRUNE_CHUNK_SIZE})",
+                        (cutoff,),
+                    )
+                    n = cur.rowcount
+                total += n
+                if n < self._PRUNE_CHUNK_SIZE:
+                    return total
+
+    def prune_probe_history(self, keep_days: int = 7) -> int:
+        """Deletes probe_history rows older than keep_days to bound table growth.
+
+        分块删除: probe_history 是最大的 event 表 (每节点每轮一条), 一次性
+        DELETE 可能达百万行级, 单事务会造成 WAL 尖峰 + 探活写入阻塞。
+        """
+        cutoff = (datetime.now() - timedelta(days=keep_days)).isoformat()
+        return self._chunked_prune("probe_history", "probed_at", cutoff)
 
     def prune_circuit_events(self, keep_days: int = 7) -> int:
         """Deletes circuit_events rows older than keep_days (append-only table)."""
         cutoff = (datetime.now() - timedelta(days=keep_days)).isoformat()
-        with self._get_conn() as conn:
-            cur = conn.execute("DELETE FROM circuit_events WHERE created_at < ?", (cutoff,))
-            return cur.rowcount
+        return self._chunked_prune("circuit_events", "created_at", cutoff)
 
     def prune_battery_events(self, keep_days: int = 7) -> int:
         """Deletes battery_events rows older than keep_days (append-only table)."""
         cutoff = (datetime.now() - timedelta(days=keep_days)).isoformat()
-        with self._get_conn() as conn:
-            cur = conn.execute("DELETE FROM battery_events WHERE created_at < ?", (cutoff,))
-            return cur.rowcount
+        return self._chunked_prune("battery_events", "created_at", cutoff)
 
     def prune_binding_changes(self, keep_days: int = 7) -> int:
         """
@@ -1483,9 +1558,7 @@ class Storage:
         full cold-start export instead of trusting an empty delta.
         """
         cutoff = (datetime.now() - timedelta(days=keep_days)).isoformat()
-        with self._get_conn() as conn:
-            cur = conn.execute("DELETE FROM binding_changes WHERE created_at < ?", (cutoff,))
-            return cur.rowcount
+        return self._chunked_prune("binding_changes", "created_at", cutoff)
 
     def prune_expired_cooldowns(self) -> int:
         """ip_cooldowns 保留窗 (#8, 二轮 review): 过期行原先只在注册分配路径
@@ -1642,43 +1715,47 @@ class Storage:
         """
         now_str = datetime.now().isoformat()
         with self._get_conn() as conn:
-            prev = conn.execute(
-                "SELECT node_name FROM account_allocations WHERE service = ? AND account_id = ?",
-                (service, account_id)
-            ).fetchone()
-            prev_node = prev["node_name"] if prev else None
-            if prev_node == new_node_name:
-                return {
-                    "moved": False, "already_on_target": True, "account_id": account_id,
-                    "service": service, "from_node": prev_node, "to_node": new_node_name
-                }
+            # 读改写原子化 (2026-11-15 review storage#3): prev 读取与全部写入
+            # 同一 IMMEDIATE 快照 —— 并发 move 下两个事务都读到 prev=A 会把
+            # binding_changes 的 from_node 写错
+            with self._immediate_txn(conn):
+                prev = conn.execute(
+                    "SELECT node_name FROM account_allocations WHERE service = ? AND account_id = ?",
+                    (service, account_id)
+                ).fetchone()
+                prev_node = prev["node_name"] if prev else None
+                if prev_node == new_node_name:
+                    return {
+                        "moved": False, "already_on_target": True, "account_id": account_id,
+                        "service": service, "from_node": prev_node, "to_node": new_node_name
+                    }
 
-            conn.execute("""
-                INSERT INTO account_allocations (service, account_id, node_name, allocated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(service, account_id) DO UPDATE SET
-                    node_name = excluded.node_name,
-                    allocated_at = excluded.allocated_at,
-                    rebind_count = account_allocations.rebind_count + 1,
-                    last_rebind_reason = ?
-            """, (service, account_id, new_node_name, now_str, reason))
+                conn.execute("""
+                    INSERT INTO account_allocations (service, account_id, node_name, allocated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(service, account_id) DO UPDATE SET
+                        node_name = excluded.node_name,
+                        allocated_at = excluded.allocated_at,
+                        rebind_count = account_allocations.rebind_count + 1,
+                        last_rebind_reason = ?
+                """, (service, account_id, new_node_name, now_str, reason))
 
-            # Legacy lease mirror (account-keyed); keep its own rebind counter in sync.
-            conn.execute("""
-                INSERT INTO leases (account_id, node_name, assigned_at, rebind_count, last_rebind_reason)
-                VALUES (?, ?, ?, 1, ?)
-                ON CONFLICT(account_id) DO UPDATE SET
-                    node_name = excluded.node_name,
-                    assigned_at = excluded.assigned_at,
-                    rebind_count = leases.rebind_count + CASE WHEN leases.node_name != excluded.node_name THEN 1 ELSE 0 END,
-                    last_rebind_reason = CASE WHEN leases.node_name != excluded.node_name THEN excluded.last_rebind_reason ELSE leases.last_rebind_reason END
-            """, (account_id, new_node_name, now_str, reason))
+                # Legacy lease mirror (account-keyed); keep its own rebind counter in sync.
+                conn.execute("""
+                    INSERT INTO leases (account_id, node_name, assigned_at, rebind_count, last_rebind_reason)
+                    VALUES (?, ?, ?, 1, ?)
+                    ON CONFLICT(account_id) DO UPDATE SET
+                        node_name = excluded.node_name,
+                        assigned_at = excluded.assigned_at,
+                        rebind_count = leases.rebind_count + CASE WHEN leases.node_name != excluded.node_name THEN 1 ELSE 0 END,
+                        last_rebind_reason = CASE WHEN leases.node_name != excluded.node_name THEN excluded.last_rebind_reason ELSE leases.last_rebind_reason END
+                """, (account_id, new_node_name, now_str, reason))
 
-            epoch = self._advance_binding_epochs(conn, {service}, now_str)[service]
-            conn.execute("""
-                INSERT INTO binding_changes (service, epoch, account_id, from_node, to_node, reason, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (service, epoch, account_id, prev_node, new_node_name, reason, now_str))
+                epoch = self._advance_binding_epochs(conn, {service}, now_str)[service]
+                conn.execute("""
+                    INSERT INTO binding_changes (service, epoch, account_id, from_node, to_node, reason, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (service, epoch, account_id, prev_node, new_node_name, reason, now_str))
 
         return {
             "moved": True,

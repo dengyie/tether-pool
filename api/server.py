@@ -441,13 +441,21 @@ async def bearer_auth_middleware(request: Request, call_next):
                 # dashboard 走 ?token= 换 cookie 握手。
                 authorized = False
             elif svc is None:
-                # 仅 per-service 模式: 无 service 标识的端点 (dashboard /
-                # node_pipeline / metrics) 维持 Mesh 内网现状放行 (需求 §8)。
-                authorized = True
+                # 仅 per-service 模式: 读类端点 (GET/HEAD: dashboard / metrics /
+                # node_pipeline) 维持 Mesh 内网现状放行 (需求 §8)。
+                # 2026-11-15 review api#2: 破坏性端点 (POST/DELETE — delete /
+                # bulk-disable / config reload / circuit reset / disable) 若也
+                # fail-open, "tokenized 部署" 实际形同虚设 —— 任何无 service
+                # 请求都能删节点。写操作一律要求凭据 (全局令牌或对应 service 令牌)。
+                if request.method in ("GET", "HEAD", "OPTIONS"):
+                    authorized = True
+                else:
+                    authorized = False
             elif svc not in SERVICE_TOKENS:
-                # 未配专用令牌的 service 维持放行; 但持失败凭据的请求按无效
-                # 令牌拒绝 (fail closed, 防 A 服务令牌被误用于 B 服务)。
-                authorized = not token
+                # 未配专用令牌的 service: 读放行; 写 (绑定分配等状态变更) 持
+                # 失败凭据的请求按无效令牌拒绝 (fail closed, 防 A 服务令牌被
+                # 误用于 B 服务)。
+                authorized = not token or request.method in ("GET", "HEAD", "OPTIONS")
             else:
                 # 目标 service 配了专用令牌: 必须持匹配令牌。
                 authorized = False
@@ -1047,7 +1055,9 @@ def trigger_node_rehome(node_name: str = Query(..., description="Node name whose
 
 # --- Registration Anti-Sybil Endpoints ---
 
-@app.get("/v1/acquire_for_registration", response_model=RegistrationLease)
+# --- Registration Anti-Sybil Endpoints ---
+
+@app.post("/v1/acquire_for_registration", response_model=RegistrationLease)
 def acquire_for_registration(
     account_id: str = Query(..., description="Unique registration account ID / email"),
     target_service: str = Query(..., description="Target service identifier (e.g., grok_reg, openai_signup)"),
@@ -1059,6 +1069,10 @@ def acquire_for_registration(
     """
     Dedicated anti-sybil egress lease assignment for batch registration bots.
     Ensures exit IP has not been used for target_service within the cooldown period.
+
+    2026-11-15 review api#7: GET → POST —— 本端点消耗 IP cooldown 并持久化
+    lease, 是状态变更; GET 会带 cookie 的链接预取/预加载静默烧 cooldown
+    (与 GET /v1/acquire 的 safe-GET 不变式同一条)。
     """
     lease = router.acquire_for_registration(
         account_id=account_id,

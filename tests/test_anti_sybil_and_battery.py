@@ -129,7 +129,8 @@ def test_api_acquire_for_registration_endpoint():
     client = TestClient(api.server.app)
 
     # Call /v1/acquire_for_registration
-    resp = client.get(
+    # 2026-11-15 review api#7: 端点改为 POST (状态变更不得走 safe GET)
+    resp = client.post(
         "/v1/acquire_for_registration",
         params={
             "account_id": "test_bot_user@mango.com",

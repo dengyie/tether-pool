@@ -245,6 +245,31 @@ def test_prune_probe_history_bounds_growth(storage):
     assert remaining == 0
 
 
+def test_chunked_prune_crosses_chunk_boundary(storage):
+    """2026-11-15 review storage#7: 分块 DELETE —— 行数超过单块上限时必须
+    跨多个 BEGIN IMMEDIATE 事务累计删除, 总数正确且表被清空 (否则 retention
+    清扫一个事务删百万行, WAL 尖峰阻塞探活写入)。"""
+    storage.upsert_node(_node("chunk-node", exit_ip="198.51.100.4"))
+    from core.models import ProbeResult as PR
+    for _ in range(25):
+        storage.update_probe_result(PR(
+            node_name="chunk-node", success=True, exit_ip="198.51.100.4", latency_ms=10
+        ))
+
+    # 把单块上限临时压到 7 -> 25 行需要 4 块 (7/7/7/4), 验证跨块累计
+    real_size = Storage._PRUNE_CHUNK_SIZE
+    Storage._PRUNE_CHUNK_SIZE = 7
+    try:
+        pruned = storage.prune_probe_history(keep_days=0)
+    finally:
+        Storage._PRUNE_CHUNK_SIZE = real_size
+    assert pruned == 25
+
+    with storage._get_conn() as conn:
+        remaining = conn.execute("SELECT COUNT(*) FROM probe_history").fetchone()[0]
+    assert remaining == 0
+
+
 def test_prune_nodes_except_removes_stale_nodes_and_bindings(storage):
     storage.upsert_node(_node("keep-me", exit_ip="198.51.100.2"))
     storage.upsert_node(_node("drop-me", exit_ip="198.51.100.3"))

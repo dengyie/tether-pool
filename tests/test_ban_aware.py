@@ -802,11 +802,13 @@ def test_avoid_cidr_invalid_rejected_422(storage):
 
 
 def test_cooldown_param_validated(storage):
-    """F4: cooldown 超界 -> 422 (上限 86400)。"""
+    """F4: cooldown 超界 -> 422 (上限 86400)。
+    2026-11-15 safe-GET 不变式: acquire_for_registration 是状态变更端点,
+    已从 GET 改为 POST。"""
     from starlette.testclient import TestClient
     import api.server as api
     with TestClient(api.app) as client:
-        res = client.get(
+        res = client.post(
             "/v1/acquire_for_registration",
             params={"account_id": "acc-r", "target_service": "svc", "cooldown": 999999},
         )
