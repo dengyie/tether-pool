@@ -345,9 +345,12 @@ class Storage:
             conn.execute("""
                 UPDATE nodes SET
                     status = ?,
-                    circuit_state = ?
+                    circuit_state = ?,
+                    -- 2026-11-15 review #5: 离开 dead 必须清锚点, 否则旧
+                    -- dead_since 会被下次 DEAD 落锤沿用 (janitor 秒冻结)
+                    dead_since = CASE WHEN ? != 'dead' THEN NULL ELSE dead_since END
                 WHERE name = ?
-            """, (status, status, node_name))
+            """, (status, status, status, node_name))
 
     def update_probe_result(self, res: ProbeResult) -> Tuple[ProbeResult, Optional[CircuitEvent]]:
         """
@@ -754,15 +757,28 @@ class Storage:
                 (node_name, reason, datetime.now().isoformat()))
 
     def get_tombstones(self) -> set:
+        # 2026-11-15 review: fail-OPEN 会把驱逐节点当复活候选 —— 只容忍缺表
+        # (未写入过任何 tombstone 的正常态), 其他错误 (locked/disk) 必须炸响。
         try:
             with self._get_conn() as conn:
                 return {r[0] for r in conn.execute("SELECT node_name FROM node_tombstones").fetchall()}
-        except Exception:
-            return set()
+        except sqlite3.OperationalError as e:
+            if "no such table" in str(e):
+                return set()
+            raise
 
     def revive_tombstoned(self, node_name: str) -> bool:
         """人工复活: 清 tombstone (管理员判断节点真的回来了)。"""
         with self._get_conn() as conn:
+            # 表是 record_tombstone 惰性建的: 从未写过 tombstone 的库直接 DELETE
+            # 会 no such table (2026-11-15 review #4)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS node_tombstones (
+                    node_name TEXT PRIMARY KEY,
+                    reason TEXT,
+                    created_at TEXT
+                )
+            """)
             cur = conn.execute("DELETE FROM node_tombstones WHERE node_name = ?", (node_name,))
             return cur.rowcount > 0
 
@@ -1512,10 +1528,14 @@ class Storage:
             if not stale:
                 return []
             placeholders = ",".join("?" * len(stale))
+            # 2026-11-15 review #2: 非探活路径落 DEAD 也必须写 dead_since 锚点,
+            # 否则续期分支永远保留 NULL —— 这批节点永远进不了冻结/驱逐倒计时
             conn.execute(
-                f"UPDATE nodes SET status = ?, circuit_state = ? "
+                f"UPDATE nodes SET status = ?, circuit_state = ?, "
+                f"dead_since = COALESCE(dead_since, ?) "
                 f"WHERE name IN ({placeholders})",
-                [HealthStatus.DEAD.value, HealthStatus.DEAD.value, *stale]
+                [HealthStatus.DEAD.value, HealthStatus.DEAD.value,
+                 datetime.now().isoformat(), *stale]
             )
             return stale
 
@@ -1719,10 +1739,13 @@ class Storage:
 
             names = [n.name for n in affected]
             placeholders = ",".join("?" * len(names))
+            # 2026-11-15 review #2: 域级隔离落 DEAD 同样要写 dead_since 锚点
             conn.execute(
                 f"UPDATE nodes SET status = ?, circuit_state = ?, consecutive_failures = MAX(consecutive_failures, 2), "
-                f"consecutive_successes = 0, next_probe_allowed_at = ?, last_probed_at = ? WHERE name IN ({placeholders})",
-                [HealthStatus.DEAD.value, HealthStatus.DEAD.value, next_allowed, now_str, *names]
+                f"consecutive_successes = 0, next_probe_allowed_at = ?, last_probed_at = ?, "
+                f"dead_since = COALESCE(dead_since, ?) WHERE name IN ({placeholders})",
+                [HealthStatus.DEAD.value, HealthStatus.DEAD.value, next_allowed, now_str,
+                 now_str, *names]
             )
             cur = conn.execute("""
                 INSERT INTO circuit_events (node_name, from_state, to_state, reason, created_at)

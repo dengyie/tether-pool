@@ -11,6 +11,7 @@ import os
 import sys
 import socket
 import struct
+import time
 import urllib.parse
 import uuid
 from typing import Optional, Tuple, Dict, Any
@@ -648,21 +649,30 @@ class ForwardProxyGateway:
             "target_steers": dict(self.target_steers),
         }
 
+    @staticmethod
+    def _escape_label(value: str) -> str:
+        """Prometheus exposition-format label escaping (review #5): account_id
+        来自客户端头, 未转义的 \" 与 \\n 可注入任意 metric 行毒化抓取。"""
+        return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
     def render_metrics(self) -> bytes:
         lines = [
             "# HELP tetherpool_gateway_relay_total Relay connections established per account.",
             "# TYPE tetherpool_gateway_relay_total counter",
         ]
         for acct, count in sorted(self.relay_total.items()):
-            lines.append('tetherpool_gateway_relay_total{account="%s"} %d' % (acct, count))
+            lines.append('tetherpool_gateway_relay_total{account="%s"} %d'
+                         % (self._escape_label(acct), count))
         lines.append("# HELP tetherpool_gateway_relay_by_node_total Relay connections established per exit node.")
         lines.append("# TYPE tetherpool_gateway_relay_by_node_total counter")
         for node, count in sorted(self.relay_nodes.items()):
-            lines.append('tetherpool_gateway_relay_by_node_total{node="%s"} %d' % (node, count))
+            lines.append('tetherpool_gateway_relay_by_node_total{node="%s"} %d'
+                         % (self._escape_label(node), count))
         lines.append("# HELP tetherpool_gateway_target_steers_total Requests steered away from target-class-bad exits (cumulative).")
         lines.append("# TYPE tetherpool_gateway_target_steers_total counter")
         for cls, count in sorted(self.target_steers.items()):
-            lines.append('tetherpool_gateway_target_steers_total{class="%s"} %d' % (cls, count))
+            lines.append('tetherpool_gateway_target_steers_total{class="%s"} %d'
+                         % (self._escape_label(cls), count))
         return ("\n".join(lines) + "\n").encode()
 
     def _extract_routing_headers(self, headers_dict: Dict[str, str], client_ip: str) -> RoutingContext:
@@ -872,7 +882,8 @@ class ForwardProxyGateway:
             if attempt > 0 and self.retry_backoff > 0:
                 await asyncio.sleep(self.retry_backoff)
 
-            lease = self.router.acquire_for_account(
+            lease = await asyncio.to_thread(
+                self.router.acquire_for_account,
                 account_id=account_id,
                 region=region,
                 egress_type=egress_type,
@@ -889,7 +900,8 @@ class ForwardProxyGateway:
                 # 降级: 目标类坏节点占满候选 (如整个 us-west 池对该类失联) ->
                 # 无引导重试。宁可走坏出口, 绝不 503 —— 坏出口上目标类之外的
                 # 流量仍可用, 且探活恢复后自动回到绑定节点。
-                lease = self.router.acquire_for_account(
+                lease = await asyncio.to_thread(
+                    self.router.acquire_for_account,
                     account_id=account_id,
                     region=region,
                     egress_type=egress_type,
@@ -911,9 +923,9 @@ class ForwardProxyGateway:
                     "No available proxy nodes in IP pool"
                 )
 
-            node = lease if lease.host is not None else self.storage.get_node(lease.node_name)
-            # lease 携带拨号四元组时直接鸭子类型当节点用 (数据流优化: 少一次
-            # get_node); legacy 镜像 lease 无字段, 回退查库, 行为不变。
+            # legacy 镜像 lease 无拨号字段时回退查库 (阻塞 sqlite, 同样移出事件环)
+            node = lease if lease.host is not None else \
+                await asyncio.to_thread(self.storage.get_node, lease.node_name)
             if not node:
                 excluded.add(lease.node_name)
                 continue
@@ -945,13 +957,20 @@ class ForwardProxyGateway:
 
                 # 阻塞 sqlite 写移出事件环 (二轮 review #2): 失败路径在 3000 并发下
                 # 每次写库都是一次全事件环停顿; rehome 内部含写锁与多表事务, 同理。
-                _, event = await asyncio.to_thread(
-                    self.storage.update_probe_result, ProbeResult(
-                        node_name=node.name,
-                        success=False,
-                        error=f"gateway_connect_failed: {exc}"[:120],
+                # 三轮 review #2: 此写裸露时一次 sqlite 抖动会从 except 块直接炸出
+                # retry 循环 -> 请求 502 而不是换下一节点。失败路径的观测写必须
+                # 与业务重试解耦: 写失败只丢观测, 不杀 failover。
+                try:
+                    _, event = await asyncio.to_thread(
+                        self.storage.update_probe_result, ProbeResult(
+                            node_name=node.name,
+                            success=False,
+                            error=f"gateway_connect_failed: {exc}"[:120],
+                        )
                     )
-                )
+                except Exception as probe_err:
+                    print(f"[-] Probe-result write failed for {node.name} (failover continues): {probe_err}")
+                    event = None
 
                 # R3: a connection-layer failure is a host-level signal, not a port-level
                 # one. The isolator decides whether this collapses the whole domain, but
@@ -960,7 +979,10 @@ class ForwardProxyGateway:
                 domain_result: Dict[str, object] = {"action": "no_isolator"}
                 if self.isolator is not None:
                     try:
-                        domain_result = self.isolator.report_unreachable(
+                        # report_unreachable 内部含 isolator 锁 + 多表事务 (可能触发
+                        # 全域 mark_dead + rehome), 同为阻塞调用, 移出事件环。
+                        domain_result = await asyncio.to_thread(
+                            self.isolator.report_unreachable,
                             node.name,
                             reason="gateway_connect_failed",
                             confirmed_dead=bool(
@@ -986,7 +1008,8 @@ class ForwardProxyGateway:
 
         self._record_attempts(max(attempts, 1))
         try:
-            self.storage.incr_metric(
+            await asyncio.to_thread(
+                self.storage.incr_metric,
                 "ip_pool_retry_exhausted_total",
                 {"service": service or "default", "reason": "connect_failed"}
             )
@@ -1231,12 +1254,27 @@ class ForwardProxyGateway:
                     return
 
                 try:
-                    # Reconstruct clean HTTP request without internal headers
+                    # Reconstruct clean HTTP request without internal headers.
+                    # 2026-11-15 review #8: 除逐名过滤外, 还必须剥 Connection 头
+                    # 点名的 hop-by-hop 头 + 无条件剥 transfer-encoding/te/upgrade/
+                    # keep-alive/trailer —— 网关把 body 当不透明字节流泵, 转发
+                    # 分帧头会产生冲突框架 (request-smuggling 面)。
+                    connection_named: set = set()
+                    for line in lines[1:]:
+                        if ":" in line:
+                            k, v = line.split(":", 1)
+                            if k.strip().lower() == "connection":
+                                connection_named.update(
+                                    t.strip().lower() for t in v.split(",") if t.strip())
+                    HOP_BY_DROP = {"transfer-encoding", "te", "upgrade",
+                                   "keep-alive", "trailer", "proxy-connection"}
                     new_req_lines = [f"{method} {path_and_query} {version}"]
                     for line in lines[1:]:
                         if ":" in line:
                             k, _ = line.split(":", 1)
-                            if not _is_internal_header(k):
+                            kl = k.strip().lower()
+                            if not _is_internal_header(k) and kl not in connection_named \
+                                    and kl not in HOP_BY_DROP:
                                 new_req_lines.append(line)
                     new_req_lines.append("Connection: close")
                     new_req_payload = "\r\n".join(new_req_lines) + "\r\n\r\n"
@@ -1367,19 +1405,36 @@ class ForwardProxyGateway:
     async def start(self):
         self.server = await asyncio.start_server(self.handle_client, self.host, self.port)
         logger.info("Unified Forward Proxy Gateway listening on %s:%s", self.host, self.port)
+
+        def _task_done_callback(name: str):
+            def _cb(task: asyncio.Task):
+                # 后台循环死亡必须炸响而不是静默 (2026-11-15 review: target probe
+                # loop 因缺 import time 首轮 NameError 静默全灭, steer 子系统
+                # 上线即失效无人知晓)。CancelledError 是正常停机, 不算事。
+                if task.cancelled():
+                    return
+                exc = task.exception()
+                if exc:
+                    logger.critical("Background loop %s DIED: %r — feature is now inert!", name, exc)
+            return _cb
+
         if self.peer_monitor is not None and EASYTIER_MONITOR_ENABLED:
             self._peer_task = asyncio.create_task(self._peer_monitor_loop())
+            self._peer_task.add_done_callback(_task_done_callback("peer_monitor"))
             logger.info("EasyTier peer monitor started (whole-host fast detection)")
         if self.relay_report_interval > 0:
             self._relay_task = asyncio.create_task(self._relay_report_loop())
+            self._relay_task.add_done_callback(_task_done_callback("relay_report"))
             logger.info("Relay summary every %ss (per-connection detail at DEBUG)",
                         int(self.relay_report_interval))
         if self.target_probe_interval > 0:
             self._target_probe_task = asyncio.create_task(self._target_probe_loop())
+            self._target_probe_task.add_done_callback(_task_done_callback("target_probe"))
             logger.info("Target-health probing every %ss (classes=%s, concurrency=%d)",
                         int(self.target_probe_interval),
                         ",".join(TARGET_CLASS_CANARIES), self.target_probe_concurrency)
         self._metrics_task = asyncio.create_task(self._metrics_flush_loop())
+        self._metrics_task.add_done_callback(_task_done_callback("metrics_flush"))
         logger.info("Gateway metrics flush every %ss (in-memory accumulation)",
                     int(self._metrics_flush_interval))
 

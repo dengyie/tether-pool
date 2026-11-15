@@ -151,7 +151,9 @@ class Prober:
     async def probe_all(self, concurrency: int = 25, force: bool = False,
                         nodes: Optional[List[ProxyNode]] = None) -> List[ProbeResult]:
         if nodes is None:
-            nodes = self.storage.list_nodes()
+            # 全表读 (3600 行) 移出事件环 (2026-11-15 review #5: sqlite 连接的
+            # lock 等待可达 10s, 不能阻塞调用方事件环)
+            nodes = await asyncio.to_thread(self.storage.list_nodes)
             if not force:
                 # admin-disabled 节点不进探活 (force 除外): 管理员意图优先,
                 # 探活不碰 DISABLED, 不涨 fail_count, 不产生 circuit_event。

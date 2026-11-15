@@ -142,22 +142,34 @@ class CircuitBreaker:
         update_probe_result transaction, conn = same sqlite connection).
         Returns (allowed, reason). Renewals of already-DEAD nodes are checked
         by the caller (this only guards the DEGRADED/HALF_OPEN -> DEAD edge).
-        Env `IP_POOL_MASS_GUARD=0` disables the guard entirely (kill-switch)."""
+        Env `IP_POOL_MASS_GUARD=0` disables the guard entirely (kill-switch).
+
+        2026-11-15 review #7/#8:
+        - domain key 用 effective_fault_domain (空 fault_domain 回退 host),
+          与 FailureDomainIsolator 同一规则 —— 否则 host 派生域的节点完全
+          不受 50% domain cap 保护。
+        - 分母只数【活跃】节点: DISABLED (永不恢复) 与 frozen (探活已降级,
+          事实上出局) 都不算 —— Envoy outlier denominator 是 active hosts。
+          不排除的话墓碑堆积会把 guard 锁死在永久 panic (合法熔断全被拒)。"""
         if os.environ.get("IP_POOL_MASS_GUARD", "1") in ("0", "false", "no"):
             return True, "mass_guard_disabled_by_env"
-        row = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM nodes WHERE status != 'disabled' "
+            "AND tags NOT LIKE '%\"frozen\"%'",).fetchone()
         if (row[0] or 0) < cls.MIN_POOL_FOR_GUARD:
             return True, "pool_too_small_for_guard"
-        domain = node.fault_domain or ""
+        domain = node.effective_fault_domain
         if domain:
             row = conn.execute(
                 "SELECT COUNT(*), SUM(CASE WHEN status='dead' THEN 1 ELSE 0 END) "
-                "FROM nodes WHERE fault_domain = ?", (domain,)).fetchone()
+                "FROM nodes WHERE fault_domain = ? AND status != 'disabled' "
+                "AND tags NOT LIKE '%\"frozen\"%'", (domain,)).fetchone()
             total, dead = (row[0] or 0), (row[1] or 0)
             if total > 0 and (dead + 1) / total > cls.DOMAIN_DEAD_RATIO_CAP:
                 return False, f"ejection_capped_domain_over_{int(cls.DOMAIN_DEAD_RATIO_CAP * 100)}pct"
         row = conn.execute(
-            "SELECT COUNT(*), SUM(CASE WHEN status='dead' THEN 1 ELSE 0 END) FROM nodes").fetchone()
+            "SELECT COUNT(*), SUM(CASE WHEN status='dead' THEN 1 ELSE 0 END) "
+            "FROM nodes WHERE status != 'disabled' AND tags NOT LIKE '%\"frozen\"%'").fetchone()
         total, dead = (row[0] or 0), (row[1] or 0)
         if total > 0 and (dead + 1) / total > cls.GLOBAL_DEAD_RATIO_CAP:
             return False, f"panic_mode_global_dead_over_{int(cls.GLOBAL_DEAD_RATIO_CAP * 100)}pct"

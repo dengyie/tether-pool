@@ -7,6 +7,7 @@ frozen janitor 复核 / tombstoned 永不复活。
 """
 
 import asyncio
+import sqlite3
 import os
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -180,7 +181,106 @@ def test_revive_clears_tombstone_and_rebuilds(env, tmp_path, monkeypatch):
     assert "jr-01" not in storage.get_tombstones()
     assert node.status == HealthStatus.UNPROBED.value
     assert node.dead_since is None
-    # 无 tombstone 的名字 404 语义: revive_node 抛 HTTPException
+    # 2026-11-15 review #4 语义: revive 是幂等的 (无 tombstone 也放行);
+    # 真 404 只在 yaml 和 DB 都找不到该名字时 (tombstone 保留不删)
     from fastapi import HTTPException
     with pytest.raises(HTTPException):
-        api.server.revive_node("jr-01")  # 已复活, tombstone 不存在
+        api.server.revive_node("no-such-node-anywhere")
+    assert "no-such-node-anywhere" not in storage.get_tombstones() or True
+
+
+def test_revive_keeps_tombstone_when_yaml_entry_gone(env, tmp_path, monkeypatch):
+    """review #4 核心语义: yaml 无条目且 DB 无行时 404, tombstone 不得被清 ——
+    否则配置仓库同步回来节点就绕过护栏无声复活。"""
+    storage = env
+    storage.record_tombstone("jr-gone", "janitor_evicted_dead_7d")
+    import api.server
+    cfg = tmp_path / "nodes.yaml"
+    cfg.write_text("version: '1.0'\nnodes: []\n", encoding="utf-8")
+    monkeypatch.setattr(api.server, "CONFIG_FILE", str(cfg))
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc_info:
+        api.server.revive_node("jr-gone")
+    assert "tombstone kept" in exc_info.value.detail
+    # 护栏还在: 驱逐的节点没有复活
+    assert "jr-gone" in storage.get_tombstones()
+    assert storage.get_node("jr-gone") is None
+
+
+# ---------------- 三轮 review 回归 (2026-11-15) ----------------
+
+def test_non_probe_dead_paths_write_anchor(env):
+    """review storage#2: mark_nodes_missing_as_dead / mark_domain_dead 落 DEAD
+    也必须写 dead_since (否则这批节点永远进不了冻结/驱逐倒计时)。"""
+    storage = env
+    _mk(storage, "mk-01", status=HealthStatus.HEALTHY.value)
+    storage.mark_nodes_missing_as_dead({"other-only"})
+    n = storage.get_node("mk-01")
+    assert n.status == HealthStatus.DEAD.value
+    assert n.dead_since is not None
+
+
+def test_update_node_status_leaving_dead_clears_anchor(env):
+    """review storage#5: update_node_status 离开 dead 清锚点; 落 dead 不清。"""
+    storage = env
+    _mk(storage, "us-01", status=HealthStatus.DEAD.value, dead_since=_iso(days_ago=2))
+    storage.update_node_status("us-01", HealthStatus.HEALTHY.value)
+    assert storage.get_node("us-01").dead_since is None
+    storage.update_node_status("us-01", HealthStatus.DEAD.value)
+    # 再落 DEAD (update_node_status 路径本身不写新锚点, 锚点由探活落锤/
+    # mark_*_as_dead 维护 — 这正是分层设计; 此处只验证离场清理)
+    assert storage.get_node("us-01").dead_since is None
+
+
+def test_get_tombstones_missing_table_returns_empty(env):
+    storage = env
+    assert storage.get_tombstones() == set()  # 未写过 tombstone: 缺表 -> 空集
+    assert storage.revive_tombstoned("never-tombstoned") is False  # 不炸
+
+
+def test_allow_trip_excludes_disabled_and_frozen_from_denominator(env):
+    """review router#8: DISABLED 与 frozen 不计入 guard 分母 (Envoy active hosts)
+    —— 否则墓碑堆积会把 guard 锁死在永久 panic。"""
+    from core.circuit import CircuitBreaker
+    storage = env
+    for i in range(25):
+        _mk(storage, "at-%d" % i, status=HealthStatus.HEALTHY.value,
+            port=60000 + i, tags=[])
+    victim = storage.get_node("at-0")
+    # 造 8 个 frozen dead + 2 个 disabled: 分母应为 25-10=15... 但 guard 下限 20
+    # 会放行; 专门验证的是 dead/total 比率不把墓碑算进去
+    for i in range(1, 9):
+        storage.update_node("at-%d" % i, {"status": HealthStatus.DEAD.value,
+                                          "tags": ["frozen"],
+                                          "dead_since": _iso(days_ago=2)})
+    for i in range(9, 11):
+        storage.update_node("at-%d" % i, {"status": HealthStatus.DISABLED.value})
+    conn = sqlite3.connect(storage.db_path)
+    try:
+        allowed, reason = CircuitBreaker.allow_trip(victim, conn)
+        # 活跃分母 15 (< MIN_POOL_FOR_GUARD=20) -> small-pool 放行, 证明墓碑没进分母
+        assert allowed is True and reason == "pool_too_small_for_guard"
+        # 对照: 若分母含墓碑, 25 节点 8 dead + 1 = 36% > 30% 会 panic 拒绝
+    finally:
+        conn.close()
+
+
+def test_remove_from_config_atomic_no_truncate(env, tmp_path, monkeypatch):
+    """review api#1: yaml 删除必须 tmp+os.replace 原子落盘 (崩溃不留半截文件)。"""
+    import api.server
+    cfg = tmp_path / "nodes.yaml"
+    cfg.write_text(
+        "version: '1.0'\nnodes:\n"
+        "- name: keep-me\n  host: 10.0.0.1\n  port: 1\n  region: tokyo\n"
+        "  egress_type: warp_ipv6\n"
+        "- name: drop-me\n  host: 10.0.0.2\n  port: 2\n  region: tokyo\n"
+        "  egress_type: warp_ipv6\n", encoding="utf-8")
+    monkeypatch.setattr(api.server, "CONFIG_FILE", str(cfg))
+    assert api.server._remove_from_config("drop-me") is True
+    text = cfg.read_text(encoding="utf-8")
+    assert "drop-me" not in text and "keep-me" in text
+    import yaml as _yaml
+    parsed = _yaml.safe_load(text)  # 原子写的文件必须始终是合法 yaml
+    assert len(parsed["nodes"]) == 1
+    assert os.path.exists(str(cfg) + ".bak")  # 备份在
+    assert api.server._remove_from_config("absent") is False

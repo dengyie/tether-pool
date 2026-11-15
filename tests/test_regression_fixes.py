@@ -27,10 +27,11 @@ from core.circuit import CircuitBreaker, MAX_COOLDOWN_SECONDS, JITTER_MAX_SECOND
 from gateway.server import _is_internal_header
 
 
-def _node(name: str, exit_ip: str = "", region: str = "tokyo", port: int = 10881) -> ProxyNode:
+def _node(name: str, exit_ip: str = "", region: str = "tokyo", port: int = 10881,
+          host_override: str = "") -> ProxyNode:
     return ProxyNode(
         name=name,
-        host="10.144.144.3",
+        host=host_override or "10.144.144.3",
         port=port,
         region=region,
         egress_type=EgressType.WARP_IPV6.value,
@@ -176,7 +177,10 @@ def test_battery_event_only_rewrites_reporting_service(storage):
 def test_rehome_updates_universal_allocations(storage):
     """Re-homing used to only rewrite legacy leases, leaving allocations on the dead node."""
     for i in range(3):
-        storage.upsert_node(_node(f"rehome-{i}", exit_ip=f"2a09:bac5:4::{i}"))
+        # 2026-11-15 review #1: rehome 排除 fault-domain 兄弟 (同 host), 备份
+        # 节点给不同 host 以落在域外
+        storage.upsert_node(_node(f"rehome-{i}", exit_ip=f"2a09:bac5:4::{i}",
+                                  host_override=f"10.144.144.{100 + i}"))
 
     router = Router(storage)
     storage.batch_save_allocations([("svc", "alloc-only", "rehome-0", "2026-11-04T00:00:00")])

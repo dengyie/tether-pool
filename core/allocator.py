@@ -126,6 +126,10 @@ class AllocationEngine:
         # 3. Last fallback (must strictly exclude DEAD nodes)
         if not nodes and allow_cross_tier:
             nodes = [n for n in self.storage.list_nodes(region=region, egress_type=egress_preference) if n.status not in (HealthStatus.DEAD.value, HealthStatus.DISABLED.value)]
+            if not nodes and region:
+                # 2026-11-15 review #4: region-only 中间档 (对齐 Router 阶梯:
+                # region+egress -> region -> 全球), 旧逻辑直接跳全球池
+                nodes = [n for n in self.storage.list_nodes(region=region) if n.status not in (HealthStatus.DEAD.value, HealthStatus.DISABLED.value)]
             if not nodes:
                 nodes = [n for n in self.storage.list_nodes() if n.status not in (HealthStatus.DEAD.value, HealthStatus.DISABLED.value)]
 

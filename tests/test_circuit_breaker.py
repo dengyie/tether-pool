@@ -100,9 +100,11 @@ def test_lease_rehoming_on_node_trip(temp_env):
         egress_type=EgressType.WARP_IPV6.value,
         status=HealthStatus.HEALTHY.value
     )
+    # 2026-11-15 review #1: rehome 现在排除 fault-domain 兄弟 (同 host = 同一次
+    # 故障), 备份节点必须在另一台宿主上才能成为合法 rehome 目标。
     n_backup = ProxyNode(
         name="tokyo-node-backup",
-        host="10.144.144.3",
+        host="10.144.144.9",
         port=10882,
         region="tokyo",
         egress_type=EgressType.WARP_IPV6.value,

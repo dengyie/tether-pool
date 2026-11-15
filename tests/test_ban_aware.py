@@ -779,8 +779,12 @@ def test_probe_write_and_rehome_off_event_loop():
     assert "to_thread(\n                            self.router.rehome_leases_for_node" in src
     from gateway import server as gw_server
     src2 = inspect.getsource(gw_server.ForwardProxyGateway._open_upstream)
-    assert "to_thread(\n                    self.storage.update_probe_result" in src2
-    assert "to_thread(\n                    self.router.rehome_account_binding" in src2
+    # 2026-11-15 三轮 review #2: 探活写移进 try 块 (缩进变化) 且必须容错
+    assert "to_thread(" in src2
+    assert "self.storage.update_probe_result" in src2
+    assert "Probe-result write failed" in src2  # 容错: sqlite 抖动不杀 retry 循环
+    assert "to_thread(\n                    self.router.rehome_account_binding" in src2 or \
+           "to_thread(\n                        self.router.rehome_account_binding" in src2
     assert "to_thread(self.router.rehome_leases_for_node, node.name)" in src2
 
 

@@ -235,7 +235,10 @@ async def _scheduled_probe_sweep():
             results = await prober.probe_all(concurrency=PROBE_CONCURRENCY)
             healthy = sum(1 for r in results if r.success)
             print(f"[+] Scheduled probe finished: {healthy}/{len(results)} nodes healthy.")
-            pruned = storage.prune_event_tables(keep_days=PROBE_HISTORY_KEEP_DAYS)
+            # prune 是 7 天历史的大 DELETE (百万行级), 事务持有写锁可达秒级;
+            # 必须移出事件环 (三轮 review #5: 事件环上一次锁等待冻结全部端点 10s)
+            pruned = await asyncio.to_thread(storage.prune_event_tables,
+                                             keep_days=PROBE_HISTORY_KEEP_DAYS)
             pruned_total = {k: v for k, v in pruned.items() if v}
             if pruned_total:
                 detail = ", ".join(f"{k}={v}" for k, v in pruned_total.items())
@@ -256,7 +259,9 @@ async def background_probe_loop():
 async def _sick_probe_sweep():
     """One sick-sweep tick: fast re-probe of DEGRADED nodes only (extracted
     for test drivability, same pattern as _scheduled_probe_sweep)."""
-    sick = [n for n in storage.list_nodes(status=HealthStatus.DEGRADED.value)][:PROBE_SICK_CAP]
+    # list_nodes 是全表查询 (3600 行), 移出事件环 (review #5)
+    sick = (await asyncio.to_thread(storage.list_nodes,
+                                    status=HealthStatus.DEGRADED.value))[:PROBE_SICK_CAP]
     if not sick:
         return
     results = await prober.probe_all(concurrency=PROBE_SICK_CONCURRENCY, nodes=sick)
@@ -276,7 +281,12 @@ async def background_sick_probe_loop():
 def _remove_from_config(name: str) -> bool:
     """把被驱逐的节点条目从 nodes.yaml 中同步删除 (块级: 从该条目的 'name:' 行
     到下一个 '- name:' 行或文件尾), 使驱逐与配置仓库一致, 防 reload 复活。
-    删除前先写 .bak 备份。返回是否删了条目。"""
+    删除前先写 .bak 备份。返回是否删了条目。
+
+    三轮 review P0 修 (2026-11-15): 3426 条目的大文件绝不能 truncate-then-write
+    —— 进程崩溃/并发 reload 读到半截文件, 若条目数 > MIN_CONFIG_NODES_FOR_PRUNE
+    还会触发毁灭性 prune。tmp + os.replace 原子落盘。"""
+    import tempfile as _tempfile
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         lines = f.readlines()
     start = None
@@ -294,8 +304,16 @@ def _remove_from_config(name: str) -> bool:
     with open(CONFIG_FILE + ".bak", "w", encoding="utf-8") as f:
         f.writelines(lines)
     del lines[start:end]
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        f.writelines(lines)
+    fd, tmp_path = _tempfile.mkstemp(dir=os.path.dirname(CONFIG_FILE) or ".",
+                                     prefix=".nodes.yaml.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        os.replace(tmp_path, CONFIG_FILE)  # 原子: 读者要么看旧全量要么看新全量
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
     return True
 
 
@@ -655,22 +673,33 @@ def enable_node(name: str):
 @app.post("/v1/nodes/{name}/revive", response_model=ProxyNode)
 def revive_node(name: str):
     """人工复活被 janitor 驱逐的节点 (tombstone 护栏只在 load_initial_nodes 挡
-    yaml 重载; 管理员确认节点真的回来了, 显式清 tombstone + 重建条目)。"""
-    if not storage.revive_tombstoned(name):
-        raise HTTPException(status_code=404, detail=f"No tombstone for '{name}'")
-    if not storage.get_node(name):
-        # DB 条目已删: 从 yaml 重新入库 (此刻 tombstone 已清, load 路径放行)
-        import yaml as _yaml
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            cfg = _yaml.safe_load(f) or {}
-        for item in (cfg.get("nodes") or []):
-            if item.get("name") == name:
-                storage.upsert_node(ProxyNode(**{k: v for k, v in item.items()
-                                                 if k in ProxyNode.model_fields}))
-                break
+    yaml 重载; 管理员确认节点真的回来了, 显式清 tombstone + 重建条目)。
+
+    三轮 review P1 修 (2026-11-15): 必须【先验证 yaml/DB 条目可复活, 再清
+    tombstone】—— 反过来时, 若 yaml 里已无该条目 (驱逐路径本就删了它), 404
+    已经把 tombstone 清掉了, 之后配置仓库同步回来该节点就绕过护栏无声复活。
+    验证失败时 tombstone 原样保留。"""
+    # 1) 先取 yaml 条目 (只读, 不动任何状态)
+    import yaml as _yaml
+    yaml_item = None
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        cfg = _yaml.safe_load(f) or {}
+    for item in (cfg.get("nodes") or []):
+        if item.get("name") == name:
+            yaml_item = item
+            break
+    if not yaml_item and not storage.get_node(name):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Cannot revive '{name}': not in config file (tombstone kept)")
+    # 2) 验证通过才清 tombstone (无 tombstone 也放行, 幂等)
+    storage.revive_tombstoned(name)
+    if not storage.get_node(name) and yaml_item:
+        storage.upsert_node(ProxyNode(**{k: v for k, v in yaml_item.items()
+                                         if k in ProxyNode.model_fields}))
     node = storage.get_node(name)
     if not node:
-        raise HTTPException(status_code=404, detail=f"'{name}' not in config file either")
+        raise HTTPException(status_code=404, detail=f"'{name}' not found after revive attempt")
     storage.update_node(name, {"status": HealthStatus.UNPROBED.value,
                                "circuit_state": HealthStatus.UNPROBED.value,
                                "consecutive_failures": 0,

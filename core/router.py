@@ -359,6 +359,10 @@ class Router:
                     bound
                     and bound.status == HealthStatus.HEALTHY.value
                     and _node_matches_constraints(bound)
+                    # 2026-11-15 review #3: 降级不能绕过 ban 硬过滤 (同 /24 / 同
+                    # ISP 封禁与 steer 排除同级) —— fast path 同类洞已修
+                    # (§"只查名字会让健康粘性绑定绕过过滤"), 这里对齐, 违约宁可 None。
+                    and not _ban_rejects(bound)
                 ):
                     return LeaseInfo(
                         account_id=account_id,
@@ -530,6 +534,12 @@ class Router:
             c = [n for n in self.storage.list_nodes(region=region, egress_type=egress_type) if n.status not in (HealthStatus.DEAD.value, HealthStatus.DISABLED.value)]
             if c:
                 return c
+            # 2026-11-15 review #4: region-only 中间档 (region 承诺仍在, 只放
+            # egress) —— 旧逻辑非 strict 时直接从 region+egress 跳到全球池,
+            # 同区明明有其他 egress 的健康节点却拿到外国出口。
+            c_region_only = [n for n in self.storage.list_nodes(region=region) if n.status not in (HealthStatus.DEAD.value, HealthStatus.DISABLED.value)]
+            if c_region_only:
+                return c_region_only
             if allow_region_relax:
                 return [n for n in self.storage.list_nodes() if n.status not in (HealthStatus.DEAD.value, HealthStatus.DISABLED.value)]
             c_region = [n for n in self.storage.list_nodes(region=region) if n.status not in (HealthStatus.DEAD.value, HealthStatus.DISABLED.value)]
@@ -715,9 +725,19 @@ class Router:
         # resolve to exactly this ladder inside _find_rehome_candidates_for_account).
         # It stays inside the BINDING_WRITE_LOCK, so the hoist also shortens the
         # critical section proportionally to the account count.
+        # 2026-11-15 review #1: 与 rehome_account_binding 对齐, 必须排除
+        # fault-domain 兄弟 —— 同一台宿主的其他 listener 十有八九同死 (prober
+        # 先熔断单 listener 时其余还是 HEALTHY, 落上去就是 2026-11-07 那种
+        # 再熔断+再 rehome 风暴)。
+        broken_node = self.storage.get_node(broken_node_name)
+        domain_peers = set()
+        if broken_node:
+            for peer in self.storage.list_nodes_by_domain(broken_node.effective_fault_domain):
+                if peer.name != broken_node_name:
+                    domain_peers.add(peer.name)
         base_candidates = self._find_rehome_candidates(
             target_region, target_egress, target_tier,
-            exclude_names={broken_node_name}
+            exclude_names={broken_node_name} | domain_peers
         )
 
         new_node_by_unit: Dict[Tuple[str, str], ProxyNode] = {}
@@ -728,7 +748,7 @@ class Router:
             if c.get("region"):
                 cands, blocked_region = self._find_rehome_candidates_for_account(
                     c, target_region, target_egress, target_tier,
-                    exclude_names={broken_node_name}
+                    exclude_names={broken_node_name} | domain_peers
                 )
             else:
                 # No region promise on record: shared availability-first ladder.
