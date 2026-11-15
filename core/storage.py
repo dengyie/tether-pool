@@ -243,6 +243,16 @@ class Storage:
                 if col not in existing_cols:
                     conn.execute(f"ALTER TABLE nodes ADD COLUMN {col} {col_type} DEFAULT {default_val}")
 
+            # janitor 存量回填 (2026-11-15): 升级前已 DEAD 的节点没有 dead_since
+            # 锚点, 续期分支会一直保留 NULL —— 它们永远进不了冻结/驱逐倒计时。
+            # 统一补成迁移时刻 (连续 DEAD 从此起算, 24h 后冻结 / 7d 后驱逐)。
+            backfilled = conn.execute(
+                "UPDATE nodes SET dead_since = ? "
+                "WHERE status = 'dead' AND dead_since IS NULL",
+                (datetime.now().isoformat(),)).rowcount
+            if backfilled:
+                print(f"[schema] backfilled dead_since anchor for {backfilled} legacy dead node(s)")
+
             lease_cols = [r["name"] for r in conn.execute("PRAGMA table_info(leases)").fetchall()]
             for col, col_type, default_val in [
                 ("rebind_count", "INTEGER", "0"),
