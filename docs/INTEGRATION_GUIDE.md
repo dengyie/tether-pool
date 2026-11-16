@@ -137,19 +137,15 @@ curl -X POST http://10.144.144.9:9100/v1/battery/event \
 ---
 
 ### 2. CPA Manager Plus (自动化运营矩阵)
-TetherPool 原生支持 CPA 格式的批量导出端点：
+CPA 侧接入走**参数化网关凭据**（每个任务一个用户名，出口绑定由服务端按上表指令决定；2026-11 重构后不再有静态 CPA 格式导出端点）：
 
-```bash
-# 导出当前全部健康节点为 CPA 代理列表
-curl -s http://10.144.144.9:9100/v1/export/cpa
-```
-返回输出格式标准：
 ```text
-http://10.144.144.9:9101:cpa_task_01:<GATEWAY_PASSWORD>
-http://10.144.144.9:9101:cpa_task_02:<GATEWAY_PASSWORD>
+# 每个任务在 CPA 后台填一个代理凭据（密码 = 网关 GATEWAY_PASSWORD）：
+cpa_task_01__tier_standard:<GATEWAY_PASSWORD>@10.144.144.9:9101
+cpa_task_02__tier_standard:<GATEWAY_PASSWORD>@10.144.144.9:9101
 ...
 ```
-在 CPA 后台导入该 URL 或批量粘贴，即可实现每个任务固定独立出口。
+用户名即路由元数据（指令表见上文），首次请求即建立账号级持久绑定，每个任务固定独立出口；故障时按约束集自动 rehome。
 
 ---
 

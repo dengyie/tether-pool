@@ -8,14 +8,13 @@ from core.router import Router
 from core.prober import Prober
 from core.metrics import MetricsCollector
 from core.allocator import AllocationEngine
-from adapters.cpa_adapter import CpaAdapter
 import api.server
 
 
 @pytest.fixture(autouse=True)
 def isolate_api_storage(tmp_path, monkeypatch):
     """
-    Guarantees test isolation: replaces global storage, router, prober, metrics_collector, and cpa_adapter
+    Guarantees test isolation: replaces global storage, router, prober, metrics_collector
     in api.server with temporary instances backed by an isolated SQLite file.
     Prevents tests from mutating production data/ip_pool.db.
     """
@@ -26,7 +25,6 @@ def isolate_api_storage(tmp_path, monkeypatch):
     isolated_router = Router(isolated_storage)
     isolated_prober = Prober(isolated_storage, router=isolated_router)
     isolated_metrics = MetricsCollector(isolated_storage)
-    isolated_cpa = CpaAdapter(isolated_storage)
     isolated_allocator = AllocationEngine(isolated_storage)
 
     monkeypatch.setattr(api.server, "storage", isolated_storage)
@@ -34,7 +32,6 @@ def isolate_api_storage(tmp_path, monkeypatch):
     monkeypatch.setattr(api.server, "prober", isolated_prober)
     monkeypatch.setattr(api.server, "allocator", isolated_allocator)
     monkeypatch.setattr(api.server, "metrics_collector", isolated_metrics)
-    monkeypatch.setattr(api.server, "cpa_adapter", isolated_cpa)
 
     # Prevent accidental subprocess calls from disturbing live daemons during tests
     try:

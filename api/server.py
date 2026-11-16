@@ -29,7 +29,6 @@ from core.metrics import MetricsCollector
 from core.allocator import AllocationEngine
 from core.quality import IPQualityEvaluator
 from core.locks import BINDING_WRITE_LOCK
-from adapters.cpa_adapter import CpaAdapter
 
 CONFIG_FILE = os.environ.get("IP_POOL_CONFIG", os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "nodes.yaml"))
 DASHBOARD_HTML = os.path.join(os.path.dirname(os.path.dirname(__file__)), "web", "templates", "dashboard.html")
@@ -81,7 +80,6 @@ prober = Prober(storage, router=router,
                 timeout=float(os.environ.get("IP_POOL_PROBE_TIMEOUT", str(DEFAULT_PROBE_TIMEOUT))))
 allocator = AllocationEngine(storage)
 metrics_collector = MetricsCollector(storage)
-cpa_adapter = CpaAdapter(storage)
 
 # Single-flight guard so overlapping sweeps (startup + manual trigger) cannot
 # both hammer the pool at once.
@@ -1022,15 +1020,6 @@ def _binding_reason_breakdown(changes) -> Dict[str, int]:
     for change in changes:
         breakdown[change.reason] = breakdown.get(change.reason, 0) + 1
     return breakdown
-
-
-@app.get("/v1/export/cpa")
-def export_cpa(
-    region: Optional[str] = Query(None, description="Optional region filter"),
-    egress_type: Optional[str] = Query(None, description="Optional egress type filter")
-):
-    """Export native and WARP nodes for CPA configuration via CpaAdapter"""
-    return cpa_adapter.generate_cpa_config(region=region, egress_type=egress_type)
 
 
 @app.get("/metrics", response_class=PlainTextResponse)

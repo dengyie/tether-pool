@@ -72,13 +72,6 @@ def test_export_grok2api_endpoint(client):
     assert "nodes" in data
 
 
-def test_export_cpa_endpoint(client):
-    res = client.get("/v1/export/cpa")
-    assert res.status_code == 200
-    data = res.json()
-    assert "proxies" in data
-
-
 def test_dashboard_endpoint(client):
     res = client.get("/dashboard")
     assert res.status_code == 200

@@ -182,7 +182,7 @@ class Router:
                 "tier_policy": tier_policy or "",
             }
 
-        def _honoured_constraints(selected: ProxyNode) -> Dict[str, Any]:
+        def _honoured_constraints(selected: ProxyNode) -> Dict[str, Any] | None:
             """The promise subset the selected node actually fulfils.
 
             Persisting the RAW call constraints would record a promise the binding
@@ -193,6 +193,14 @@ class Router:
             dropped so rehome never defends a constraint the acquire ladder already
             gave up. Policy pins (*_only) always survive: they filtered the ladder,
             so the selected node matches them by construction.
+
+            Returns None whenever the honoured set is empty — both for a fully
+            unconstrained call and for a call whose every dimension was relaxed away
+            by the ladder (e.g. the warp_ipv6 default relaxed onto a native-v4 node):
+            batch_save_allocations then skips the bound_* CASE branch entirely,
+            preserving whatever promise the existing binding carries — a plain rebind
+            must not strip a pinned binding (the same invariant the fast-path
+            constraint backfill at 1a keeps).
             """
             c = _call_constraints()
             if selected.egress_type != (c["egress_type"] or None):
@@ -202,6 +210,8 @@ class Router:
                 c["region_strict"] = False
             if c["tier"] and selected.tier != c["tier"]:
                 c["tier"] = ""
+            if not any(c.values()):
+                return None
             return c
 
         def _node_matches_constraints(node: ProxyNode) -> bool:
@@ -439,10 +449,11 @@ class Router:
                 return ephemeral_lease
             try:
                 self.storage.set_lease(account_id, selected_node.name, rebind_reason="constraint_rebind")
+                honoured = _honoured_constraints(selected_node)
                 self.storage.batch_save_allocations(
                     [(svc, account_id, selected_node.name, now_str)],
                     reason="constraint_rebind",
-                    constraints_by_account={(svc, account_id): _honoured_constraints(selected_node)},
+                    constraints_by_account={(svc, account_id): honoured} if honoured else {},
                 )
             except Exception as persist_err:
                 print(f"[-] constraint_rebind persistence failed for {account_id}: {persist_err}")
@@ -456,11 +467,15 @@ class Router:
             return ephemeral_lease
 
         # 5. Persist lease and synchronize with account_allocations (constraint set rides
-        #    along so auto_rehome stays inside the credential's promise).
+        #    along so auto_rehome stays inside the credential's promise). An unconstrained
+        #    call passes no constraint map at all: the ON CONFLICT CASE branches keep the
+        #    existing bound_* columns instead of stripping them (F2 review root fix —
+        #    a plain force_rebind must never erase a pinned binding's promise).
         lease = self.storage.set_lease(account_id, selected_node.name)
+        honoured = _honoured_constraints(selected_node)
         self.storage.batch_save_allocations(
             [(svc, account_id, selected_node.name, now_str)],
-            constraints_by_account={(svc, account_id): _honoured_constraints(selected_node)},
+            constraints_by_account={(svc, account_id): honoured} if honoured else {},
         )
         # set_lease 由 lease 表构造, 不带拨号字段 —— 从 selected_node 补齐,
         # 让新绑定/R2 重绑路径同样免掉网关的重复 get_node。
@@ -655,14 +670,7 @@ class Router:
                 # Egress-promise without a region: hop regions but never the egress
                 # type — landing a warp_ipv6 account on native-v4 breaks the contract
                 # the data plane keeps re-asserting on every request.
-                if bound_policy == TierPolicy.PREMIUM_ONLY.value:
-                    tier_pref = [Tier.PREMIUM.value]
-                elif bound_policy == TierPolicy.STANDARD_ONLY.value:
-                    tier_pref = [Tier.STANDARD.value]
-                elif bound_tier:
-                    tier_pref = [bound_tier, None]
-                else:
-                    tier_pref = [None]
+                tier_pref = self._rehome_tier_pref(bound_policy, bound_tier)
                 for t in tier_pref:
                     cands = [
                         n for n in self.storage.list_nodes(
@@ -701,10 +709,8 @@ class Router:
         tier_pref: List[Optional[str]]
         if hard_tiers:
             tier_pref = hard_tiers  # policy is absolute; no relaxation at all
-        elif bound_tier:
-            tier_pref = [bound_tier, None]
         else:
-            tier_pref = [None]
+            tier_pref = self._rehome_tier_pref(bound_policy, bound_tier)
 
         for t in tier_pref:
             # Preferred egress first, then any egress inside the region.
@@ -717,6 +723,23 @@ class Router:
                 return cands, None
 
         return None, bound_region
+
+    @staticmethod
+    def _rehome_tier_pref(bound_policy: Optional[str], bound_tier: Optional[str]) -> List[Optional[str]]:
+        """Shared tier preference ladder for rehome candidate selection.
+
+        `*_only` policies are absolute (single tier, no relaxation); a plain bound
+        tier is preferred then relaxed to any tier; no tier pin accepts any tier.
+        Used by both the region-bound path and the egress-hard path so the mapping
+        can never drift between them.
+        """
+        if bound_policy == TierPolicy.PREMIUM_ONLY.value:
+            return [Tier.PREMIUM.value]
+        if bound_policy == TierPolicy.STANDARD_ONLY.value:
+            return [Tier.STANDARD.value]
+        if bound_tier:
+            return [bound_tier, None]
+        return [None]
 
     @staticmethod
     def _constraints_from_alloc(alloc: Optional[Dict[str, Any]]) -> Dict[str, Any]:

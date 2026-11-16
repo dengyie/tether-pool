@@ -401,9 +401,6 @@ http://<account_id>:<gateway_password>@<gateway_host>:9101
 - **方法**：`GET /v1/bindings/epoch?service=grok2api`
 - **说明**：返回当前绑定纪元 `{service, epoch, changed_at, last_change_reason}`。
 
-### 4. CPA 格式导出
-- **方法**：`GET /v1/export/cpa`
-
 ---
 
 ## 七、故障域与死节点自愈指标 (R3 / R7)

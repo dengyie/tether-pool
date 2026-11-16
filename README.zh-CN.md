@@ -162,7 +162,6 @@ curl -x http://bob:secret@127.0.0.1:9101 \
 | `GET` | `/v1/circuit/events` | 查询断路器状态变迁与自愈重签审计日志 |
 | `POST` | `/v1/circuit/reset` | 运维人员手动复位节点断路器至 `healthy` |
 | `POST` | `/v1/circuit/rehome` | 针对特定故障节点手动触发租约重签迁移 |
-| `GET` | `/v1/export/cpa` | 导出 CPA 格式代理列表 |
 | `GET` | `/v1/export/grok2api` | 导出 grok2api 所需健康节点格式 |
 
 ---

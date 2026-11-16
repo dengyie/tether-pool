@@ -615,3 +615,46 @@ def test_fully_unconstrained_rehome_ladder_unchanged(temp_pool):
     # Any healthy node is acceptable; only assert it moved somewhere healthy.
     new_node = storage.get_node(storage.find_allocation_by_account("free_acc")["node_name"])
     assert new_node.status == "healthy" and new_node.name != lease.node_name
+
+
+# ------------------------------------------------------ 2026-11-17: acquire persistence honours its own ladder
+
+def test_relaxed_egress_not_persisted_as_phantom_promise(temp_pool):
+    """Upstream root of the 2026-11-16 incident: acquire must persist only the
+    constraint dimensions the selected node actually fulfils. A warp_ipv6 request
+    whose ladder relaxed onto a clash node must NOT write bound_egress_type=warp_ipv6
+    (rehome would then defend a phantom promise as hard)."""
+    router, storage = temp_pool
+    _seed_egress_pool(router, storage)
+    # Make every warp_ipv6 node DEAD so the ladder must relax egress; one clash
+    # node stays healthy to receive the binding.
+    for name in ("huawei-tokyo-warp-01", "huawei-tokyo-warp-02", "singapore-warp-01"):
+        storage.update_node_status(name, HealthStatus.DEAD.value)
+
+    lease = router.acquire_for_account("phantom_acc", egress_type=EgressType.WARP_IPV6.value)
+    assert lease is not None
+    assert lease.egress_type != "warp_ipv6", "test setup: ladder must have relaxed egress"
+
+    alloc = storage.find_allocation_by_account("phantom_acc")
+    assert alloc["bound_egress_type"] == "", \
+        f"phantom promise persisted: bound_egress_type={alloc['bound_egress_type']!r}"
+
+
+def test_unconstrained_force_rebind_preserves_existing_promise(temp_pool):
+    """F2 review: a plain unconstrained call that persists a rebind must never
+    strip the pinned binding's promise (acquire docstring invariant: a plain
+    request must not weaken a pinned binding)."""
+    router, storage = temp_pool
+
+    lease = router.acquire_for_account("pin_acc", region="us-west")
+    assert lease is not None
+    alloc = storage.find_allocation_by_account("pin_acc")
+    assert alloc["bound_region"] == "us-west"
+
+    # Unconstrained force_rebind (e.g. gateway ?rebind=true without params).
+    new_lease = router.acquire_for_account("pin_acc", force_rebind=True)
+    assert new_lease is not None
+
+    alloc2 = storage.find_allocation_by_account("pin_acc")
+    assert alloc2["bound_region"] == "us-west", \
+        f"unconstrained rebind stripped the region promise: {alloc2['bound_region']!r}"

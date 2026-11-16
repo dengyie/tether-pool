@@ -163,7 +163,6 @@ curl -x http://bob:secret@127.0.0.1:9101 \
 | `GET` | `/v1/circuit/events` | Audit log of circuit transitions and lease migrations |
 | `POST` | `/v1/circuit/reset` | Operator manual reset of a node to `healthy` |
 | `POST` | `/v1/circuit/rehome` | Manually re-home leases for a degraded/dead node |
-| `GET` | `/v1/export/cpa` | Export proxies in CPA format |
 | `GET` | `/v1/export/grok2api` | Export healthy nodes for `grok2api` |
 
 ---

@@ -1,5 +1,5 @@
 """
-tests/test_adapters.py - Unit tests for CPA, Gemini, and Playwright adapters
+tests/test_adapters.py - Unit tests for Gemini and Playwright adapters
 """
 
 import os
@@ -9,7 +9,6 @@ import yaml
 from core.models import ProxyNode, EgressType, HealthStatus
 from core.storage import Storage
 from core.router import Router
-from adapters.cpa_adapter import CpaAdapter
 from adapters.gemini_adapter import GeminiAdapter
 from adapters.playwright_pool import PlaywrightProxyManager
 
@@ -43,27 +42,6 @@ def temp_adapter_env():
 
     if os.path.exists(db_path):
         os.remove(db_path)
-
-
-def test_cpa_adapter(temp_adapter_env):
-    storage, router = temp_adapter_env
-    adapter = CpaAdapter(storage=storage)
-
-    cfg = adapter.generate_cpa_config()
-    assert cfg["version"] == "1.0"
-    assert cfg["proxy_count"] == 2
-    assert len(cfg["proxies"]) == 2
-    assert "socks5://" in cfg["proxies"][0]["url"]
-
-    # Export to temp YAML
-    with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as yf:
-        yaml_path = yf.name
-    adapter.export_to_file(yaml_path)
-
-    with open(yaml_path, "r", encoding="utf-8") as f:
-        loaded = yaml.safe_load(f)
-    assert loaded["proxy_count"] == 2
-    os.remove(yaml_path)
 
 
 def test_gemini_adapter(temp_adapter_env):
