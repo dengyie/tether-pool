@@ -182,6 +182,28 @@ class Router:
                 "tier_policy": tier_policy or "",
             }
 
+        def _honoured_constraints(selected: ProxyNode) -> Dict[str, Any]:
+            """The promise subset the selected node actually fulfils.
+
+            Persisting the RAW call constraints would record a promise the binding
+            itself does not keep (e.g. the default warp_ipv6 request relaxed by the
+            ladder onto a native-v4 node), and every later rehome would then treat
+            that phantom promise as hard — the 2026-11-16 incident's upstream source.
+            Only dimensions the binding genuinely satisfies survive; relaxed ones are
+            dropped so rehome never defends a constraint the acquire ladder already
+            gave up. Policy pins (*_only) always survive: they filtered the ladder,
+            so the selected node matches them by construction.
+            """
+            c = _call_constraints()
+            if selected.egress_type != (c["egress_type"] or None):
+                c["egress_type"] = ""
+            if selected.region != (c["region"] or None):
+                c["region"] = ""
+                c["region_strict"] = False
+            if c["tier"] and selected.tier != c["tier"]:
+                c["tier"] = ""
+            return c
+
         def _node_matches_constraints(node: ProxyNode) -> bool:
             if egress_type and node.egress_type != egress_type:
                 return False
@@ -420,7 +442,7 @@ class Router:
                 self.storage.batch_save_allocations(
                     [(svc, account_id, selected_node.name, now_str)],
                     reason="constraint_rebind",
-                    constraints_by_account={(svc, account_id): _call_constraints()},
+                    constraints_by_account={(svc, account_id): _honoured_constraints(selected_node)},
                 )
             except Exception as persist_err:
                 print(f"[-] constraint_rebind persistence failed for {account_id}: {persist_err}")
@@ -438,7 +460,7 @@ class Router:
         lease = self.storage.set_lease(account_id, selected_node.name)
         self.storage.batch_save_allocations(
             [(svc, account_id, selected_node.name, now_str)],
-            constraints_by_account={(svc, account_id): _call_constraints()},
+            constraints_by_account={(svc, account_id): _honoured_constraints(selected_node)},
         )
         # set_lease 由 lease 表构造, 不带拨号字段 —— 从 selected_node 补齐,
         # 让新绑定/R2 重绑路径同样免掉网关的重复 get_node。
@@ -613,12 +635,15 @@ class Router:
         * `region` — HARD: candidates never leave the bound region. `region_strict`
           changes acquire-time relaxation only; for rehome a bound region is always
           enforced (that is the caller's "美国出口" promise).
-        * `egress_type` / `tier` — preferred inside the region: the (region+egress) or
-          (region+tier) subset is tried first, relaxed to the whole region when empty
-          (the acquire ladder relaxes egress the same way).
-        * `tier_policy` `*_only` — HARD: the region candidate set must also match the
-          policy tier (a standard_only account must not be parked on premium nodes).
-        * no bound region — unconstrained: identical to the availability-first ladder.
+        * `egress_type` — HARD when there is no bound region: candidates stay on the
+          bound egress type across regions (the "one account one IP" promise lives in
+          this dimension for region-less credentials; relaxing it here re-parked 127
+          cpa accounts on native-v4 nodes on 2026-11-16). With a bound region it stays
+          preferred-then-relaxed inside the region, mirroring the acquire ladder.
+        * `tier` / `tier_policy` `*_only` — HARD: the candidate set must also match
+          the policy tier (a standard_only account must not be parked on premium nodes).
+        * no bound region AND no bound egress — unconstrained: identical to the
+          availability-first ladder.
         """
         bound_region = (constraints.get("region") or "").strip() or None
         bound_egress = (constraints.get("egress_type") or "").strip() or None
@@ -626,7 +651,32 @@ class Router:
         bound_policy = (constraints.get("tier_policy") or "").strip().lower() or None
 
         if not bound_region:
-            # No region promise on record: keep the existing availability-first ladder.
+            if bound_egress:
+                # Egress-promise without a region: hop regions but never the egress
+                # type — landing a warp_ipv6 account on native-v4 breaks the contract
+                # the data plane keeps re-asserting on every request.
+                if bound_policy == TierPolicy.PREMIUM_ONLY.value:
+                    tier_pref = [Tier.PREMIUM.value]
+                elif bound_policy == TierPolicy.STANDARD_ONLY.value:
+                    tier_pref = [Tier.STANDARD.value]
+                elif bound_tier:
+                    tier_pref = [bound_tier, None]
+                else:
+                    tier_pref = [None]
+                for t in tier_pref:
+                    cands = [
+                        n for n in self.storage.list_nodes(
+                            egress_type=bound_egress,
+                            status=HealthStatus.HEALTHY.value,
+                            tier=t,
+                        )
+                        if n.name not in exclude_names
+                    ]
+                    if cands:
+                        return cands, None
+                return None, None
+            # No region and no egress promise on record: keep the existing
+            # availability-first ladder.
             cands = self._find_rehome_candidates(
                 fallback_region, fallback_egress, fallback_tier, exclude_names
             )
@@ -745,13 +795,17 @@ class Router:
         for key, info in units.items():
             svc_acc, acc = key
             c = info["constraints"]
-            if c.get("region"):
+            if c.get("region") or c.get("egress_type"):
+                # Any persisted promise (region OR egress type) must be honoured by the
+                # constraint-aware path — a region-less warp_ipv6 account rehomed via
+                # the availability-first ladder lands on native-v4 nodes and silently
+                # breaks the egress contract (2026-11-16, 127 cpa bindings).
                 cands, blocked_region = self._find_rehome_candidates_for_account(
                     c, target_region, target_egress, target_tier,
                     exclude_names={broken_node_name} | domain_peers
                 )
             else:
-                # No region promise on record: shared availability-first ladder.
+                # No promise on record: shared availability-first ladder.
                 cands, blocked_region = (base_candidates or None), None
             if not cands:
                 blocked_units[key] = blocked_region or "none_healthy"
@@ -848,9 +902,16 @@ class Router:
                 lease_accounts.setdefault(lease.account_id, lease.node_name)
             for a in self.storage.get_allocations_for_node(node_name):
                 stale_allocs[(a["service"], a["account_id"])] = a["node_name"]
-                units.setdefault((a["service"], a["account_id"]), {"constraints": {}})
                 c = self._constraints_from_alloc(a)
-                if c.get("region"):
+                units.setdefault(
+                    (a["service"], a["account_id"]),
+                    {"constraints": c if (c.get("region") or c.get("egress_type")) else {}}
+                )
+                # Persist every promise, not just region pins: a region-less
+                # egress-pinned account whose constraints were dropped here rode
+                # the unconstrained ladder and violated its egress contract
+                # (2026-11-16, 127 cpa bindings on native-v4 nodes).
+                if c.get("region") or c.get("egress_type"):
                     units[(a["service"], a["account_id"])]["constraints"] = c
         allocated_account_ids = {acc for (_, acc) in stale_allocs}
         for acc in lease_accounts:
@@ -875,7 +936,7 @@ class Router:
         for key, info in units.items():
             svc_acc, acc = key
             c = info["constraints"]
-            if c.get("region"):
+            if c.get("region") or c.get("egress_type"):
                 cands, blocked_region = self._find_rehome_candidates_for_account(
                     c, anchor.region, anchor.egress_type, anchor.tier,
                     exclude_names=broken_names
@@ -977,7 +1038,10 @@ class Router:
             domain_peers = {
                 n.name for n in self.storage.list_nodes_by_domain(failed.effective_fault_domain)
             }
-            if alloc_c.get("region"):
+            if alloc_c.get("region") or alloc_c.get("egress_type"):
+                # Any persisted promise (region OR egress type) routes through the
+                # constraint-aware path — see _rehome_leases_for_node for the
+                # 2026-11-16 incident this closes.
                 candidates, blocked_region = self._find_rehome_candidates_for_account(
                     alloc_c, failed.region, failed.egress_type, failed.tier,
                     exclude_names={failed_node_name} | domain_peers

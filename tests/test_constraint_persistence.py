@@ -517,3 +517,101 @@ def test_unconstrained_sweep_computes_candidate_ladder_once(temp_pool):
     router._find_rehome_candidates = orig
     assert result["rehomed_count"] == 3
     assert len(calls) == 1, f"ladder computed {len(calls)}x for 3 unconstrained accounts"
+
+
+# ------------------------------------------------------ 2026-11-16: egress-promise rehome
+
+def _seed_egress_pool(router, storage):
+    """Adds a tokyo warp_ipv6 pool plus native-v4 decoys in every region."""
+    storage.upsert_node(ProxyNode(name="huawei-tokyo-warp-01", host="10.0.1.1", port=9001,
+                                  region="tokyo", egress_type=EgressType.WARP_IPV6.value,
+                                  status=HealthStatus.HEALTHY.value))
+    storage.upsert_node(ProxyNode(name="huawei-tokyo-warp-02", host="10.0.1.2", port=9001,
+                                  region="tokyo", egress_type=EgressType.WARP_IPV6.value,
+                                  status=HealthStatus.HEALTHY.value))
+    storage.upsert_node(ProxyNode(name="singapore-warp-01", host="10.0.1.3", port=9001,
+                                  region="singapore", egress_type=EgressType.WARP_IPV6.value,
+                                  status=HealthStatus.HEALTHY.value))
+
+
+def test_egress_pinned_account_never_rehomed_to_other_egress(temp_pool):
+    """2026-11-16 incident: a region-less warp_ipv6 account swept via the
+    unconstrained ladder landed on native-v4 nodes. The egress promise is HARD
+    for rehome even without a region pin."""
+    router, storage = temp_pool
+    _seed_egress_pool(router, storage)
+
+    lease = router.acquire_for_account("xai_acc", egress_type=EgressType.WARP_IPV6.value)
+    assert lease is not None
+    alloc = storage.find_allocation_by_account("xai_acc")
+    assert alloc["bound_egress_type"] == "warp_ipv6"
+
+    storage.update_node_status(lease.node_name, HealthStatus.DEAD.value)
+    result = router.rehome_leases_for_node(lease.node_name)
+    assert result["rehomed_count"] == 1
+
+    new_node = storage.get_node(storage.find_allocation_by_account("xai_acc")["node_name"])
+    assert new_node.egress_type == "warp_ipv6", \
+        f"rehome broke the egress promise: {new_node.egress_type}"
+
+
+def test_egress_pinned_rehome_blocked_when_no_warp_node_healthy(temp_pool):
+    """No healthy warp_ipv6 node anywhere -> rehome_blocked, binding preserved."""
+    router, storage = temp_pool
+    _seed_egress_pool(router, storage)
+
+    lease = router.acquire_for_account("xai_block", egress_type=EgressType.WARP_IPV6.value)
+    for name in ("huawei-tokyo-warp-01", "huawei-tokyo-warp-02", "singapore-warp-01"):
+        storage.update_node_status(name, HealthStatus.DEAD.value)
+
+    result = router.rehome_leases_for_node(lease.node_name)
+    assert result["rehome_blocked_count"] == 1
+    alloc = storage.find_allocation_by_account("xai_block")
+    assert alloc["node_name"] == lease.node_name, "blocked rehome must keep the original binding"
+
+
+def test_r2_egress_pinned_account_stays_on_egress_type(temp_pool):
+    """R2 (retry_exhausted) must honour the egress promise too, not just region pins."""
+    router, storage = temp_pool
+    _seed_egress_pool(router, storage)
+
+    lease = router.acquire_for_account("xai_r2", egress_type=EgressType.WARP_IPV6.value)
+    storage.update_node_status(lease.node_name, HealthStatus.DEAD.value)
+
+    result = router.rehome_account_binding("xai_r2", lease.node_name, trigger="retry_exhausted")
+    assert result["rehomed"] is True
+    new_node = storage.get_node(result["to_node"])
+    assert new_node.egress_type == "warp_ipv6", \
+        f"R2 broke the egress promise: {new_node.egress_type}"
+
+
+def test_domain_rehome_preserves_egress_only_constraints(temp_pool):
+    """Domain sweep used to DROP non-region constraints entirely (units got {}),
+    sending egress-pinned accounts through the unconstrained ladder."""
+    router, storage = temp_pool
+    _seed_egress_pool(router, storage)
+
+    lease = router.acquire_for_account("xai_dom", egress_type=EgressType.WARP_IPV6.value)
+    broken = storage.get_node(lease.node_name)
+    storage.update_node_status(lease.node_name, HealthStatus.DEAD.value)
+
+    result = router.rehome_leases_for_domain(broken.effective_fault_domain, [broken])
+    assert result["rehomed_count"] == 1
+
+    new_node = storage.get_node(storage.find_allocation_by_account("xai_dom")["node_name"])
+    assert new_node.egress_type == "warp_ipv6", \
+        f"domain rehome broke the egress promise: {new_node.egress_type}"
+
+
+def test_fully_unconstrained_rehome_ladder_unchanged(temp_pool):
+    """Accounts with no region AND no egress promise keep availability-first behaviour."""
+    router, storage = temp_pool
+    _seed_egress_pool(router, storage)
+
+    lease = router.acquire_for_account("free_acc")
+    storage.update_node_status(lease.node_name, HealthStatus.DEAD.value)
+    result = router.rehome_leases_for_node(lease.node_name)
+    assert result["rehomed_count"] == 1
+    # Any healthy node is acceptable; only assert it moved somewhere healthy.
+    new_node = storage.get_node(storage.find_allocation_by_account("free_acc")["node_name"])
+    assert new_node.status == "healthy" and new_node.name != lease.node_name
