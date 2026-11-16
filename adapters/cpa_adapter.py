@@ -1,6 +1,14 @@
 """
 adapters/cpa_adapter.py - CPA (Claude / OpenAI Proxy) Configuration Exporter & Synchronizer
 Generates proxy definitions and credential-level sticky routing for CPA.
+
+DEPRECATED (2026-11-17): CPA no longer consumes exported proxy lists. The live
+integration uses gateway parametric credentials of the form
+    http://<account_id>__type_warp_ipv6__service_cpa:<PW>@gw:9101
+written into each credential's proxy_url (see scripts/cpa_pool_migrate.py and
+the IP-Pool 运维手册). This exporter predates that design: it emits bare
+socks5:// node URLs with no account stickiness or egress-promise semantics —
+do not wire new consumers through it.
 """
 
 import os
