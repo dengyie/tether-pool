@@ -43,7 +43,9 @@ PROJECT = Path(__file__).resolve().parent.parent
 MANIFEST_PATH = PROJECT / "config" / "node_groups.yaml"
 NODES_YAML = PROJECT / "config" / "nodes.yaml"
 START_SH = PROJECT / "start.sh"
-CONTROL = "http://127.0.0.1:9100"
+# 控制面目标 (2026-11-18): 默认 Mac 本地实例; mesh 宿主机验收用
+# IP_POOL_CONTROL_URL 指生产 (如 http://10.144.144.9:9100) 校验 L5 注册一致性。
+CONTROL = os.environ.get("IP_POOL_CONTROL_URL", "http://127.0.0.1:9100")
 GATEWAY = "http://127.0.0.1:9101"
 # 网关密码从环境读取 (F2, 二轮 review): 线上启用 GATEWAY_PASSWORD 后, verify
 # 阶段硬编码 "x" 会全量 407, 网关路由检查形同虚设。GATEWAY_PASSWORD 未设时
