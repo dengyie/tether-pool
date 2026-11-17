@@ -150,6 +150,67 @@ def test_mass_guard_small_pool_passthrough(temp_env):
     assert storage.get_node("s-0").status == HealthStatus.DEAD.value
 
 
+def test_mass_guard_blocked_node_keeps_backoff_anchor(temp_env):
+    """guard 拦截 = 这次别踢进 DEAD, 不是永远别退避。
+
+    2026-11-17 生产取证: 1871 个节点 fail_count>=20 卡在 degraded——拦截分支
+    把 next_allowed 置 None 后, 节点无冷却锚点, 每轮全量扫都立即重探、立即
+    再失败、立即再被拦, 白烧探测预算且永远进不了指数退避。修复后拦截仍
+    保留 compute_cooldown 的退避锚点, 状态留在 DEGRADED。"""
+    storage, _ = temp_env
+    for i in range(3):
+        _mk(storage, "bk-a%d" % i, fault_domain="dom-bk")
+    storage.update_node("bk-a0", {"status": HealthStatus.DEAD.value})
+    storage.update_node("bk-a1", {"status": HealthStatus.DEAD.value})
+    for i in range(17):
+        _mk(storage, "bk-pad-%d" % i, port=22000 + i, fault_domain="dom-bkpad")
+    # 先失败一次进 DEGRADED, 再失败才触发 DEGRADED->DEAD 边上的 guard 拦截
+    storage.update_probe_result(ProbeResult(node_name="bk-a2", success=False, error="timeout"))
+    assert storage.get_node("bk-a2").status == HealthStatus.DEGRADED.value
+    res, event = storage.update_probe_result(ProbeResult(node_name="bk-a2", success=False, error="timeout"))
+    n = storage.get_node("bk-a2")
+    assert n.status == HealthStatus.DEGRADED.value           # 拦截语义不变
+    assert n.next_probe_allowed_at is not None               # 但退避锚点必须保留
+    # DEGRADED->DEGRADED 不算状态迁移, 不产生 circuit_event
+    assert event is None
+    from datetime import datetime
+    assert datetime.fromisoformat(n.next_probe_allowed_at) > datetime.now()
+
+
+def test_degraded_with_backoff_anchor_skipped_by_probe_node(temp_env):
+    """probe_node 早退: DEGRADED + 未到期退避锚点 (guard 拦截产物) 本轮不重探。
+
+    观察期 DEGRADED 锚点为空, 照常探测, rise=2 不受影响; force 跳过该早退。
+    锚点经真实 guard 拦截路径构造 (update_node 白名单不含探活状态机内部列)。"""
+    storage, _ = temp_env
+    from core.prober import Prober
+    # 复现 guard 拦截场景: dom-x 3 节点 2 dead, 第 3 个二连失败被拦回 DEGRADED + 锚点
+    for i in range(3):
+        _mk(storage, "dg-a%d" % i, fault_domain="dom-dg")
+    storage.update_node("dg-a0", {"status": HealthStatus.DEAD.value})
+    storage.update_node("dg-a1", {"status": HealthStatus.DEAD.value})
+    for i in range(17):
+        _mk(storage, "dg-pad-%d" % i, port=23000 + i, fault_domain="dom-dgpad")
+    storage.update_probe_result(ProbeResult(node_name="dg-a2", success=False, error="timeout"))
+    storage.update_probe_result(ProbeResult(node_name="dg-a2", success=False, error="timeout"))
+    n = storage.get_node("dg-a2")
+    assert n.status == HealthStatus.DEGRADED.value and n.next_probe_allowed_at
+
+    prober = Prober.__new__(Prober)  # 不发真实请求: 早退在触网之前
+    prober.storage = storage
+    prober.router = None
+    prober.timeout = 1.0
+    import asyncio
+    res = asyncio.run(prober.probe_node(n))
+    assert res.error == "degraded_backoff_in_cooldown"
+    after = storage.get_node("dg-a2")
+    assert after.fail_count == 2          # 没被本轮重探计入新失败
+
+    # force 不受锚点约束
+    res_f = asyncio.run(prober.probe_node(n, force=True))
+    assert res_f.error != "degraded_backoff_in_cooldown"
+
+
 # ---------------- DISABLED 管理员状态 ----------------
 
 def test_disabled_node_skipped_by_probe_node(temp_env):

@@ -3,6 +3,7 @@ core/prober.py - Asynchronous dual-stack health prober with Circuit Breaker Inte
 """
 
 import asyncio
+import datetime
 import time
 import httpx
 from typing import List, Optional, Any
@@ -66,6 +67,21 @@ class Prober:
                     to_state=HealthStatus.HALF_OPEN.value,
                     reason="cooldown_expired_canary_probe"
                 )
+        elif not force and node.status == HealthStatus.DEGRADED.value \
+                and node.next_probe_allowed_at:
+            # mass-guard 拦截产物 (2026-11-17): DEGRADED + 未到期退避锚点 =
+            # "本轮别再探" (guard 说这次别踢 DEAD, 但退避照走)。观察期 DEGRADED
+            # 的 next_probe_allowed_at 为空, 不受影响, rise=2 语义不变。
+            try:
+                if datetime.datetime.now() < datetime.datetime.fromisoformat(node.next_probe_allowed_at):
+                    return ProbeResult(
+                        node_name=node.name,
+                        success=False,
+                        latency_ms=0.0,
+                        error="degraded_backoff_in_cooldown"
+                    )
+            except ValueError:
+                pass  # 锚点解析失败按无锚点处理, 照常探测
 
         proxy_url = f"socks5h://{node.host}:{node.port}"
 

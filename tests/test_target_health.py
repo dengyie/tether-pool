@@ -345,7 +345,7 @@ def test_gateway_metrics_buffered_and_flushed():
         names = [r["name"] for r in storage.get_runtime_metrics()]
         assert not any("attempts_per_request" in n for n in names)
         import asyncio
-        asyncio.get_event_loop_policy().new_event_loop().run_until_complete(gw._flush_metrics())
+        asyncio.run(gw._flush_metrics())
         names = [r["name"] for r in storage.get_runtime_metrics()]
         assert any("attempts_per_request" in n for n in names), "flush 后落库"
         assert gw._metrics_buffer == []

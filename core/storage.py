@@ -468,13 +468,15 @@ class Storage:
                 # committing a NEW DEAD transition (DEGRADED/HALF_OPEN -> DEAD edge),
                 # check the domain-bucket and global DEAD ratios. Renewals of
                 # already-DEAD nodes (cooldown extension) are never blocked.
+                # 2026-11-17 根因修复: 拦截只改写状态, 不丢弃 next_allowed ——
+                # 之前的置 None 让被拦节点失去退避锚点, 每轮 sweep 立即重探立即
+                # 再失败立即再被拦, 生产 1871 节点 fail_count>=20 永卡 degraded。
                 if (not res.success and new_state == HealthStatus.DEAD.value
                         and old_state != HealthStatus.DEAD.value):
                     allowed, guard_reason = CircuitBreaker.allow_trip(node, conn)
                     if not allowed:
                         new_state = HealthStatus.DEGRADED.value
                         reason = f"{guard_reason}: {reason[:40]}"
-                        next_allowed = None
 
                 next_allowed_str = next_allowed.isoformat() if next_allowed else None
                 cur_lat = res.latency_ms if res.success else node.latency_ms
