@@ -71,6 +71,11 @@ class ProxyNode(BaseModel):
     # `fault_domain` is empty the storage layer derives it from `host`.
     fault_domain: str = ""
     provider_region: str = ""
+    # Node-level probe target override (2026-11-18 mesh 宿主机收编): 节点自己的
+    # 探活 URL。CN 家宽/CN 机房 native 出口下 GFW 会拦 Cloudflare 段
+    # (api.ipify.org / cdn-cgi/trace)，用可直达目标覆盖，如 https://ipinfo.io/ip
+    # (纯 IP 文本)；空 = 按默认阶梯 (native_ipv4 -> ipify, 其余 -> CF trace)。
+    probe_url: str = ""
     # Node-side last liveness heartbeat (e.g. EasyTier peer timestamp).
     self_reported_at: Optional[str] = None
     # 连续 DEAD 锚点 (janitor 2026-11-15): DEAD 落锤时写, 离开 DEAD 清空。
@@ -346,6 +351,7 @@ class NodeCreateRequest(BaseModel):
     relay_hop_node: Optional[str] = None
     fault_domain: str = ""
     provider_region: str = ""
+    probe_url: str = ""
 
     @field_validator("tier", "configured_tier")
     @classmethod

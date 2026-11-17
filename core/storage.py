@@ -120,6 +120,7 @@ class Storage:
                     quality_score INTEGER DEFAULT 50,
                     fault_domain TEXT DEFAULT '',
                     provider_region TEXT DEFAULT '',
+                    probe_url TEXT DEFAULT '',
                     self_reported_at TEXT
                 );
 
@@ -258,6 +259,7 @@ class Storage:
                 ("configured_tier", "TEXT", "NULL"),
                 ("fault_domain", "TEXT", "''"),
                 ("provider_region", "TEXT", "''"),
+                ("probe_url", "TEXT", "''"),
                 ("self_reported_at", "TEXT", "NULL"),
                 # 节点生命周期 janitor (2026-11-15): 连续 DEAD 24h -> 冻结
                 # (探活降频 + 不进分配), 连续 7d -> 驱逐 (DB 删除 + tombstone
@@ -352,9 +354,9 @@ class Storage:
                     exit_ip, latency_ms, status, fail_count, last_probed_at,
                     circuit_state, consecutive_failures, consecutive_successes, next_probe_allowed_at,
                     relay_mode, relay_hop_node, tier, configured_tier, quality_score,
-                    fault_domain, provider_region, self_reported_at, dead_since
+                    fault_domain, provider_region, probe_url, self_reported_at, dead_since
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     host=excluded.host,
                     port=excluded.port,
@@ -379,6 +381,9 @@ class Storage:
                     next_probe_allowed_at=CASE WHEN excluded.status != 'unprobed' THEN excluded.next_probe_allowed_at ELSE nodes.next_probe_allowed_at END,
                     fault_domain=CASE WHEN excluded.fault_domain != '' THEN excluded.fault_domain ELSE nodes.fault_domain END,
                     provider_region=CASE WHEN excluded.provider_region != '' THEN excluded.provider_region ELSE nodes.provider_region END,
+                    -- probe_url: 节点级探活覆盖 (mesh CN 节点绕 GFW Cloudflare 段拦
+                    -- 截); 非空覆盖语义与 fault_domain 一致, yaml/DTO 为权威源
+                    probe_url=CASE WHEN excluded.probe_url != '' THEN excluded.probe_url ELSE nodes.probe_url END,
                     self_reported_at=COALESCE(excluded.self_reported_at, nodes.self_reported_at),
                     -- janitor 锚点: upsert 不得清掉既有 DEAD 倒计时 (探活恢复由
                     -- update_probe_result 清); 新节点携带的种子值也照写
@@ -391,7 +396,8 @@ class Storage:
                 node.consecutive_successes, node.next_probe_allowed_at,
                 node.relay_mode, node.relay_hop_node,
                 node.tier or Tier.STANDARD.value, node.configured_tier, node.quality_score or 50,
-                node.fault_domain or "", node.provider_region or "", node.self_reported_at,
+                node.fault_domain or "", node.provider_region or "", node.probe_url or "",
+                node.self_reported_at,
                 node.dead_since
             ))
 
@@ -650,6 +656,7 @@ class Storage:
             quality_score=row["quality_score"] if "quality_score" in keys and row["quality_score"] is not None else 50,
             fault_domain=row["fault_domain"] if "fault_domain" in keys and row["fault_domain"] else "",
             provider_region=row["provider_region"] if "provider_region" in keys and row["provider_region"] else "",
+            probe_url=row["probe_url"] if "probe_url" in keys and row["probe_url"] else "",
             self_reported_at=row["self_reported_at"] if "self_reported_at" in keys else None
         )
 

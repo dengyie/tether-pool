@@ -184,6 +184,9 @@ def load_initial_nodes():
                 # omitted, ProxyNode derives it from host (see effective_fault_domain).
                 fault_domain=item.get("fault_domain", "") or "",
                 provider_region=item.get("provider_region", "") or "",
+                # Node-level probe target override (mesh CN nodes bypass GFW-blocked
+                # Cloudflare probe segments; empty = default ladder in prober).
+                probe_url=item.get("probe_url", "") or "",
                 tier=init_tier,
                 configured_tier=configured_tier,
                 quality_score=score
@@ -578,7 +581,8 @@ def create_or_upsert_node(req: NodeCreateRequest):
         configured_tier=configured_tier,
         quality_score=score,
         fault_domain=req.fault_domain,
-        provider_region=req.provider_region
+        provider_region=req.provider_region,
+        probe_url=req.probe_url
     )
     storage.upsert_node(node)
     saved = storage.get_node(req.name)

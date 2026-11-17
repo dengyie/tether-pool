@@ -29,6 +29,10 @@ from core.storage import Storage
 ISP_SEGMENT_MAP: Tuple[Tuple[str, str], ...] = (
     ("23.230.200.0/24", "comcast"),
     ("23.132.180.0/24", "att"),
+    # 中国移动家宽 (2026-11-18 mesh 收编 home-win/laptop-win): 183.193.0.0/16
+    # 为上海移动动态家宽段, 实测出口 183.193.163.187 (AS24400); /16 粒度容忍
+    # 宽带重拨整段漂移。
+    ("183.193.0.0/16", "cmcc"),
 )
 
 

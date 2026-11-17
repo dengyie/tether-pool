@@ -49,4 +49,39 @@ frozen_base_insurance:
     port: 11052
     listen: 127.0.0.1
     proxy: '[自建] 🇺🇸VLESS-AWS-Oregon-Reality'
+# ---------------------------------------------------------------- mesh 宿主机组
+# kind=mesh (2026-11-18): EasyTier mesh 宿主机直连 socks5 收编。宿主机跑免认证
+# sing-box socks5 (端口约定 10801=native), 节点 host=mesh IP, 无桥核/无 Verge 注入。
+# check: L2 SKIP, L4=远端 socks5 拨测; heal: 只同步 nodes.yaml。
+# 一组一台宿主机 (组= fault_domain); 节点级可覆盖 host_ip/fault_domain/region/weight/tier/probe_url。
+mesh-home-win:
+  kind: mesh
+  host_ip: 10.144.144.10
+  fault_domain: home-win
+  region: cn
+  egress_type: native_ipv4
+  tier: premium
+  weight: 50
+  tags: [self_hosted, mesh, residential, cmcc, native]
+  # CN 出口 GFW 拦 Cloudflare 段 (ipify/CF trace), 节点级探活目标须可直达
+  probe_url: https://ipinfo.io/ip
+  tether_name_template: 'home-win-native-v{idx:02d}'
+  tether_seq_start: 500
+  relay_mode: direct_only
+  nodes:
+  - {idx: 1, port: 10801}
+mesh-aws-oregon:
+  kind: mesh
+  host_ip: 10.144.144.14
+  fault_domain: aws-oregon
+  region: us-west
+  egress_type: native_ipv4
+  tier: premium
+  weight: 50
+  tags: [self_hosted, mesh, native, aws, datacenter]
+  tether_name_template: 'aws-oregon-native-v{idx:02d}'
+  tether_seq_start: 501
+  relay_mode: direct_only
+  nodes:
+  - {idx: 1, port: 10801}
 _note: 复制为 config/node_groups.yaml 并填入真实凭据; 该文件已被 gitignore, 严禁入库

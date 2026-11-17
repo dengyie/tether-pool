@@ -25,6 +25,22 @@ def parse_cf_trace(text: str) -> dict:
     return data
 
 
+def select_probe_target(node: ProxyNode) -> tuple[str, bool]:
+    """Probe target ladder for a node. Returns (target_url, is_cf_trace).
+
+    节点级 `probe_url` 覆盖优先 (2026-11-18 mesh 宿主机收编): CN 家宽/CN 机房
+    native 出口下 GFW 会拦 Cloudflare 段 (api.ipify.org / cdn-cgi/trace 的
+    TLS)，节点需自带可直达目标 (如 https://ipinfo.io/ip 纯 IP 文本)。
+    格式按 URL 特征识别而非 egress_type —— CF trace 走 k=v 解析并附带 loc=
+    geo 信号，其余按纯文本 IP 处理。空 probe_url 回落默认阶梯。
+    """
+    if node.probe_url:
+        return node.probe_url, "cdn-cgi/trace" in node.probe_url
+    if node.egress_type == EgressType.NATIVE_IPV4.value:
+        return PROBE_URL_V4, False
+    return PROBE_URL_CF_TRACE, True
+
+
 class Prober:
     def __init__(self, storage: Storage, router: Optional[Any] = None, timeout: float = DEFAULT_TIMEOUT):
         self.storage = storage
@@ -85,13 +101,8 @@ class Prober:
 
         proxy_url = f"socks5h://{node.host}:{node.port}"
 
-        # Choose primary probe URL
-        if node.egress_type == EgressType.NATIVE_IPV4.value:
-            target_url = PROBE_URL_V4
-            is_cf_trace = False
-        else:
-            target_url = PROBE_URL_CF_TRACE
-            is_cf_trace = True
+        # Choose primary probe URL (node-level override -> egress-type ladder)
+        target_url, is_cf_trace = select_probe_target(node)
 
         for attempt in range(retries + 1):
             start_t = time.perf_counter()

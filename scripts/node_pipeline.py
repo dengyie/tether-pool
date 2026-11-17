@@ -30,6 +30,7 @@ import concurrent.futures
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -354,15 +355,79 @@ function {fn}(config) {{
 def is_standalone(group: dict) -> bool:
     """standalone 桥核组 (bridge_core.type=standalone-mihomo, 如 teleapi):
     节点只入 TetherPool, 不写 Clash Verge (Script.js/Merge.yaml/mihomo 活体)."""
-    return (group.get("bridge_core") or {}).get("type") == "standalone-mihomo"
+    return group_kind(group) == "standalone"
+
+
+def group_kind(group: dict) -> str:
+    """组类型三态 (2026-11-18 mesh 宿主机收编):
+    - 'standalone': bridge_core.type=standalone-mihomo — Mac 本地独立桥核 (teleapi)
+    - 'mesh':       kind=mesh — EasyTier mesh 宿主机直连 socks5 (节点 host=mesh IP,
+                    无桥核/无 Verge/无 listener, check L4 = 远端拨测, heal 只同步 nodes.yaml)
+    - 'verge':      默认 — Clash Verge 注入组 (Script.js 托管块 + mihomo 活体)"""
+    if (group.get("bridge_core") or {}).get("type") == "standalone-mihomo":
+        return "standalone"
+    if group.get("kind") == "mesh":
+        return "mesh"
+    return "verge"
+
+
+def mesh_ports(group: dict) -> list[int]:
+    """mesh 组端口: 每节点自带 port (无 bridge_ports 桥接段概念)."""
+    return [int(n["port"]) for n in group["nodes"]]
+
+
+def mesh_expected_entry(group: dict, i: int) -> dict:
+    """mesh 组第 i 个节点在 nodes.yaml 的期望条目 (节点级字段覆盖组级)."""
+    n = group["nodes"][i]
+    spec = {
+        "name": tether_names(group)[i],
+        "host": n.get("host_ip") or group.get("host_ip", ""),
+        "port": int(n["port"]),
+        "protocol": "socks5h",
+        "region": n.get("region") or group.get("region", ""),
+        "egress_type": n.get("egress_type") or group.get("egress_type", "native_ipv4"),
+        "tags": (group.get("tags") or []) + ["mesh", "pipeline"],
+        "weight": n.get("weight") or group.get("weight", 100),
+        "tier": n.get("tier") or group.get("tier", "standard"),
+        "relay_mode": group.get("relay_mode", "direct_only"),
+    }
+    fd = n.get("fault_domain") or group.get("fault_domain") or ""
+    if fd:
+        spec["fault_domain"] = fd
+    pu = n.get("probe_url") or group.get("probe_url") or ""
+    if pu:
+        spec["probe_url"] = pu
+    return spec
+
+
+def socks5_probe_dial(host: str, port: int, timeout: float = 4.0) -> tuple[bool, str]:
+    """mesh L4 远端拨测: TCP 连通 + SOCKS5 no-auth 问候握手 (05 01 00 -> 05 00).
+
+    只验证 listener 在位且说 SOCKS5, 不做出口探测 (L5b 健康度由 TetherPool
+    自身 prober 负责, check 不重复烧探测预算)。"""
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            s.settimeout(timeout)
+            s.sendall(b"\x05\x01\x00")
+            resp = b""
+            while len(resp) < 2:
+                chunk = s.recv(2 - len(resp))
+                if not chunk:
+                    break
+                resp += chunk
+            if resp != b"\x05\x00":
+                return False, f"socks5 握手拒绝: {resp.hex() or 'EOF'}"
+            return True, "ok"
+    except OSError as e:
+        return False, str(e)
 
 
 def gen_main_call_js(manifest: dict) -> str:
-    # standalone 组没有 ensureNPGroup_<name> 函数, 主调用块绝不能引用它
+    # standalone/mesh 组没有 ensureNPGroup_<name> 函数, 主调用块绝不能引用它
     # (否则 JS ReferenceError 使整个宿主脚本失效, 连带 pigeonw 等受管组全灭)。
     calls = "\n".join(
         f"  ensureNPGroup_{gname}(config);" for gname, g in manifest["groups"].items()
-        if not is_standalone(g))
+        if group_kind(g) == "verge")
     return f"""{MAIN_BEGIN.format()}
   // 节点流水线: 所有受管组(节点注入/中转/url-test)统一入口。
 {calls}
@@ -452,9 +517,9 @@ def cmd_check(args):
     pool_registry = pool_nodes()
     live_listening = listening_ports()
 
-    # Verge 侧依赖惰性拉取: 全 standalone 环境无 Verge 也必须能跑 check;
+    # Verge 侧依赖惰性拉取: 全 standalone/mesh 环境无 Verge 也必须能跑 check;
     # 有受管组但 Verge 不可达时降级为 L2/L4 DRIFT(语义正确), 不再直接崩溃。
-    has_verge_groups = any(not is_standalone(g) for g in manifest["groups"].values())
+    has_verge_groups = any(group_kind(g) == "verge" for g in manifest["groups"].values())
     script = None
     if has_verge_groups:
         try:
@@ -472,29 +537,41 @@ def cmd_check(args):
 
     for gname, group in manifest["groups"].items():
         log(f"\n== 组 {gname} ==")
+        kind = group_kind(group)
+        standalone = kind == "standalone"
+        mesh = kind == "mesh"
         tnames = tether_names(group)
-        ports = realized_ports(group)
+        # mesh 组端口来自节点自身 port (无桥接段); vendor 组走 realized_ports
+        ports = mesh_ports(group) if mesh else realized_ports(group)
         # standalone 桥核组 (bridge_core.type=standalone-mihomo, 如 teleapi):
         # 节点只入 TetherPool, 不写 Clash Verge (Script.js/mihomo 活体) — L2 豁免,
         # L4 只验自有核 listener 在位; L1/L3/L5 照常。
-        standalone = is_standalone(group)
+        # mesh 宿主机组 (kind=mesh, 如 home-win): host=mesh IP 直连 — L2 豁免,
+        # L4 = 远端 socks5 拨测, L3 全字段比对; L1/L5 照常。
 
         # L1 manifest 内部完备性 (server 必填; username/password 成对 — http vendor
         # 语义; 协议型节点 (vless/hysteria2/tuic 等) 无 Basic Auth 概念, 凭据以
         # uuid/password/sni 等原始字段存在 manifest 节点里, 只要求 server+type 在位)
-        def _l1_ok(n: dict) -> bool:
-            if not n.get("server"):
-                return False
-            if str(n.get("type", "")).lower() in ("vless", "vmess", "hysteria2", "tuic", "hysteria", "ss", "ssr", "trojan", "snell", "wireguard"):
-                return bool(n.get("type"))
-            return bool(n.get("username")) == bool(n.get("password"))
+        if mesh:
+            def _l1_ok(n: dict) -> bool:
+                return bool(n.get("port")) and bool(n.get("host_ip") or group.get("host_ip"))
+        else:
+            def _l1_ok(n: dict) -> bool:
+                if not n.get("server"):
+                    return False
+                if str(n.get("type", "")).lower() in ("vless", "vmess", "hysteria2", "tuic", "hysteria", "ss", "ssr", "trojan", "snell", "wireguard"):
+                    return bool(n.get("type"))
+                return bool(n.get("username")) == bool(n.get("password"))
         complete = all(_l1_ok(n) for n in group["nodes"])
         all_ok &= layer("L1 manifest 完备性", complete,
-                        f"{len(group['nodes'])} nodes" if complete else "缺 server 或凭据不成对")
+                        f"{len(group['nodes'])} nodes" if complete else
+                        ("缺 host_ip/port (mesh)" if mesh else "缺 server 或凭据不成对"))
 
         # L2 manifest ↔ Script.js 托管块 (全字段)
         if standalone:
             log("  [SKIP ] L2 Script.js 托管块 — standalone 桥核组 (仅 TetherPool, 无 Verge 注入)")
+        elif mesh:
+            log("  [SKIP ] L2 Script.js 托管块 — mesh 宿主机组 (mesh IP 直连, 无 Verge 注入)")
         elif script is None:
             all_ok &= layer("L2 Script.js 托管块", False, "Script.js 不可读 — 需恢复宿主脚本")
         else:
@@ -505,26 +582,53 @@ def cmd_check(args):
         # L3 manifest ↔ nodes.yaml
         by_name = {n.get("name"): n for n in nodes_yaml.get("nodes", [])}
         node_region = {n["idx"]: n.get("region") for n in group["nodes"] if n.get("region")}
-        drift = []
-        for i, (tname, port) in enumerate(zip(tnames, ports)):
-            entry = by_name.get(tname)
-            if not entry:
-                drift.append(f"{tname}(缺失)")
-                continue
-            if entry.get("port") != port:
-                drift.append(f"{tname}(port {entry.get('port')}≠{port})")
-            if entry.get("relay_mode") != group.get("relay_mode", "direct_only"):
-                drift.append(f"{tname}(relay_mode)")
-            expected_region = node_region.get(group["nodes"][i]["idx"], group["region"])
-            if entry.get("region") != expected_region:
-                drift.append(f"{tname}(region {entry.get('region')}≠{expected_region})")
-        all_ok &= layer("L3 nodes.yaml 注册", not drift, "一致" if not drift else str(drift[:4]))
+        if mesh:
+            drift = []
+            for i in range(len(group["nodes"])):
+                expected = mesh_expected_entry(group, i)
+                entry = by_name.get(expected["name"])
+                if not entry:
+                    drift.append(f"{expected['name']}(缺失)")
+                    continue
+                for field in ("host", "port", "region", "egress_type", "fault_domain", "probe_url"):
+                    if expected.get(field) and entry.get(field) != expected[field]:
+                        drift.append(f"{expected['name']}({field} {entry.get(field)}≠{expected[field]})")
+                if entry.get("weight") != expected["weight"]:
+                    drift.append(f"{expected['name']}(weight {entry.get('weight')}≠{expected['weight']})")
+            all_ok &= layer("L3 nodes.yaml 注册", not drift, "一致" if not drift else str(drift[:4]))
+        else:
+            drift = []
+            for i, (tname, port) in enumerate(zip(tnames, ports)):
+                entry = by_name.get(tname)
+                if not entry:
+                    drift.append(f"{tname}(缺失)")
+                    continue
+                if entry.get("port") != port:
+                    drift.append(f"{tname}(port {entry.get('port')}≠{port})")
+                if entry.get("relay_mode") != group.get("relay_mode", "direct_only"):
+                    drift.append(f"{tname}(relay_mode)")
+                expected_region = node_region.get(group["nodes"][i]["idx"], group["region"])
+                if entry.get("region") != expected_region:
+                    drift.append(f"{tname}(region {entry.get('region')}≠{expected_region})")
+            all_ok &= layer("L3 nodes.yaml 注册", not drift, "一致" if not drift else str(drift[:4]))
 
         # L4 manifest ↔ mihomo 活体 (固定中转: dialer 节点存活才要求; 注入组须包含全部节点)
         if standalone:
             ports_up = [p for p in ports if p in live_listening]
             all_ok &= layer("L4 自有桥核 listener", len(ports_up) == len(ports),
                             f"listener {len(ports_up)}/{len(ports)} 在位 ({ports[0]}–{ports[-1]})")
+        elif mesh:
+            # mesh 宿主机组: 远端 socks5 拨测 (TCP + 05 01 00 -> 05 00),
+            # 从 Mac 侧拨 mesh IP —— 与 TetherPool prober 同路径。
+            dead = []
+            for i in range(len(group["nodes"])):
+                expected = mesh_expected_entry(group, i)
+                ok, why = socks5_probe_dial(expected["host"], expected["port"])
+                if not ok:
+                    dead.append(f"{expected['name']}({why})")
+            all_ok &= layer("L4 mesh 宿主拨测", not dead,
+                            f"{len(ports) - len(dead)}/{len(ports)} socks5 在位"
+                            if not dead else str(dead[:4]))
         else:
             missing = [n["name"] for n in group["nodes"] if n["name"] not in live_names]
             dialer = group.get("dialer_proxy")
@@ -845,14 +949,18 @@ def cmd_heal(args):
     manifest = load_manifest()
     gname = args.group
     group = manifest["groups"][gname]
-    standalone = is_standalone(group)
+    kind = group_kind(group)
+    standalone = kind == "standalone"
+    mesh = kind == "mesh"
     fixed = []
 
-    # standalone 组不进 Verge: 跳过宿主脚本恢复/重建与 Merge.yaml 镜像,
-    # 只对齐 nodes.yaml 与 realize 端口映射。
+    # standalone/mesh 组不进 Verge: 跳过宿主脚本恢复/重建与 Merge.yaml 镜像,
+    # 只对齐 nodes.yaml (standalone 另有 realize 端口映射)。
     js_skip_reason = None
     if standalone:
         js_skip_reason = "standalone 桥核组 — 无 Verge 注入, 跳过 Script.js/Merge.yaml"
+    elif mesh:
+        js_skip_reason = "mesh 宿主机组 — mesh IP 直连, 跳过 Script.js/Merge.yaml"
     elif not SCRIPT_JS.exists():
         baks = sorted(VERGE_DIR.joinpath("profiles").glob("Script.js.bak-*"))
         if baks:
@@ -864,8 +972,8 @@ def cmd_heal(args):
             js_skip_reason = ("Script.js 缺失且无备份 (profiles/Script.js.bak-*) — "
                               "请先恢复宿主脚本(含 main/ensureHomeMeshNode 锚点)再重跑 heal")
 
-    script = None if standalone else read_script()
-    drift = [] if standalone else js_block_drift(gname, group, script)
+    script = None if standalone or mesh else read_script()
+    drift = [] if standalone or mesh else js_block_drift(gname, group, script)
     if js_skip_reason is None and (drift or args.force_js):
         log(f"[heal] 重建 Script.js 托管块 (漂移: {drift[:4] if drift else 'force'})")
         bak = backup(SCRIPT_JS, f"heal-{gname}")
@@ -885,37 +993,59 @@ def cmd_heal(args):
     ny = yaml.safe_load(open(NODES_YAML, encoding="utf-8")) or {}
     by_name = {n.get("name"): n for n in ny.get("nodes", [])}
     tnames = tether_names(group)
-    ports = realized_ports(group)
-    need_node_fix = any(
-        (n := by_name.get(t)) is None or n.get("port") != p or n.get("relay_mode") != "direct_only"
-        for t, p in zip(tnames, ports))
-    node_region = {n["idx"]: n.get("region") for n in group["nodes"] if n.get("region")}
-    if not need_node_fix and node_region:
-        # 节点级 region 覆盖组默认时, 还要比对 region 本身 (standalone/多地区组)
+    ports = mesh_ports(group) if mesh else realized_ports(group)
+    if mesh:
+        # mesh 组: 按 mesh_expected_entry 全字段对齐 (host=mesh IP / fault_domain /
+        # probe_url / weight / tier / region / egress_type), 缺则补、漂则修。
+        expected_entries = [mesh_expected_entry(group, i) for i in range(len(group["nodes"]))]
         need_node_fix = any(
-            (e := by_name.get(t)) is not None
-            and e.get("region") != node_region.get(group["nodes"][i]["idx"], group["region"])
-            for i, (t, _p) in enumerate(zip(tnames, ports)))
-    if need_node_fix:
-        log("[heal] 对齐 nodes.yaml (端口/relay_mode/region)")
-        backup(NODES_YAML, f"heal-{gname}")
-        for i, (t, p) in enumerate(zip(tnames, ports)):
-            entry = by_name.get(t)
-            expected_region = node_region.get(group["nodes"][i]["idx"], group["region"])
-            if entry is None:
-                ny["nodes"].append({"name": t, "host": "127.0.0.1", "port": p,
-                                    "protocol": "socks5h", "region": expected_region,
-                                    "egress_type": "clash_proxy", "tags": group["tags"] + ["pipeline"],
-                                    "weight": 100, "tier": group["tier"], "relay_mode": "direct_only"})
-            else:
-                entry["port"] = p
-                entry["relay_mode"] = "direct_only"
-                if node_region:
-                    entry["region"] = expected_region
-        atomic_write_text(NODES_YAML, yaml.dump(ny, allow_unicode=True, sort_keys=False, width=200))
-        fixed.append("nodes.yaml")
+            (e := by_name.get(x["name"])) is None
+            or any(e.get(f) != v for f, v in x.items() if f != "name" and v)
+            for x in expected_entries)
+        if need_node_fix:
+            log("[heal] 对齐 nodes.yaml (mesh: host/port/region/egress_type/fault_domain/probe_url/weight/tier)")
+            backup(NODES_YAML, f"heal-{gname}")
+            for x in expected_entries:
+                entry = by_name.get(x["name"])
+                if entry is None:
+                    ny["nodes"].append(x)
+                else:
+                    for f, v in x.items():
+                        if f != "name" and v:
+                            entry[f] = v
+            atomic_write_text(NODES_YAML, yaml.dump(ny, allow_unicode=True, sort_keys=False, width=200))
+            fixed.append("nodes.yaml")
+    else:
+        need_node_fix = any(
+            (n := by_name.get(t)) is None or n.get("port") != p or n.get("relay_mode") != "direct_only"
+            for t, p in zip(tnames, ports))
+        node_region = {n["idx"]: n.get("region") for n in group["nodes"] if n.get("region")}
+        if not need_node_fix and node_region:
+            # 节点级 region 覆盖组默认时, 还要比对 region 本身 (standalone/多地区组)
+            need_node_fix = any(
+                (e := by_name.get(t)) is not None
+                and e.get("region") != node_region.get(group["nodes"][i]["idx"], group["region"])
+                for i, (t, _p) in enumerate(zip(tnames, ports)))
+        if need_node_fix:
+            log("[heal] 对齐 nodes.yaml (端口/relay_mode/region)")
+            backup(NODES_YAML, f"heal-{gname}")
+            for i, (t, p) in enumerate(zip(tnames, ports)):
+                entry = by_name.get(t)
+                expected_region = node_region.get(group["nodes"][i]["idx"], group["region"])
+                if entry is None:
+                    ny["nodes"].append({"name": t, "host": "127.0.0.1", "port": p,
+                                        "protocol": "socks5h", "region": expected_region,
+                                        "egress_type": "clash_proxy", "tags": group["tags"] + ["pipeline"],
+                                        "weight": 100, "tier": group["tier"], "relay_mode": "direct_only"})
+                else:
+                    entry["port"] = p
+                    entry["relay_mode"] = "direct_only"
+                    if node_region:
+                        entry["region"] = expected_region
+            atomic_write_text(NODES_YAML, yaml.dump(ny, allow_unicode=True, sort_keys=False, width=200))
+            fixed.append("nodes.yaml")
 
-    if not standalone:
+    if not standalone and not mesh:
         merge = yaml.safe_load(open(MERGE_YAML, encoding="utf-8")) or {}
         have_insurance = {str(l.get("proxy")) for l in merge.get("listeners", [])}
         missing_insurance = [n["name"] for n in group["nodes"] if n["name"] not in have_insurance]
@@ -937,7 +1067,7 @@ def cmd_heal(args):
         else:
             log("[heal] ⚠️ 未重启 TetherPool — 网关注册表仍是旧快照, 需手动 start.sh restart")
 
-    if args.realize:
+    if args.realize and not mesh:
         rc_r, changed = realize_group(manifest, gname, declared_ports(group))
         if changed:
             fixed.append("realize(端口映射回写)")
@@ -945,17 +1075,25 @@ def cmd_heal(args):
             log("[heal] ❌ realize 未能唯一匹配端口映射, 需人工核对")
             return 2
 
-    live = listening_ports()
-    ports_up = [p for p in ports if p in live]
-    if len(ports_up) != len(ports):
-        if standalone:
-            log(f"[heal] ⚠️ 桥核 listener 缺失 {len(ports) - len(ports_up)} 个 — "
-                f"检查桥核进程 (start.sh status / logs/teleapi-bridge.log)")
-        else:
-            log(f"[heal] ⚠️ Verge 底座 listener 缺失 {len(ports) - len(ports_up)} 个 — "
-                f"需在 Clash Verge 重新激活配置后重跑 heal")
-            if args.restart_verge:
-                restart_verge_app()
+    if mesh:
+        # mesh 组无本地 listener: 直接远端拨测给出健康概况 (L5b 由 TetherPool prober 负责)
+        dead = [x["name"] for x in [mesh_expected_entry(group, i) for i in range(len(group["nodes"]))]
+                if not socks5_probe_dial(x["host"], x["port"])[0]]
+        if dead:
+            log(f"[heal] ⚠️ mesh 宿主拨测失败 {len(dead)}/{len(ports)}: {dead[:4]} — "
+                f"检查宿主机 sing-box-native 服务与防火墙")
+    else:
+        live = listening_ports()
+        ports_up = [p for p in ports if p in live]
+        if len(ports_up) != len(ports):
+            if standalone:
+                log(f"[heal] ⚠️ 桥核 listener 缺失 {len(ports) - len(ports_up)} 个 — "
+                    f"检查桥核进程 (start.sh status / logs/teleapi-bridge.log)")
+            else:
+                log(f"[heal] ⚠️ Verge 底座 listener 缺失 {len(ports) - len(ports_up)} 个 — "
+                    f"需在 Clash Verge 重新激活配置后重跑 heal")
+                if args.restart_verge:
+                    restart_verge_app()
     rc = cmd_check(argparse.Namespace())
     log(("[heal] 已修复: " + ", ".join(fixed)) if fixed else "[heal] 无需修复")
     return rc
