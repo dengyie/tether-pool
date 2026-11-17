@@ -5,6 +5,7 @@ Transparently maps client requests to sticky EasyTier SOCKS5 exits based on head
 
 import asyncio
 import base64
+import collections
 import hmac
 import logging
 import os
@@ -258,7 +259,7 @@ def parse_host_port(raw_target: str, default_port: int = 80) -> Tuple[str, int]:
         raise ValueError(f"Invalid host or port: {raw_target}") from e
 
 
-async def pump_streams(r1: asyncio.StreamReader, w1: asyncio.StreamWriter, r2: asyncio.StreamReader, w2: asyncio.StreamWriter):
+async def pump_streams(r1: asyncio.StreamReader, w1: asyncio.StreamWriter, r2: asyncio.StreamReader, w2: asyncio.StreamWriter) -> str:
     """
     Bidirectionally pumps data between client and upstream proxy.
 
@@ -266,6 +267,12 @@ async def pump_streams(r1: asyncio.StreamReader, w1: asyncio.StreamWriter, r2: a
     with write_eof() and the opposite direction gets a bounded grace period to
     finish. Cancelling both directions on first completion truncated HTTP CONNECT
     responses whenever the client half-closed early.
+
+    Returns the relay outcome (2026-11-18 流中级 EOF 反馈):
+    - 'client_first'  : 客户端侧先收尾 (正常完成/客户端主动断)
+    - 'upstream_first': 上游在客户端仍活跃时先断 —— 线路或上游过早断开的信号,
+      调用方据此做节点级阈值反馈 (坏线路自动退出分配)
+    - 'both_error'    : 双侧均异常收尾
     """
     async def _forward(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
@@ -275,12 +282,13 @@ async def pump_streams(r1: asyncio.StreamReader, w1: asyncio.StreamWriter, r2: a
                     break
                 writer.write(data)
                 await writer.drain()
+            return "eof"
         except (asyncio.IncompleteReadError, ConnectionError, OSError):
-            pass
+            return "error"
         except asyncio.CancelledError:
             raise
         except Exception:
-            pass
+            return "error"
         finally:
             try:
                 if writer.can_write_eof():
@@ -288,10 +296,16 @@ async def pump_streams(r1: asyncio.StreamReader, w1: asyncio.StreamWriter, r2: a
             except (NotImplementedError, RuntimeError, OSError):
                 pass
 
-    t1 = asyncio.create_task(_forward(r1, w2))
-    t2 = asyncio.create_task(_forward(r2, w1))
+    t1 = asyncio.create_task(_forward(r1, w2))  # 读客户端
+    t2 = asyncio.create_task(_forward(r2, w1))  # 读上游
     try:
-        _, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+        done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+        first_client = t1 in done
+        first_outcome = "eof"
+        for t in done:
+            res = t.result()
+            if res == "error":
+                first_outcome = "error"
         for task in pending:
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=HALF_CLOSE_GRACE_SECONDS)
@@ -310,6 +324,20 @@ async def pump_streams(r1: asyncio.StreamReader, w1: asyncio.StreamWriter, r2: a
                 await w.wait_closed()
             except Exception:
                 pass
+    if first_outcome == "error":
+        return "both_error"
+    if first_client:
+        # 客户端先收尾; 若上游在宽限期内异常死亡同样算过早断。
+        # finally 已 cancel 未完成任务, result() 对 cancelled 任务抛 CancelledError
+        # 必须防御 (review 修正)。
+        upstream_res = None
+        if t2.done() and not t2.cancelled():
+            try:
+                upstream_res = t2.result()
+            except Exception:
+                upstream_res = "error"
+        return "upstream_first" if upstream_res == "error" else "client_first"
+    return "upstream_first"
 
 
 class ParsedCredentials:
@@ -543,6 +571,11 @@ class ForwardProxyGateway:
     ):
         self.storage = storage
         self.router = router
+        # 流中级 EOF 反馈 (2026-11-18): pump_streams "上游过早断开" 的滚动窗口
+        # 计数, 达阈值写入一次探活失败 (断路器照常 degrade/exclude)。保守语义:
+        # 上游站自身断流同样计入, 故阈值取多事件而非单发, 写入后清零重新累积 ——
+        # 单渠道偶发上游抖动不会踢掉对其他消费方正常的节点。
+        self._midstream_eof: dict = {}
         self.host = host
         self.port = port
         self.server = None
@@ -613,6 +646,44 @@ class ForwardProxyGateway:
         if key not in table and len(table) >= limit:
             return "other"
         return key
+
+    MIDSTREAM_EOF_THRESHOLD = 4       # 窗口内过早断开次数达到即写探活失败
+    MIDSTREAM_EOF_WINDOW = 600.0      # 滚动窗口秒数
+
+    def _handle_midstream_eol(self, node_name: str, outcome: str) -> None:
+        """pump_streams 上游过早断开 (upstream_first/both_error) 的节点级反馈。
+
+        滚动窗口计数达 MIDSTREAM_EOF_THRESHOLD -> 通过既有探活失败通道写一次
+        (断路器 degrade/exclude), 写入后清零重新累积。与 CONNECT 失败反馈互补:
+        CONNECT 失败管建连层, 这里管隧道建立后的流中断层 —— 坏线路在两个层面
+        都会被自动退出分配, 不再依赖消费方日志 scraping 才能发现。"""
+        try:
+            dq = self._midstream_eof.setdefault(node_name, collections.deque())
+            now = time.time()
+            dq.append(now)
+            while dq and now - dq[0] > self.MIDSTREAM_EOF_WINDOW:
+                dq.popleft()
+            if len(dq) < self.MIDSTREAM_EOF_THRESHOLD:
+                return
+            dq.clear()
+            print(f"[!] Midstream premature close threshold reached for {node_name} "
+                  f"({outcome}) — recording probe failure (circuit breaker will degrade/exclude)")
+            asyncio.get_running_loop().create_task(self._record_midstream_failure(node_name, outcome))
+        except Exception as e:
+            print(f"[-] Midstream EOF feedback failed for {node_name}: {e}")
+
+    async def _record_midstream_failure(self, node_name: str, outcome: str) -> None:
+        try:
+            _, _event = await asyncio.to_thread(
+                self.storage.update_probe_result, ProbeResult(
+                    node_name=node_name,
+                    success=False,
+                    error=f"gateway_midstream_eof: {outcome} (upstream closed before client)"[:120],
+                )
+            )
+        except Exception as probe_err:
+            # 与 CONNECT 失败反馈同口径: 写失败只丢观测, 不影响请求
+            print(f"[-] Midstream probe-result write failed for {node_name}: {probe_err}")
 
     def _record_relay(self, account_id: str, node_name: str, target: str) -> None:
         acct = self._relay_key(account_id, self.relay_total, self.RELAY_LABEL_CAP)
@@ -950,7 +1021,9 @@ class ForwardProxyGateway:
                 # from production: without it there is no way to see which downstream
                 # account generated the traffic).
                 self._record_relay(account_id, node.name, f"{target_host}:{target_port}")
-                return streams
+                # 流中级 EOF 反馈 (2026-11-18): 调用方需要 node 身份才能把
+                # "上游过早断开" 归因到具体节点 (原只返回 streams 无法归因)。
+                return node, streams[0], streams[1]
             except Exception as exc:
                 last_err = exc
                 excluded.add(node.name)
@@ -1151,7 +1224,7 @@ class ForwardProxyGateway:
                     return
 
                 try:
-                    remote_reader, remote_writer = await self._open_upstream(
+                    upstream_node, remote_reader, remote_writer = await self._open_upstream(
                         account_id=route_ctx.account_id,
                         region=route_ctx.region,
                         egress_type=route_ctx.egress_type,
@@ -1194,7 +1267,9 @@ class ForwardProxyGateway:
                 try:
                     client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                     await client_writer.drain()
-                    await pump_streams(client_reader, client_writer, remote_reader, remote_writer)
+                    outcome = await pump_streams(client_reader, client_writer, remote_reader, remote_writer)
+                    if outcome in ("upstream_first", "both_error"):
+                        self._handle_midstream_eol(upstream_node.name, outcome)
                 finally:
                     remote_writer.close()
 
@@ -1216,7 +1291,7 @@ class ForwardProxyGateway:
                     path_and_query += f"?{parsed_url.query}"
 
                 try:
-                    remote_reader, remote_writer = await self._open_upstream(
+                    upstream_node, remote_reader, remote_writer = await self._open_upstream(
                         account_id=route_ctx.account_id,
                         region=route_ctx.region,
                         egress_type=route_ctx.egress_type,
@@ -1282,7 +1357,9 @@ class ForwardProxyGateway:
                     remote_writer.write(new_req_payload.encode("iso-8859-1"))
                     await remote_writer.drain()
 
-                    await pump_streams(client_reader, client_writer, remote_reader, remote_writer)
+                    outcome = await pump_streams(client_reader, client_writer, remote_reader, remote_writer)
+                    if outcome in ("upstream_first", "both_error"):
+                        self._handle_midstream_eol(upstream_node.name, outcome)
                 finally:
                     remote_writer.close()
 

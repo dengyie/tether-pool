@@ -11,6 +11,7 @@ from core.models import ProxyNode, EgressType, HealthStatus
 from core.storage import Storage
 from core.router import Router
 from gateway.server import ForwardProxyGateway, parse_host_port
+import gateway.server as gateway_mod
 
 
 @pytest.fixture
@@ -365,3 +366,64 @@ def test_gateway_password_gate_end_to_end(temp_gateway, monkeypatch):
         assert b"407" not in right.buffer
 
     asyncio.run(scenario())
+
+
+# ---------------- 流中级 EOF 反馈 (2026-11-18): outcome 分类 + 节点级阈值 ----------------
+
+def _socketpair_streams():
+    import socket as _socket
+    a, b = _socket.socketpair()
+    return a, b
+
+
+@pytest.mark.asyncio
+async def test_pump_streams_outcome_upstream_first():
+    """上游先断 (客户端仍开着) -> outcome=upstream_first (坏线路反馈信号)."""
+    import socket as _socket
+    ca, cb = _socketpair_streams()
+    ua, ub = _socketpair_streams()
+    r1, w1 = await asyncio.open_connection(sock=ca)
+    r2, w2 = await asyncio.open_connection(sock=ua)
+    task = asyncio.create_task(gateway_mod.pump_streams(r1, w1, r2, w2))
+    await asyncio.sleep(0.05)
+    ub.close()  # 上游侧先死
+    outcome = await asyncio.wait_for(task, timeout=12)
+    assert outcome == "upstream_first"
+
+
+@pytest.mark.asyncio
+async def test_pump_streams_outcome_client_first():
+    """客户端先收尾 -> outcome=client_first (正常完成)."""
+    import socket as _socket
+    ca, cb = _socketpair_streams()
+    ua, ub = _socketpair_streams()
+    r1, w1 = await asyncio.open_connection(sock=ca)
+    r2, w2 = await asyncio.open_connection(sock=ua)
+    task = asyncio.create_task(gateway_mod.pump_streams(r1, w1, r2, w2))
+    await asyncio.sleep(0.05)
+    cb.close()  # 客户端侧先收尾
+    outcome = await asyncio.wait_for(task, timeout=12)
+    assert outcome == "client_first"
+
+
+@pytest.mark.asyncio
+async def test_midstream_eof_threshold_records_probe_failure(temp_gateway):
+    """滚动窗口 4 次过早断开 -> 恰好写一次探活失败 (fail_count+1), 写后清零."""
+    gateway, storage, router = temp_gateway
+    storage.upsert_node(ProxyNode(
+        name="midstream-victim", host="10.144.144.3", port=10881,
+        region="tokyo", egress_type=EgressType.WARP_IPV6.value,
+        status=HealthStatus.HEALTHY.value,
+    ))
+    for _ in range(gateway.MIDSTREAM_EOF_THRESHOLD - 1):
+        gateway._handle_midstream_eol("midstream-victim", "upstream_first")
+    assert storage.get_node("midstream-victim").fail_count == 0  # 阈值前不动
+    gateway._handle_midstream_eol("midstream-victim", "upstream_first")  # 第 4 次
+    await asyncio.sleep(0.1)  # to_thread 写入落地
+    victim = storage.get_node("midstream-victim")
+    assert victim.fail_count == 1
+    assert "gateway_midstream_eof" in (victim.circuit_state or "") or victim.status != "healthy"
+    # 写后清零: 再来 1 次不再立即写入 (需重新累积)
+    gateway._handle_midstream_eol("midstream-victim", "upstream_first")
+    await asyncio.sleep(0.1)
+    assert storage.get_node("midstream-victim").fail_count == 1
