@@ -45,6 +45,12 @@ DB_REFRESH_SECONDS = 600        # host -> channel 映射刷新周期
 RE_STREAM_BROKEN = re.compile(r"渠道\s*#(\d+)")
 RE_CONN_EOF = re.compile(r'do request failed: Post "(https?://[^"]+)":\s*(EOF|unexpected EOF|connection reset by peer)')
 RE_STREAM_EOF = re.compile(r'end_error="(unexpected EOF|EOF)"|reason=(eof|scanner_error)')
+# 渠道 typed URL 约束解析 (2026-11-18 特定区域站点: 渠道钉 region 时 agent
+# 换绑必须透传同一约束, 否则换绑会把渠道甩到错误区域)
+RE_C_TYPE = re.compile(r"__type_([a-z0-9_]+)")
+RE_C_REGION = re.compile(r"__region_([a-z0-9_-]+)")
+RE_C_TIER = re.compile(r"__tier_([a-z0-9_]+)")
+RE_C_STRICT = re.compile(r"__region_strict_true|__strict_region_true")
 
 
 def log(msg):
@@ -65,13 +71,41 @@ def _host_of(url: str):
         return None
 
 
+def parse_channel_params(proxy_url: str) -> dict:
+    """从渠道 typed URL 解析约束 (type/region/tier/region_strict) —— 换绑透传用。
+
+    分词方式与网关 parse_proxy_credentials 同构 (username.split("__") 后逐段
+    前缀匹配), 规避正则贪婪吞 `__` 边界; flag 段先于 `region_` 值段判定
+    (与网关同坑: region_strict_true 会被 region_ 前缀吞成 region="strict_true")。"""
+    u = proxy_url.split("@", 1)[0]
+    if "//" in u:
+        u = u.split("//", 1)[1]
+    user = u.rsplit(":", 1)[0] if ":" in u else u  # 剥 scheme 与 :password
+    user = user.strip("/")
+    p = {"egress_preference": None, "region": None, "tier": None, "region_strict": False}
+    for tok in user.split("__"):
+        tok = tok.strip().lower()
+        if tok in ("region_strict_true", "strict_region_true", "region_strict", "strict_region"):
+            p["region_strict"] = True
+        elif tok.startswith("type_"):
+            p["egress_preference"] = tok[5:]
+        elif tok.startswith("region_"):
+            p["region"] = tok[7:]
+        elif tok.startswith("tier_"):
+            p["tier"] = tok[5:]
+    return p
+
+
 def build_watch_index(rows):
-    """rows = [(id, base_url, setting)] -> (host_map, migrated_ids)。
+    """rows = [(id, base_url, setting)] -> (host_map, migrated_ids, channel_params)。
 
     只保留已迁移渠道（setting 含 MIGRATED_MARK）——review P1 根修：
-    非迁移渠道的 EOF 换线无意义且会产生垃圾绑定。"""
+    非迁移渠道的 EOF 换线无意义且会产生垃圾绑定。
+    channel_params: 渠道 typed URL 里的约束 (region/type/tier/region_strict),
+    换绑时透传给 acquire —— 特定区域站点 (如 mulink 钉 hongkong) 换绑不脱区。"""
     host_map = collections.defaultdict(list)
     ids = set()
+    params = {}
     for cid, base, setting in rows:
         if MIGRATED_MARK not in (setting or ""):
             continue
@@ -79,7 +113,15 @@ def build_watch_index(rows):
         h = _host_of(base)
         if h:
             host_map[h].append(cid)
-    return dict(host_map), ids
+        proxy = ""
+        try:
+            proxy = (json.loads(setting) or {}).get("proxy", "")
+        except Exception:
+            pass
+        p = parse_channel_params(proxy)
+        if any(p.values()):
+            params[cid] = p
+    return dict(host_map), ids, params
 
 
 def load_host_channels():
@@ -131,18 +173,28 @@ def tp_request(path, token, timeout=15, method="GET"):
         return json.loads(r.read().decode())
 
 
-def rebalance(cid, token):
+def rebalance(cid, token, ch_params=None):
     """对该渠道账号强制换绑；返回 (ok, detail)。
 
     - acquire 是 POST-only 写端点 (GET 405, review 二次根修: urllib 默认 GET)。
     - 约束参数名是 **egress_preference** (/v1/allocation/acquire 端点签名;
       `type=` 会被 FastAPI 静默忽略并回落默认 warp_ipv6, review 三次根修)。
-      带 clash_proxy 与渠道 typed URL 约束一致, 绑定一次落位。
+    - ch_params: 渠道 typed URL 解析出的约束 (region/type/tier/region_strict),
+      透传给 acquire —— 特定区域站点换绑不脱区 (review 五次根修)。
     - force_rebalance 本身保证换新节点; /v1/allocation/status 只有全局摘要
       无 per-account 视图, exclude_node 不可用, 不做无用调用。"""
     acct = f"mangoapi-ch{cid}"
     q = (f"/v1/allocation/acquire?service=mangoapi&account_id={acct}"
-         f"&force_rebalance=true&avoid_banned=true&egress_preference=clash_proxy")
+         f"&force_rebalance=true&avoid_banned=true")
+    p = ch_params or {}
+    if p.get("egress_preference"):
+        q += f"&egress_preference={urllib.parse.quote(p['egress_preference'])}"
+    if p.get("region"):
+        q += f"&region={urllib.parse.quote(p['region'])}"
+    if p.get("tier"):
+        q += f"&tier={urllib.parse.quote(p['tier'])}"
+    if p.get("region_strict"):
+        q += "&region_strict=true"
     try:
         r = tp_request(q, token, method="POST")
         new_node = (r.get("allocation") or r).get("node_name") if isinstance(r, dict) else None
@@ -197,8 +249,9 @@ def main():
         f"threshold={THRESHOLD}/{WINDOW_SECONDS}s cooldown={PER_CHANNEL_COOLDOWN}s "
         f"fail_retry={FAIL_RETRY_SECONDS}s cap={DAILY_CAP}/day (success only)")
     tails = [LogTail(p) for p in LOGS]
-    host_channels, migrated_ids = load_host_channels()
-    log(f"watch: {len(migrated_ids)} migrated channels, {len(host_channels)} hosts")
+    host_channels, migrated_ids, channel_params = load_host_channels()
+    log(f"watch: {len(migrated_ids)} migrated channels, {len(host_channels)} hosts, "
+        f"{len(channel_params)} with region/type constraints")
     eof_events = collections.defaultdict(collections.deque)  # cid -> deque[ts]
     last_swap, last_fail = {}, {}
     fail_streak = collections.Counter()
@@ -207,7 +260,7 @@ def main():
     while True:
         now = time.time()
         if now - last_db_refresh > DB_REFRESH_SECONDS:
-            host_channels, migrated_ids = load_host_channels()
+            host_channels, migrated_ids, channel_params = load_host_channels()
             last_db_refresh = now
         today = time.strftime("%Y%m%d")
         if today != swapped_today_day:
@@ -224,7 +277,7 @@ def main():
                 dq.popleft()
             if not swap_due(cid, now, eof_events, last_swap, last_fail, swapped_count, cap_reached):
                 continue
-            ok, detail = rebalance(cid, token)
+            ok, detail = rebalance(cid, token, channel_params.get(cid))
             if ok:
                 last_swap[cid] = now
                 eof_events[cid].clear()

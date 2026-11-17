@@ -28,7 +28,7 @@ def _rows():
 # ---------------------------------------------------------------- 作用域收窄 (P1 根修)
 
 def test_build_watch_index_only_migrated():
-    host_map, ids = sw.build_watch_index(_rows())
+    host_map, ids, _params = sw.build_watch_index(_rows())
     assert ids == {425, 90}
     assert set(host_map) == {"mazal.lol", "demo.dev2.mulink.top"}
     # 非迁移渠道 (CN/内环/绑定线/null-setting) 不得进入 watch 面
@@ -38,21 +38,21 @@ def test_build_watch_index_only_migrated():
 
 
 def test_extract_stream_broken_migrated_channel():
-    host_map, ids = sw.build_watch_index(_rows())
+    host_map, ids, _params = sw.build_watch_index(_rows())
     line = ('[INFO] 2026/11/18 - 02:29:41 | 流中断：渠道 #425 传输异常中断'
             '（reason=eof soft_errors=1, 已收块=36, 字节=8461），触发换渠道重试并熔断')
     assert sw.extract_channel_ids(line, host_map, ids) == {425}
 
 
 def test_extract_conn_eof_fans_out_to_host_channels():
-    host_map, ids = sw.build_watch_index(_rows())
+    host_map, ids, _params = sw.build_watch_index(_rows())
     line = '[ERR] ... upstream error: do request failed: Post "https://mazal.lol/v1/chat/completions": EOF'
     assert sw.extract_channel_ids(line, host_map, ids) == {425}
 
 
 def test_extract_ignores_non_migrated_channels():
     """CN 直连渠道的 EOF 不得触发换线 (P1: 防垃圾绑定)."""
-    host_map, ids = sw.build_watch_index(_rows())
+    host_map, ids, _params = sw.build_watch_index(_rows())
     line = '[INFO] ... 流中断：渠道 #56 传输异常中断（reason=eof），触发换渠道重试'
     assert sw.extract_channel_ids(line, host_map, ids) == set()
     line2 = '[ERR] ... do request failed: Post "https://api.feixingwawa.cn/v1/chat/completions": EOF'
@@ -60,7 +60,7 @@ def test_extract_ignores_non_migrated_channels():
 
 
 def test_extract_ignores_success_and_non_eof_lines():
-    host_map, ids = sw.build_watch_index(_rows())
+    host_map, ids, _params = sw.build_watch_index(_rows())
     # 渠道号出现但无 EOF 信标 -> 不计
     assert sw.extract_channel_ids("渠道 #425 恢复, 200 OK", host_map, ids) == set()
     # reason 非 eof/scanner_error -> 不计
@@ -129,3 +129,44 @@ def test_logtail_increment_truncation_rotation(tmp_path):
     p2.rename(p)
     got = t.poll()
     assert got == ["rotated"] and t.inode != old_ino
+
+
+# ---------------------------------------------------------------- 约束透传 (特定区域站点)
+
+def test_parse_channel_params_full():
+    p = sw.parse_channel_params(
+        "http://mangoapi-ch90__type_native_ipv4__region_hongkong__region_strict_true__tier_premium:***@127.0.0.1:9101")
+    assert p == {"egress_preference": "native_ipv4", "region": "hongkong",
+                 "tier": "premium", "region_strict": True}
+
+
+def test_parse_channel_params_region_only():
+    p = sw.parse_channel_params(
+        "http://mangoapi-ch90__type_clash_proxy__region_tw__service_mangoapi:***@127.0.0.1:9101")
+    assert p == {"egress_preference": "clash_proxy", "region": "tw",
+                 "tier": None, "region_strict": False}
+
+
+def test_parse_channel_params_no_constraints():
+    p = sw.parse_channel_params(
+        "http://mangoapi-ch11__type_clash_proxy__service_mangoapi:***@127.0.0.1:9101")
+    assert p == {"egress_preference": "clash_proxy", "region": None,
+                 "tier": None, "region_strict": False}
+
+
+def test_build_watch_index_carries_channel_params():
+    rows = _rows() + [
+        (90, "https://demo.dev2.mulink.top",
+         json.dumps({"proxy": "http://mangoapi-ch90__type_native_ipv4__region_hongkong__region_strict_true:***@127.0.0.1:9101"})),
+    ]
+    host_map, ids, params = sw.build_watch_index(rows)
+    assert ids == {425, 90} and 90 in host_map["demo.dev2.mulink.top"]
+    assert params[90]["region"] == "hongkong" and params[90]["region_strict"] is True
+    assert params[425]["region"] is None  # 无约束渠道不进 params
+
+
+def test_swap_due_unchanged_by_params():
+    """约束透传不得影响触发判定（swap_due 只看事件/冷却/日限）。"""
+    now = time.time()
+    ev = _events(90, 3, now)
+    assert sw.swap_due(90, now, ev, {}, {}, 0, cap_reached=False)
