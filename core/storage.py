@@ -382,8 +382,9 @@ class Storage:
                     fault_domain=CASE WHEN excluded.fault_domain != '' THEN excluded.fault_domain ELSE nodes.fault_domain END,
                     provider_region=CASE WHEN excluded.provider_region != '' THEN excluded.provider_region ELSE nodes.provider_region END,
                     -- probe_url: 节点级探活覆盖 (mesh CN 节点绕 GFW Cloudflare 段拦
-                    -- 截); 非空覆盖语义与 fault_domain 一致, yaml/DTO 为权威源
-                    probe_url=CASE WHEN excluded.probe_url != '' THEN excluded.probe_url ELSE nodes.probe_url END,
+                    -- 截)。无条件写入 —— yaml/DTO 为权威源, 移除字段即回默认阶梯
+                    -- (review 根修: 非空覆盖会让已移除的探活目标永驻 DB 且 check 不报)。
+                    probe_url=excluded.probe_url,
                     self_reported_at=COALESCE(excluded.self_reported_at, nodes.self_reported_at),
                     -- janitor 锚点: upsert 不得清掉既有 DEAD 倒计时 (探活恢复由
                     -- update_probe_result 清); 新节点携带的种子值也照写

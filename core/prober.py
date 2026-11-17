@@ -41,6 +41,15 @@ def select_probe_target(node: ProxyNode) -> tuple[str, bool]:
     return PROBE_URL_CF_TRACE, True
 
 
+def enforce_exit_contract(node: ProxyNode, exit_ip: str):
+    """出口契约校验 (与探活目标格式正交): warp_ipv6 节点必须探得 IPv6。
+
+    review 根修: 原 v6 校验只在 CF-trace 分支内, 节点级 probe_url 指向
+    纯文本目标时会静默绕过, v4 出口的 warp 节点被误判 healthy。"""
+    if node.egress_type == EgressType.WARP_IPV6.value and ":" not in (exit_ip or ""):
+        raise ValueError(f"Expected IPv6 egress for warp node, got: {exit_ip}")
+
+
 class Prober:
     def __init__(self, storage: Storage, router: Optional[Any] = None, timeout: float = DEFAULT_TIMEOUT):
         self.storage = storage
@@ -119,14 +128,12 @@ class Prober:
                     if is_cf_trace:
                         parsed = parse_cf_trace(text)
                         exit_ip = parsed.get("ip", "")
-                        if node.egress_type == EgressType.WARP_IPV6.value:
-                            if not exit_ip or ":" not in exit_ip:
-                                raise ValueError(f"Expected IPv6 in WARP trace, got: {exit_ip}")
-                        else:
-                            if not exit_ip:
-                                raise ValueError(f"Expected valid IP in trace, got: {exit_ip}")
+                        if not exit_ip:
+                            raise ValueError(f"Expected valid IP in trace, got: {exit_ip}")
                     else:
                         exit_ip = text
+                    # warp 出口契约与探活目标格式正交 (review 根修)
+                    enforce_exit_contract(node, exit_ip)
 
                     res = ProbeResult(
                         node_name=node.name,

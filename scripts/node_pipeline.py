@@ -354,12 +354,6 @@ function {fn}(config) {{
 // <<< NODE-PIPELINE:{group_name}:v1"""
 
 
-def is_standalone(group: dict) -> bool:
-    """standalone 桥核组 (bridge_core.type=standalone-mihomo, 如 teleapi):
-    节点只入 TetherPool, 不写 Clash Verge (Script.js/Merge.yaml/mihomo 活体)."""
-    return group_kind(group) == "standalone"
-
-
 def group_kind(group: dict) -> str:
     """组类型三态 (2026-11-18 mesh 宿主机收编):
     - 'standalone': bridge_core.type=standalone-mihomo — Mac 本地独立桥核 (teleapi)
@@ -379,7 +373,10 @@ def mesh_ports(group: dict) -> list[int]:
 
 
 def mesh_expected_entry(group: dict, i: int) -> dict:
-    """mesh 组第 i 个节点在 nodes.yaml 的期望条目 (节点级字段覆盖组级)."""
+    """mesh 组第 i 个节点在 nodes.yaml 的期望条目 (节点级字段覆盖组级).
+
+    这是 L3 比对与 heal 写入的唯一权威形态 —— 两处必须消费同一函数,
+    不得各自手写字段清单 (2026-11-18 review 根修: check/heal 契约对齐)。"""
     n = group["nodes"][i]
     spec = {
         "name": tether_names(group)[i],
@@ -388,7 +385,7 @@ def mesh_expected_entry(group: dict, i: int) -> dict:
         "protocol": "socks5h",
         "region": n.get("region") or group.get("region", ""),
         "egress_type": n.get("egress_type") or group.get("egress_type", "native_ipv4"),
-        "tags": (group.get("tags") or []) + ["mesh", "pipeline"],
+        "tags": list(dict.fromkeys((group.get("tags") or []) + ["mesh", "pipeline"])),
         "weight": n.get("weight") or group.get("weight", 100),
         "tier": n.get("tier") or group.get("tier", "standard"),
         "relay_mode": group.get("relay_mode", "direct_only"),
@@ -400,6 +397,25 @@ def mesh_expected_entry(group: dict, i: int) -> dict:
     if pu:
         spec["probe_url"] = pu
     return spec
+
+
+def mesh_yaml_drift(expected: dict, entry: dict) -> list[str]:
+    """L3 与 heal 共用的漂移判定: 双向全字段比对 (manifest 为权威源)。
+
+    - expected 有而 entry 不同 -> 漂移 (值错)
+    - entry 有而 expected 无   -> 漂移 (多余键, 如已移除的 probe_url 旧值 ——
+      否则移除字段永不清除且 check 不报, review P3 根修)"""
+    name = expected["name"]
+    drift = []
+    for f, v in expected.items():
+        if f == "name":
+            continue
+        if entry.get(f) != v:
+            drift.append(f"{name}({f} {entry.get(f)!r}≠{v!r})")
+    for f in entry:
+        if f != "name" and f not in expected:
+            drift.append(f"{name}({f} {entry.get(f)!r} 多余)")
+    return drift
 
 
 def socks5_probe_dial(host: str, port: int, timeout: float = 4.0) -> tuple[bool, str]:
@@ -545,11 +561,9 @@ def cmd_check(args):
         tnames = tether_names(group)
         # mesh 组端口来自节点自身 port (无桥接段); vendor 组走 realized_ports
         ports = mesh_ports(group) if mesh else realized_ports(group)
-        # standalone 桥核组 (bridge_core.type=standalone-mihomo, 如 teleapi):
-        # 节点只入 TetherPool, 不写 Clash Verge (Script.js/mihomo 活体) — L2 豁免,
-        # L4 只验自有核 listener 在位; L1/L3/L5 照常。
-        # mesh 宿主机组 (kind=mesh, 如 home-win): host=mesh IP 直连 — L2 豁免,
-        # L4 = 远端 socks5 拨测, L3 全字段比对; L1/L5 照常。
+        # 非 verge 组 (standalone 桥核 / mesh 宿主机) 均不进 Verge: L2 豁免。
+        # L4 差异: standalone 验自有核 listener; mesh 从 Mac 远端拨测宿主 socks5。
+        # L3 差异: mesh 用 mesh_yaml_drift 全字段比对 (与 heal 同源同语义)。
 
         # L1 manifest 内部完备性 (server 必填; username/password 成对 — http vendor
         # 语义; 协议型节点 (vless/hysteria2/tuic 等) 无 Basic Auth 概念, 凭据以
@@ -592,11 +606,7 @@ def cmd_check(args):
                 if not entry:
                     drift.append(f"{expected['name']}(缺失)")
                     continue
-                for field in ("host", "port", "region", "egress_type", "fault_domain", "probe_url"):
-                    if expected.get(field) and entry.get(field) != expected[field]:
-                        drift.append(f"{expected['name']}({field} {entry.get(field)}≠{expected[field]})")
-                if entry.get("weight") != expected["weight"]:
-                    drift.append(f"{expected['name']}(weight {entry.get('weight')}≠{expected['weight']})")
+                drift.extend(mesh_yaml_drift(expected, entry))
             all_ok &= layer("L3 nodes.yaml 注册", not drift, "一致" if not drift else str(drift[:4]))
         else:
             drift = []
@@ -621,13 +631,15 @@ def cmd_check(args):
                             f"listener {len(ports_up)}/{len(ports)} 在位 ({ports[0]}–{ports[-1]})")
         elif mesh:
             # mesh 宿主机组: 远端 socks5 拨测 (TCP + 05 01 00 -> 05 00),
-            # 从 Mac 侧拨 mesh IP —— 与 TetherPool prober 同路径。
-            dead = []
-            for i in range(len(group["nodes"])):
-                expected = mesh_expected_entry(group, i)
-                ok, why = socks5_probe_dial(expected["host"], expected["port"])
-                if not ok:
-                    dead.append(f"{expected['name']}({why})")
+            # 从 Mac 侧拨 mesh IP —— 与 TetherPool prober 同路径; 并发拨测
+            # 防节点数增长时 check 时长线性膨胀。
+            targets = [(mesh_expected_entry(group, i)["name"],
+                        mesh_expected_entry(group, i)["host"],
+                        mesh_expected_entry(group, i)["port"])
+                       for i in range(len(group["nodes"]))]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, max(1, len(targets)))) as ex:
+                results = list(ex.map(lambda t: socks5_probe_dial(t[1], t[2]), targets))
+            dead = [f"{targets[i][0]}({why})" for i, (ok, why) in enumerate(results) if not ok]
             all_ok &= layer("L4 mesh 宿主拨测", not dead,
                             f"{len(ports) - len(dead)}/{len(ports)} socks5 在位"
                             if not dead else str(dead[:4]))
@@ -997,23 +1009,25 @@ def cmd_heal(args):
     tnames = tether_names(group)
     ports = mesh_ports(group) if mesh else realized_ports(group)
     if mesh:
-        # mesh 组: 按 mesh_expected_entry 全字段对齐 (host=mesh IP / fault_domain /
-        # probe_url / weight / tier / region / egress_type), 缺则补、漂则修。
+        # mesh 组: 按 mesh_expected_entry 全字段对齐 (与 L3 共用 mesh_yaml_drift,
+        # 无条件写入 —— manifest 移除 probe_url 等字段时 yaml 同步清空)。
         expected_entries = [mesh_expected_entry(group, i) for i in range(len(group["nodes"]))]
         need_node_fix = any(
-            (e := by_name.get(x["name"])) is None
-            or any(e.get(f) != v for f, v in x.items() if f != "name" and v)
+            (e := by_name.get(x["name"])) is None or mesh_yaml_drift(x, e)
             for x in expected_entries)
         if need_node_fix:
-            log("[heal] 对齐 nodes.yaml (mesh: host/port/region/egress_type/fault_domain/probe_url/weight/tier)")
+            log("[heal] 对齐 nodes.yaml (mesh: 全字段对齐 + 多余键清除, manifest 为权威源)")
             backup(NODES_YAML, f"heal-{gname}")
             for x in expected_entries:
                 entry = by_name.get(x["name"])
                 if entry is None:
-                    ny["nodes"].append(x)
+                    ny["nodes"].append(dict(x))
                 else:
+                    for f in list(entry.keys()):
+                        if f != "name" and f not in x:
+                            del entry[f]  # 多余键清除 (如已移除的 probe_url)
                     for f, v in x.items():
-                        if f != "name" and v:
+                        if f != "name":
                             entry[f] = v
             atomic_write_text(NODES_YAML, yaml.dump(ny, allow_unicode=True, sort_keys=False, width=200))
             fixed.append("nodes.yaml")

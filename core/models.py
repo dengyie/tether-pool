@@ -75,12 +75,21 @@ class ProxyNode(BaseModel):
     # 探活 URL。CN 家宽/CN 机房 native 出口下 GFW 会拦 Cloudflare 段
     # (api.ipify.org / cdn-cgi/trace)，用可直达目标覆盖，如 https://ipinfo.io/ip
     # (纯 IP 文本)；空 = 按默认阶梯 (native_ipv4 -> ipify, 其余 -> CF trace)。
+    # yaml/DTO 为权威源, 移除字段即回默认阶梯 (upsert 无条件写入)。
     probe_url: str = ""
     # Node-side last liveness heartbeat (e.g. EasyTier peer timestamp).
     self_reported_at: Optional[str] = None
     # 连续 DEAD 锚点 (janitor 2026-11-15): DEAD 落锤时写, 离开 DEAD 清空。
     # 连续 24h -> 冻结 (frozen tag, 探活降频), 连续 7d -> 驱逐。
     dead_since: Optional[str] = None
+
+    @field_validator("probe_url")
+    @classmethod
+    def validate_probe_url(cls, v: str) -> str:
+        v = (v or "").strip()
+        if v and not v.lower().startswith(("http://", "https://")):
+            raise ValueError(f"probe_url must be empty or start with http(s)://, got: {v!r}")
+        return v
 
     @property
     def proxy_url(self) -> str:

@@ -74,12 +74,23 @@ def test_storage_probe_url_roundtrip(tmp_path):
     s = Storage(db_path=str(tmp_path / "t.db"))
     s.upsert_node(make_node(probe_url="https://ipinfo.io/ip"))
     assert s.get_node("mesh-x").probe_url == "https://ipinfo.io/ip"
-    # 非空覆盖语义 (与 fault_domain 一致): 空 probe_url 不擦除既有值
-    s.upsert_node(make_node(probe_url=""))
-    assert s.get_node("mesh-x").probe_url == "https://ipinfo.io/ip"
     # 换新值可覆盖
     s.upsert_node(make_node(probe_url="http://members.3322.org/dyndns/getip"))
     assert s.get_node("mesh-x").probe_url == "http://members.3322.org/dyndns/getip"
+    # 空值清除 (yaml/DTO 权威源, review 根修): 移除字段即回默认阶梯
+    s.upsert_node(make_node(probe_url=""))
+    assert s.get_node("mesh-x").probe_url == ""
+
+
+def test_probe_url_validator_rejects_non_http():
+    import pytest
+    from core.models import ProxyNode
+    with pytest.raises(Exception):
+        ProxyNode(name="x", host="h", port=1, region="cn", egress_type="native_ipv4", probe_url="ftp://x")
+    with pytest.raises(Exception):
+        ProxyNode(name="x", host="h", port=1, region="cn", egress_type="native_ipv4", probe_url="just-text")
+    n = ProxyNode(name="x", host="h", port=1, region="cn", egress_type="native_ipv4", probe_url=" https://ipinfo.io/ip ")
+    assert n.probe_url == "https://ipinfo.io/ip"  # strip + 放行 http(s)
 
 
 def test_loader_reads_probe_url(tmp_path, monkeypatch):
@@ -117,8 +128,6 @@ def test_group_kind_dispatch():
     assert np.group_kind({"kind": "mesh"}) == "mesh"
     assert np.group_kind({}) == "verge"
     assert np.group_kind({"kind": "mesh", "bridge_core": {"type": "standalone-mihomo"}}) == "standalone"
-    assert np.is_standalone({"bridge_core": {"type": "standalone-mihomo"}})
-    assert not np.is_standalone({"kind": "mesh"})
 
 
 def test_mesh_expected_entry_group_level():
@@ -280,3 +289,90 @@ def test_heal_mesh_group_writes_nodes_yaml(tmp_path, monkeypatch, capsys):
     assert healed[0]["weight"] == 50 and healed[0]["tier"] == "premium"
     out = capsys.readouterr().out
     assert "跳过 Script.js/Merge.yaml" in out   # JS 跳过声明 (mesh 不进 Verge)
+
+
+# ---------------------------------------------------------------- review 根修回归 (2026-11-18)
+
+def test_check_l3_flags_handwritten_yaml_missing_pipeline_tag(tmp_path, monkeypatch, capsys):
+    """负向: 手写 yaml 缺 pipeline tag (与 mesh_expected_entry 不同源) 时 L3 必须报漂移.
+
+    回归 guard: 原 L3 手写字段清单跳过 tags, check 全绿但 heal 会改写生产配置。"""
+    _g, tname = _write_mesh_env(tmp_path, monkeypatch)
+    ny = yaml.safe_load(open(np.NODES_YAML, encoding="utf-8"))
+    ny["nodes"][0]["tags"] = ["self_hosted", "mesh", "residential", "cmcc", "native"]  # 无 pipeline
+    np.NODES_YAML.write_text(yaml.dump(ny))
+    rc = np.cmd_check(argparse.Namespace())
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "tags" in out
+
+
+def test_heal_mesh_idempotent(tmp_path, monkeypatch, capsys):
+    """heal 收敛后二次执行必须零变更 (L3/heal 同源契约的直接后果)."""
+    _g, _t = _write_mesh_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(np, "SCRIPT_JS", tmp_path / "Script.js")
+    monkeypatch.setattr(np, "MERGE_YAML", tmp_path / "Merge.yaml")
+    monkeypatch.setattr(np, "restart_tetherpool", lambda: None)
+    ns = argparse.Namespace(group="mesh-home-win", force_js=False, restart_verge=False,
+                            realize=False, yes=True)
+    assert np.cmd_heal(ns) == 0
+    capsys.readouterr()
+    assert np.cmd_heal(ns) == 0
+    out2 = capsys.readouterr().out
+    assert "无需修复" in out2  # 幂等: 第二次零变更
+
+
+def test_heal_mesh_clears_removed_probe_url(tmp_path, monkeypatch, capsys):
+    """manifest 移除 probe_url -> heal 必须从 yaml 清除 (无条件写入语义)."""
+    _g, tname = _write_mesh_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(np, "SCRIPT_JS", tmp_path / "Script.js")
+    monkeypatch.setattr(np, "MERGE_YAML", tmp_path / "Merge.yaml")
+    monkeypatch.setattr(np, "restart_tetherpool", lambda: None)
+    # 从 manifest 移除 probe_url (模拟运维回退默认探活阶梯)
+    group_no_pu = {k: v for k, v in _g.items() if k != "probe_url"}
+    np.MANIFEST_PATH.write_text(yaml.dump({"groups": {"mesh-home-win": group_no_pu}}))
+    ns = argparse.Namespace(group="mesh-home-win", force_js=False, restart_verge=False,
+                            realize=False, yes=True)
+    assert np.cmd_heal(ns) == 0
+    healed = yaml.safe_load(open(np.NODES_YAML, encoding="utf-8"))["nodes"]
+    assert "probe_url" not in healed[0]  # 被清除而非保留旧值
+    capsys.readouterr()
+
+
+def test_loader_second_load_without_probe_url_clears_db(tmp_path, monkeypatch):
+    """yaml 移除 probe_url -> 二次 reload 后 DB 清空 (权威源语义端到端)."""
+    import api.server
+    cfg = tmp_path / "nodes.yaml"
+    with_probe = ("version: '1.0'\nnodes:\n"
+                  "- name: home-win-native-v4\n  host: 10.144.144.10\n  port: 10801\n"
+                  "  protocol: socks5h\n  region: cn\n  egress_type: native_ipv4\n"
+                  "  tags: [self_hosted, mesh]\n  fault_domain: home-win\n"
+                  "  probe_url: https://ipinfo.io/ip\n")
+    without_probe = with_probe.replace("  probe_url: https://ipinfo.io/ip\n", "")
+    cfg.write_text(with_probe, encoding="utf-8")
+    monkeypatch.setattr(api.server, "CONFIG_FILE", str(cfg))
+    api.server.load_initial_nodes()
+    assert api.server.storage.get_node("home-win-native-v4").probe_url == "https://ipinfo.io/ip"
+    cfg.write_text(without_probe, encoding="utf-8")
+    api.server.load_initial_nodes()
+    assert api.server.storage.get_node("home-win-native-v4").probe_url == ""
+
+
+def test_warp_exit_contract_enforced_regardless_of_probe_format():
+    """warp_ipv6 出口契约与探活目标格式正交: 纯文本 probe_url 探得 v4 也必须判失败."""
+    import pytest
+    from core.prober import enforce_exit_contract
+    warp = make_node(egress_type="warp_ipv6", probe_url="https://ipinfo.io/ip")
+    enforce_exit_contract(warp, "2a09:bac1:76c1:62b0::39d:59")  # v6 放行
+    with pytest.raises(ValueError):
+        enforce_exit_contract(warp, "183.193.163.187")  # v4 出口 -> 契约违约
+    native = make_node(egress_type="native_ipv4")
+    enforce_exit_contract(native, "183.193.163.187")  # native 不受 v6 契约约束
+
+
+def test_mesh_expected_entry_tags_dedup():
+    """组 tags 已含 mesh 时不得产生重复标签 (heal 写入权威形态)."""
+    g = make_mesh_group()  # tags 已含 'mesh'
+    e = np.mesh_expected_entry(g, 0)
+    assert e["tags"].count("mesh") == 1
+    assert "pipeline" in e["tags"]
