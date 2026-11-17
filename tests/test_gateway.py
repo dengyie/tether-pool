@@ -376,33 +376,67 @@ def _socketpair_streams():
     return a, b
 
 
+class _FakeWriter:
+    """pump_streams 只需 write/drain/can_write_eof/write_eof/close/wait_closed."""
+    def __init__(self):
+        self.closed = False
+    def write(self, data):
+        pass
+    async def drain(self):
+        pass
+    def can_write_eof(self):
+        return True
+    def write_eof(self):
+        pass
+    def close(self):
+        self.closed = True
+    async def wait_closed(self):
+        pass
+
+
+class _FakeReader:
+    """按序产出 chunk (异常对象即抛出), 耗尽后 b"" EOF; _hang=True 则永久挂起."""
+    def __init__(self, chunks=(), hang=False):
+        self._chunks = list(chunks)
+        self._hang = hang
+    async def read(self, n):
+        if self._chunks:
+            c = self._chunks.pop(0)
+            if isinstance(c, Exception):
+                raise c
+            return c
+        if self._hang:
+            await asyncio.Event().wait()  # 永不就绪 (仅被 cancel 打断)
+        return b""
+
+
 @pytest.mark.asyncio
-async def test_pump_streams_outcome_upstream_first():
-    """上游先断 (客户端仍开着) -> outcome=upstream_first (坏线路反馈信号)."""
-    import socket as _socket
-    ca, cb = _socketpair_streams()
-    ua, ub = _socketpair_streams()
-    r1, w1 = await asyncio.open_connection(sock=ca)
-    r2, w2 = await asyncio.open_connection(sock=ua)
-    task = asyncio.create_task(gateway_mod.pump_streams(r1, w1, r2, w2))
-    await asyncio.sleep(0.05)
-    ub.close()  # 上游侧先死
-    outcome = await asyncio.wait_for(task, timeout=12)
-    assert outcome == "upstream_first"
+async def test_pump_streams_outcome_upstream_reset():
+    """上游在客户端活跃时异常重置 (RST) -> outcome=upstream_reset (唯一反馈信号)."""
+    outcome = await asyncio.wait_for(
+        gateway_mod.pump_streams(_FakeReader(hang=True), _FakeWriter(),
+                                 _FakeReader([ConnectionResetError("rst")]), _FakeWriter()),
+        timeout=12)
+    assert outcome == "upstream_reset"
+
+
+@pytest.mark.asyncio
+async def test_pump_streams_outcome_upstream_eof_not_counted():
+    """上游 clean FIN 先到 (keep-alive 常规生命周期) -> upstream_eof, 不得反馈 (P0 根修)."""
+    outcome = await asyncio.wait_for(
+        gateway_mod.pump_streams(_FakeReader(hang=True), _FakeWriter(),
+                                 _FakeReader([b""], hang=False), _FakeWriter()),
+        timeout=12)
+    assert outcome == "upstream_eof"
 
 
 @pytest.mark.asyncio
 async def test_pump_streams_outcome_client_first():
     """客户端先收尾 -> outcome=client_first (正常完成)."""
-    import socket as _socket
-    ca, cb = _socketpair_streams()
-    ua, ub = _socketpair_streams()
-    r1, w1 = await asyncio.open_connection(sock=ca)
-    r2, w2 = await asyncio.open_connection(sock=ua)
-    task = asyncio.create_task(gateway_mod.pump_streams(r1, w1, r2, w2))
-    await asyncio.sleep(0.05)
-    cb.close()  # 客户端侧先收尾
-    outcome = await asyncio.wait_for(task, timeout=12)
+    outcome = await asyncio.wait_for(
+        gateway_mod.pump_streams(_FakeReader([b""], hang=False), _FakeWriter(),
+                                 _FakeReader(hang=True), _FakeWriter()),
+        timeout=12)
     assert outcome == "client_first"
 
 
@@ -416,14 +450,29 @@ async def test_midstream_eof_threshold_records_probe_failure(temp_gateway):
         status=HealthStatus.HEALTHY.value,
     ))
     for _ in range(gateway.MIDSTREAM_EOF_THRESHOLD - 1):
-        gateway._handle_midstream_eol("midstream-victim", "upstream_first")
+        gateway._handle_midstream_eol("midstream-victim", "upstream_reset")
     assert storage.get_node("midstream-victim").fail_count == 0  # 阈值前不动
-    gateway._handle_midstream_eol("midstream-victim", "upstream_first")  # 第 4 次
+    gateway._handle_midstream_eol("midstream-victim", "upstream_reset")  # 第 4 次
     await asyncio.sleep(0.1)  # to_thread 写入落地
     victim = storage.get_node("midstream-victim")
     assert victim.fail_count == 1
-    assert "gateway_midstream_eof" in (victim.circuit_state or "") or victim.status != "healthy"
     # 写后清零: 再来 1 次不再立即写入 (需重新累积)
-    gateway._handle_midstream_eol("midstream-victim", "upstream_first")
+    gateway._handle_midstream_eol("midstream-victim", "upstream_reset")
     await asyncio.sleep(0.1)
     assert storage.get_node("midstream-victim").fail_count == 1
+
+
+@pytest.mark.asyncio
+async def test_midstream_eof_non_reset_outcomes_never_feedback(temp_gateway):
+    """keep-alive clean FIN / 客户端中止 / 双侧异常 -> 永不写探活失败 (P0 根修)."""
+    gateway, storage, _router = temp_gateway
+    storage.upsert_node(ProxyNode(
+        name="innocent-node", host="10.144.144.3", port=10882,
+        region="tokyo", egress_type=EgressType.WARP_IPV6.value,
+        status=HealthStatus.HEALTHY.value,
+    ))
+    for outcome in ("upstream_eof", "client_first", "client_error", "both_error"):
+        for _ in range(gateway.MIDSTREAM_EOF_THRESHOLD + 2):
+            gateway._handle_midstream_eol("innocent-node", outcome)
+    await asyncio.sleep(0.1)
+    assert storage.get_node("innocent-node").fail_count == 0

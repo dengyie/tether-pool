@@ -268,11 +268,15 @@ async def pump_streams(r1: asyncio.StreamReader, w1: asyncio.StreamWriter, r2: a
     finish. Cancelling both directions on first completion truncated HTTP CONNECT
     responses whenever the client half-closed early.
 
-    Returns the relay outcome (2026-11-18 流中级 EOF 反馈):
-    - 'client_first'  : 客户端侧先收尾 (正常完成/客户端主动断)
-    - 'upstream_first': 上游在客户端仍活跃时先断 —— 线路或上游过早断开的信号,
-      调用方据此做节点级阈值反馈 (坏线路自动退出分配)
-    - 'both_error'    : 双侧均异常收尾
+    Returns the relay outcome (2026-11-18 流中级 EOF 反馈, review 二次根修):
+    - 'upstream_reset': 上游在客户端仍活跃时异常重置 (RST/error) —— 唯一计入
+      节点反馈的信号 (线路故障与上游崩溃的公共形态)。
+    - 'upstream_eof'  : 上游 clean FIN 先到 —— 不计入。keep-alive 的常规生命周期
+      (服务端 idle timeout / Connection: close 响应后关连接), 计入会以每分钟
+      数十次的频率误杀健康节点 (review P0 根修)。
+    - 'client_first' / 'client_error': 客户端先收尾/中止 —— 不计入 (客户端
+      行为; 客户端中止后上游跟着 RST 属正常传播)。
+    - 'both_error'    : 双侧异常 —— 不计入 (歧义)。
     """
     async def _forward(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
@@ -300,12 +304,13 @@ async def pump_streams(r1: asyncio.StreamReader, w1: asyncio.StreamWriter, r2: a
     t2 = asyncio.create_task(_forward(r2, w1))  # 读上游
     try:
         done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
-        first_client = t1 in done
-        first_outcome = "eof"
-        for t in done:
-            res = t.result()
-            if res == "error":
-                first_outcome = "error"
+        t1_done, t1_res = t1 in done, None
+        t2_done, t2_res = t2 in done, None
+        # FIRST_COMPLETED 阶段任务不可能被 cancel, result() 安全
+        if t1_done:
+            t1_res = t1.result()
+        if t2_done:
+            t2_res = t2.result()
         for task in pending:
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=HALF_CLOSE_GRACE_SECONDS)
@@ -324,20 +329,17 @@ async def pump_streams(r1: asyncio.StreamReader, w1: asyncio.StreamWriter, r2: a
                 await w.wait_closed()
             except Exception:
                 pass
-    if first_outcome == "error":
-        return "both_error"
-    if first_client:
-        # 客户端先收尾; 若上游在宽限期内异常死亡同样算过早断。
-        # finally 已 cancel 未完成任务, result() 对 cancelled 任务抛 CancelledError
-        # 必须防御 (review 修正)。
-        upstream_res = None
-        if t2.done() and not t2.cancelled():
-            try:
-                upstream_res = t2.result()
-            except Exception:
-                upstream_res = "error"
-        return "upstream_first" if upstream_res == "error" else "client_first"
-    return "upstream_first"
+    # 分类 (review 二次根修): 只有「客户端仍活跃 + 上游异常重置」才反馈。
+    # 宽限期内对端行为受先断侧影响 (客户端中止 -> 上游跟着 RST 属正常传播),
+    # 故只看 FIRST_COMPLETED 阶段, 不看宽限期; finally cancel 后 result() 会抛
+    # CancelledError, 未完成任务一律视作 client 侧延续。
+    if t2_done and t2_res == "error" and not t1_done:
+        return "upstream_reset"
+    if t1_done:
+        return "client_first" if t1_res == "eof" else "client_error"
+    if t2_done:
+        return "upstream_eof"
+    return "both_error"
 
 
 class ParsedCredentials:
@@ -657,6 +659,8 @@ class ForwardProxyGateway:
         (断路器 degrade/exclude), 写入后清零重新累积。与 CONNECT 失败反馈互补:
         CONNECT 失败管建连层, 这里管隧道建立后的流中断层 —— 坏线路在两个层面
         都会被自动退出分配, 不再依赖消费方日志 scraping 才能发现。"""
+        if outcome != "upstream_reset":
+            return  # 防御纵深: 非 reset 语义一律不计 (调用点已过滤, 双保险)
         try:
             dq = self._midstream_eof.setdefault(node_name, collections.deque())
             now = time.time()
@@ -1268,7 +1272,7 @@ class ForwardProxyGateway:
                     client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                     await client_writer.drain()
                     outcome = await pump_streams(client_reader, client_writer, remote_reader, remote_writer)
-                    if outcome in ("upstream_first", "both_error"):
+                    if outcome == "upstream_reset":
                         self._handle_midstream_eol(upstream_node.name, outcome)
                 finally:
                     remote_writer.close()
@@ -1358,7 +1362,7 @@ class ForwardProxyGateway:
                     await remote_writer.drain()
 
                     outcome = await pump_streams(client_reader, client_writer, remote_reader, remote_writer)
-                    if outcome in ("upstream_first", "both_error"):
+                    if outcome == "upstream_reset":
                         self._handle_midstream_eol(upstream_node.name, outcome)
                 finally:
                     remote_writer.close()
