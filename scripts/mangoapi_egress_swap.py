@@ -123,8 +123,8 @@ def swap_due(cid, now, eof_events, last_swap, last_fail, swapped_count, cap_reac
     return not cap_reached
 
 
-def tp_request(path, token, timeout=15):
-    req = urllib.request.Request(TP_BASE + path)
+def tp_request(path, token, timeout=15, method="GET"):
+    req = urllib.request.Request(TP_BASE + path, method=method)
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -132,25 +132,21 @@ def tp_request(path, token, timeout=15):
 
 
 def rebalance(cid, token):
-    """对该渠道账号强制换绑；返回 (ok, detail)。"""
+    """对该渠道账号强制换绑；返回 (ok, detail)。
+
+    - acquire 是 POST-only 写端点 (GET 405, review 二次根修: urllib 默认 GET)。
+    - 约束参数名是 **egress_preference** (/v1/allocation/acquire 端点签名;
+      `type=` 会被 FastAPI 静默忽略并回落默认 warp_ipv6, review 三次根修)。
+      带 clash_proxy 与渠道 typed URL 约束一致, 绑定一次落位。
+    - force_rebalance 本身保证换新节点; /v1/allocation/status 只有全局摘要
+      无 per-account 视图, exclude_node 不可用, 不做无用调用。"""
     acct = f"mangoapi-ch{cid}"
+    q = (f"/v1/allocation/acquire?service=mangoapi&account_id={acct}"
+         f"&force_rebalance=true&avoid_banned=true&egress_preference=clash_proxy")
     try:
-        cur = tp_request(f"/v1/allocation/status?service=mangoapi&account_id={acct}", token)
-        node = (cur.get("allocation") or cur).get("node_name") if isinstance(cur, dict) else None
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            node = None  # 尚无绑定, 直接 acquire 建绑
-        else:
-            return False, f"status http {e.code}"
-    except Exception as e:
-        return False, f"status {e}"
-    q = f"/v1/allocation/acquire?service=mangoapi&account_id={acct}&force_rebalance=true&avoid_banned=true"
-    if node:
-        q += f"&exclude_node={urllib.parse.quote(node)}"
-    try:
-        r = tp_request(q, token)
+        r = tp_request(q, token, method="POST")
         new_node = (r.get("allocation") or r).get("node_name") if isinstance(r, dict) else None
-        return True, f"{node} -> {new_node}"
+        return True, f"-> {new_node}"
     except urllib.error.HTTPError as e:
         return False, f"acquire http {e.code}"
     except Exception as e:
