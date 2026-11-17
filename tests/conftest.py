@@ -2,6 +2,8 @@
 tests/conftest.py - Pytest fixtures and test environment isolation
 """
 
+import os
+
 import pytest
 from core.storage import Storage
 from core.router import Router
@@ -9,6 +11,19 @@ from core.prober import Prober
 from core.metrics import MetricsCollector
 from core.allocator import AllocationEngine
 import api.server
+
+
+def cleanup_sqlite_artifacts(db_path: str) -> None:
+    """Remove a temp SQLite DB plus its -wal/-shm sidecars.
+
+    2026-11-17 生产取证: /tmp (987M tmpfs) 被撑爆——历次在生产机跑 pytest 的
+    fixture 只 os.remove 主 db, Storage 关闭后残留的 40M 级 -wal 副产物累计
+    1048 个 811M。各 fixture 的清理统一走这里。"""
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.remove(db_path + suffix)
+        except FileNotFoundError:
+            pass
 
 
 @pytest.fixture(autouse=True)

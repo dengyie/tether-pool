@@ -43,7 +43,8 @@ def temp_pool():
     yield router, storage
 
     if os.path.exists(db_path):
-        os.remove(db_path)
+        from tests.conftest import cleanup_sqlite_artifacts
+        cleanup_sqlite_artifacts(db_path)
 
 
 def _bind_pinned(router, storage, account_id="ag_vrf1", service="default"):

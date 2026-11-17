@@ -28,7 +28,8 @@ def storage():
     f.close()
     s = Storage(db_path=f.name)
     yield s
-    os.unlink(f.name)
+    from tests.conftest import cleanup_sqlite_artifacts
+    cleanup_sqlite_artifacts(f.name)
 
 
 def _mk_node(s, name, exit_ip=None, isp=None, region="us-west", egress=EgressType.CLASH_PROXY.value, tier="standard"):

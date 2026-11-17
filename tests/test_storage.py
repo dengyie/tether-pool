@@ -16,7 +16,8 @@ def temp_storage():
     storage = Storage(db_path=db_path)
     yield storage
     if os.path.exists(db_path):
-        os.remove(db_path)
+        from tests.conftest import cleanup_sqlite_artifacts
+        cleanup_sqlite_artifacts(db_path)
 
 
 def test_upsert_and_get_node(temp_storage):

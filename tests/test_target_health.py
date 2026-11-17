@@ -95,7 +95,8 @@ def temp_router():
         storage.upsert_node(n)
     yield router, storage
     if os.path.exists(db_path):
-        os.remove(db_path)
+        from tests.conftest import cleanup_sqlite_artifacts
+        cleanup_sqlite_artifacts(db_path)
 
 
 def _bind(router, storage, account, node):
@@ -254,7 +255,8 @@ def test_gateway_counts_and_renders_steers():
         summary = gateway.relay_summary()
         assert summary["target_steers"] == {"google": 3, "openai": 1}
     finally:
-        os.remove(f.name)
+        from tests.conftest import cleanup_sqlite_artifacts
+        cleanup_sqlite_artifacts(f.name)
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +291,8 @@ def test_storage_connection_reuse_semantics():
         assert storage.get_node("reuse-01").name == "reuse-01"
         _ = _dt.now()
     finally:
-        os.remove(f.name)
+        from tests.conftest import cleanup_sqlite_artifacts
+        cleanup_sqlite_artifacts(f.name)
 
 
 def test_hub_cache_serves_within_ttl(temp_router):
@@ -350,7 +353,8 @@ def test_gateway_metrics_buffered_and_flushed():
         assert any("attempts_per_request" in n for n in names), "flush 后落库"
         assert gw._metrics_buffer == []
     finally:
-        os.remove(f.name)
+        from tests.conftest import cleanup_sqlite_artifacts
+        cleanup_sqlite_artifacts(f.name)
 
 
 def test_tracker_prunes_deleted_nodes():

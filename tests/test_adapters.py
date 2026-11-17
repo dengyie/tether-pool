@@ -40,8 +40,8 @@ def temp_adapter_env():
 
     yield storage, router
 
-    if os.path.exists(db_path):
-        os.remove(db_path)
+    from tests.conftest import cleanup_sqlite_artifacts
+    cleanup_sqlite_artifacts(db_path)
 
 
 def test_gemini_adapter(temp_adapter_env):

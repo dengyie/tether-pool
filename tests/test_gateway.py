@@ -22,7 +22,8 @@ def temp_gateway():
     gateway = ForwardProxyGateway(storage, router, host="127.0.0.1", port=0)
     yield gateway, storage, router
     if os.path.exists(db_path):
-        os.remove(db_path)
+        from tests.conftest import cleanup_sqlite_artifacts
+        cleanup_sqlite_artifacts(db_path)
 
 
 def test_extract_routing_headers(temp_gateway):
