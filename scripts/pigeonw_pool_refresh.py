@@ -36,6 +36,11 @@ MAX_PORT = 12099          # 槽位扩容上限
 PROBE_POOL = 39101        # 临时探活监听段 (避开 sub 刷新的 39001)
 KEEP_BACKUPS = 7
 PROXY_PREFIX = "PIGEONW-"
+# 2026-11-19 可用性根修: 死链接计数 (连续 3 轮 fetch 失败/空订阅 → 淘汰本源全部节点)
+from refresh_death_state import bump_failure, clear_failure
+DEATH_STATE = "/opt/ip-pool/data/refresh_death_fails.json"
+DEATH_KEY = "PIGEONW"
+DEATH_AFTER = int(os.environ.get("PIGEONW_DEATH_AFTER", "3"))
 LISTENER_PREFIX = "pigeonw-bridge-"
 NODE_RE = re.compile(r"^clash-(3\d\d)-pigeonw-(\d+)$")
 
@@ -111,9 +116,26 @@ def main():
         print("[PIGEONW_REFRESH_SKIP] another refresh is running", file=sys.stderr)
         return 0
     try:
-        fetched = fetch_and_parse()
+        force_drop = False
+        try:
+            fetched = fetch_and_parse()
+            clear_failure(DEATH_STATE, DEATH_KEY)
+        except Exception as e:
+            fails = bump_failure(DEATH_STATE, DEATH_KEY)
+            if fails >= DEATH_AFTER:
+                fetched = []
+                force_drop = True
+                print(f"[PIGEONW_SOURCE_DEAD] {e}; 连续 {fails}/{DEATH_AFTER} 轮失效 "
+                      f"→ 淘汰本源全部节点 (listeners/nodes.yaml/绑定随重建链路逐级回收)",
+                      file=sys.stderr)
+            else:
+                print(f"[PIGEONW_REFRESH_FAIL] {e}; 连续失效 {fails}/{DEATH_AFTER} 轮, "
+                      f"keep current state", file=sys.stderr)
+                return 1
         if not fetched:
-            print("[PIGEONW_REFRESH_FAIL] fetch empty, keep current state", file=sys.stderr)
+            fails = bump_failure(DEATH_STATE, DEATH_KEY)
+            print(f"[PIGEONW_REFRESH_FAIL] fetch empty (连续 {fails}/{DEATH_AFTER} 轮), "
+                  f"keep current state", file=sys.stderr)
             return 1
         # 订阅条目统一改名 PIGEONW-NNN 在匹配后再定; 先去重 (重名会硬失败 mihomo -t)
         seen = set()
@@ -126,7 +148,7 @@ def main():
         print(f"fetched {len(fetched)} proxies from pigeonw")
         alive = probe_via_listeners(fetched)
         print(f"alive {len(alive)}/{len(fetched)}")
-        if len(alive) < 3:
+        if len(alive) < 3 and not force_drop:
             print("[PIGEONW_REFRESH_FAIL] alive too few (%d/%d), keep current state" % (
                 len(alive), len(fetched)), file=sys.stderr)
             return 1

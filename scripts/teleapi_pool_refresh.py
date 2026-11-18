@@ -39,6 +39,11 @@ PROBE_POOL = 39401        # 临时探活监听段 (四个既有段之外)
 PROBE_DIR = "/tmp/mihomo-probe-teleapisub"
 KEEP_BACKUPS = 7
 PROXY_PREFIX = "TELEAPISUB-"
+# 2026-11-19 可用性根修: 死链接计数 (连续 3 轮 fetch 失败/空订阅 → 淘汰本源全部节点)
+from refresh_death_state import bump_failure, clear_failure
+DEATH_STATE = "/opt/ip-pool/data/refresh_death_fails.json"
+DEATH_KEY = "TELEAPISUB"
+DEATH_AFTER = int(os.environ.get("TELEAPISUB_DEATH_AFTER", "3"))
 LISTENER_PREFIX = "teleapisub-bridge-"
 NODE_RE = re.compile(r"^clash-6\d{3}-teleapisub-\d+$")
 
@@ -127,9 +132,26 @@ def main():
         print("[TELEAPISUB_REFRESH_SKIP] another refresh is running", file=sys.stderr)
         return 0
     try:
-        fetched = fetch_and_parse()
+        force_drop = False
+        try:
+            fetched = fetch_and_parse()
+            clear_failure(DEATH_STATE, DEATH_KEY)
+        except Exception as e:
+            fails = bump_failure(DEATH_STATE, DEATH_KEY)
+            if fails >= DEATH_AFTER:
+                fetched = []
+                force_drop = True
+                print(f"[TELEAPISUB_SOURCE_DEAD] {e}; 连续 {fails}/{DEATH_AFTER} 轮失效 "
+                      f"→ 淘汰本源全部节点 (listeners/nodes.yaml/绑定随重建链路逐级回收)",
+                      file=sys.stderr)
+            else:
+                print(f"[TELEAPISUB_REFRESH_FAIL] {e}; 连续失效 {fails}/{DEATH_AFTER} 轮, "
+                      f"keep current state", file=sys.stderr)
+                return 1
         if not fetched:
-            print("[TELEAPISUB_REFRESH_FAIL] fetch empty, keep current state", file=sys.stderr)
+            fails = bump_failure(DEATH_STATE, DEATH_KEY)
+            print(f"[TELEAPISUB_REFRESH_FAIL] fetch empty (连续 {fails}/{DEATH_AFTER} 轮), "
+                  f"keep current state", file=sys.stderr)
             return 1
         # 订阅内部重名去重 (重名会硬失败 mihomo -t)
         seen = set()
@@ -152,7 +174,7 @@ def main():
         print(f"fetched {len(fetched)} proxies from teleapisub")
         alive = probe_via_listeners(fetched)
         print(f"alive {len(alive)}/{len(fetched)}")
-        if len(alive) < 30:
+        if len(alive) < 30 and not force_drop:
             print("[TELEAPISUB_REFRESH_FAIL] alive too few (%d/%d), keep current state" % (
                 len(alive), len(fetched)), file=sys.stderr)
             return 1

@@ -230,3 +230,38 @@ def test_probe_forwards_extra_relays(monkeypatch):
     spr.probe_via_listeners([{"name": "s3-x"}], extra_proxies=[{"name": "SKYWARD-01"}])
     assert calls["proxies"] == [{"name": "s3-x"}]
     assert calls["extra"] == [{"name": "SKYWARD-01"}]
+
+
+# ---------------------------------------------------------------- 死链接淘汰 (2026-11-19 review 根修)
+
+def test_apply_source_failure_counts_to_death():
+    """PermanentSubError 连续 3 轮 → 判源死亡 (got=空, SUB_SOURCE_DEAD 标记)."""
+    fails = {}
+    carried = [{"name": "s1-a"}]
+    err = spr.PermanentSubError("HTTP 410 Gone")
+    got, msg = spr.apply_source_failure(fails, 1, err, carried, 3)
+    assert got == carried and fails["1"] == 1 and "FROZEN" in msg
+    got, msg = spr.apply_source_failure(fails, 1, err, carried, 3)
+    assert got == carried and fails["1"] == 2
+    got, msg = spr.apply_source_failure(fails, 1, err, carried, 3)
+    assert got == [] and fails["1"] == 3 and "SUB_SOURCE_DEAD" in msg
+
+
+def test_apply_source_failure_rate_limited_never_counts():
+    """429 限速是瞬时的, 不计入死亡判定 (重试语义归 RateLimitedSubError)。"""
+    fails = {}
+    err = spr.RateLimitedSubError("HTTP 429", retry_after=10)
+    for _ in range(5):
+        got, msg = spr.apply_source_failure(fails, 2, err, [{"name": "x"}], 3)
+        assert got == [{"name": "x"}]
+    assert fails == {}
+    assert "THROTTLED" in msg
+
+
+def test_apply_source_failure_revive_resets_counter():
+    """成功路径 pop 计数后, 再次失效从 0 重新累计 (链接复活又死是新一轮)。"""
+    fails = {"1": 2}
+    fails.pop("1")  # main 内成功分支的清零语义
+    err = spr.PermanentSubError("HTTP 404")
+    spr.apply_source_failure(fails, 1, err, [], 3)
+    assert fails["1"] == 1

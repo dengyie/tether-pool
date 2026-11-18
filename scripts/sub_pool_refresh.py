@@ -209,6 +209,26 @@ def region_of(name):
         cc = _EN_REGION[m.group(0).rstrip("0123456789").lower()] if m else None
     return "us-west" if cc == "us" else (cc or "misc")
 
+def apply_source_failure(src_fails: dict, src_idx: int, error: Exception,
+                         carried: list, death_after: int) -> tuple[list, str]:
+    """失效计数与淘汰判定 (2026-11-19 review 根修, 纯函数便于测试)。
+
+    PermanentSubError (410/404/401 = 链接冻结/失效) 累计计数; 连续 death_after 轮
+    → 判源死亡: 返回空节点集 (该源全部节点随重建链路逐级回收: listeners/
+    nodes.yaml/悬空绑定清理/PRUNE_MISSING_NODES)。RateLimitedSubError (429
+    = 瞬时) 不计数, 沿用 carry-over。返回 (本轮节点集, 日志行)。"""
+    if isinstance(error, PermanentSubError):
+        n_fail = src_fails.get(str(src_idx), 0) + 1
+        src_fails[str(src_idx)] = n_fail
+        if n_fail >= death_after:
+            return [], (f"[SUB_SOURCE_DEAD] SUB{src_idx}: {error}; 连续 {n_fail} 轮永久失效 "
+                        f"→ 淘汰该源全部节点 (本轮移除 carried {len(carried)} 条, "
+                        f"listeners/nodes.yaml/绑定随重建链路逐级回收)")
+        return carried, (f"[SUB_SOURCE_FROZEN] SUB{src_idx}: {error}; 永久失效 {n_fail}/{death_after} 轮, "
+                         f"暂 carry {len(carried)} previous nodes")
+    return carried, (f"[SUB_SOURCE_THROTTLED] SUB{src_idx}: {error}; carrying {len(carried)} previous nodes")
+
+
 def main():
     import yaml
     lock_fd = open(LOCK, "w")
@@ -237,18 +257,30 @@ def main():
                 print(f"[SUB_RELAY_FAIL] SUB{src_idx}_RELAY={relay} not in bridge config; "
                       f"this source stays direct", file=sys.stderr)
 
+        # 2026-11-19 review 根修: 死链接节点淘汰。PermanentSubError (410/404/401
+        # = 链接冻结/失效) 连续 SUB_SOURCE_DEATH_AFTER 轮后, 该源视为死亡:
+        # 不再 carry-over, 其节点随本轮重建链路整体消失 (listeners/nodes.yaml/
+        # 悬空绑定清理/PRUNE_MISSING_NODES 逐级回收)。瞬时失败 (超时/限速) 不计数。
+        FAILS_STATE = Path("/opt/ip-pool/data/sub_source_fails.json")
+        DEATH_AFTER = int(os.environ.get("SUB_SOURCE_DEATH_AFTER", "3"))
+        try:
+            src_fails = json.loads(FAILS_STATE.read_text()) if FAILS_STATE.exists() else {}
+        except Exception:
+            src_fails = {}
+
         proxies, seen_names, seen_up, ok_any, dropped = [], set(), set(), False, 0
         for src_idx, url in sources:
             try:
                 got = fetch_and_parse(url)
                 ok_any = True
+                if src_fails.pop(str(src_idx), None) is not None:
+                    print(f"[SUB_SOURCE_REVIVED] SUB{src_idx}: 重新可用, 失效计数清零",
+                          file=sys.stderr)
                 print(f"SUB{src_idx}: fetched {len(got)} proxies")
             except (PermanentSubError, RateLimitedSubError) as e:
-                # 冻结/失效/限速: 重试无意义或有害, 沿用上一轮条目, 由日志告警人工处理
-                tag = "SUB_SOURCE_FROZEN" if isinstance(e, PermanentSubError) else "SUB_SOURCE_THROTTLED"
-                got = [dict(p) for p in old_sub if str(p.get("name", "")).startswith(f"s{src_idx}-")]
-                print(f"[{tag}] SUB{src_idx}: {e}; carrying {len(got)} previous nodes",
-                      file=sys.stderr)
+                carried = [dict(p) for p in old_sub if str(p.get("name", "")).startswith(f"s{src_idx}-")]
+                got, msg = apply_source_failure(src_fails, src_idx, e, carried, DEATH_AFTER)
+                print(msg, file=sys.stderr)
             except Exception as e:
                 # 单源失败不中止: 沿用该源上一轮条目, 其余源照常刷新
                 got = [dict(p) for p in old_sub if str(p.get("name", "")).startswith(f"s{src_idx}-")]
@@ -268,6 +300,15 @@ def main():
                 seen_names.add(n)
                 p["name"] = n
                 proxies.append(p)
+
+        # 失效计数持久化 (原子写; 成功/复活已在循环内清零) —— 跨轮累计是
+        # 死亡判定的基础, 状态丢失会让死链接永不淘汰
+        try:
+            from atomic_yaml import atomic_write_text
+            atomic_write_text(FAILS_STATE, json.dumps(src_fails, ensure_ascii=False, indent=1))
+        except Exception as e:
+            print(f"[SUB_SOURCE_STATE] 失效计数落盘失败: {e}", file=sys.stderr)
+
         if not ok_any:
             print("[SUB_REFRESH_FAIL] all sources failed, keep current state", file=sys.stderr)
             return 1
