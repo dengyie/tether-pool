@@ -98,3 +98,58 @@ def test_cmd_import_cleans_bridge_yaml_on_validation_failure(tmp_path, monkeypat
     assert rc == 2
     assert not (tmp_path / "config/gtest-bridge.yaml").exists(), "校验失败必须清理残留核配置"
     assert manifest["groups"] == {}, "校验失败不得写 manifest"
+
+
+def test_cmd_relay_on_cleans_stale_dialer_on_relay_defs(tmp_path, monkeypatch):
+    """2026-11-19 review P1 根修回归: 提拔新中继时, 中继定义 (新旧) 上的历史
+    dialer 必须清掉 —— 残留会形成链式双跳, 且 watchdog current_relay() 读到
+    多值判 AMBIGUOUS 静默失效 (今晚 Oregon→Tokyo 割接实测 140 节点含定义)。"""
+    (tmp_path / "config").mkdir()
+    bridge = tmp_path / "config" / "g-bridge.yaml"
+    bridge.write_text(yaml.dump({"proxies": [
+        {"name": "[自建] Old-Relay", "type": "vless", "server": "a", "port": 443,
+         "dialer-proxy": "[自建] Old-Relay"},   # 上一次割接给旧中继留下的残值
+        {"name": "[自建] New-Relay", "type": "vless", "server": "b", "port": 443,
+         "dialer-proxy": "[自建] Old-Relay"},   # 新中继定义也带着旧 dialer
+        {"name": "node-1", "type": "http", "server": "s", "port": 1},
+    ]}))
+    relay_file = tmp_path / "relay-nodes.local.yaml"
+    relay_file.write_text(yaml.dump({"relay_nodes": [
+        {"name": "[自建] Old-Relay", "type": "vless", "server": "a", "port": 443},
+        {"name": "[自建] New-Relay", "type": "vless", "server": "b", "port": 443},
+    ]}))
+    monkeypatch.setattr(isa, "REPO", tmp_path)
+    monkeypatch.setattr(isa, "RELAY_LOCAL_YAML", relay_file)
+
+    rc = isa.cmd_relay(argparse.Namespace(group="g", mode="on",
+                                          relay_node="[自建] New-Relay"))
+    assert rc == 0
+    cfg = yaml.safe_load(open(bridge))
+    by_name = {p["name"]: p for p in cfg["proxies"]}
+    assert by_name["node-1"]["dialer-proxy"] == "[自建] New-Relay"
+    # 全部中继定义 (新旧) 均不得接线或残留 dialer —— 否则链式双跳 + watchdog AMBIGUOUS
+    assert "dialer-proxy" not in by_name["[自建] New-Relay"]
+    assert "dialer-proxy" not in by_name["[自建] Old-Relay"]
+
+
+def test_cmd_relay_on_injects_from_local_file(tmp_path, monkeypatch):
+    (tmp_path / "config").mkdir()
+    bridge = tmp_path / "config" / "g-bridge.yaml"
+    bridge.write_text(yaml.dump({"proxies": [
+        {"name": "node-1", "type": "http", "server": "s", "port": 1},
+    ]}))
+    relay_file = tmp_path / "relay-nodes.local.yaml"
+    relay_file.write_text(yaml.dump({"relay_nodes": [
+        {"name": "[自建] R1", "type": "vless", "server": "1.2.3.4", "port": 443,
+         "uuid": "u-1"},
+    ]}))
+    monkeypatch.setattr(isa, "REPO", tmp_path)
+    monkeypatch.setattr(isa, "RELAY_LOCAL_YAML", relay_file)
+
+    rc = isa.cmd_relay(argparse.Namespace(group="g", mode="on", relay_node="[自建] R1"))
+    assert rc == 0
+    cfg = yaml.safe_load(open(bridge))
+    by_name = {p["name"]: p for p in cfg["proxies"]}
+    assert by_name["node-1"]["dialer-proxy"] == "[自建] R1"
+    assert by_name["[自建] R1"]["uuid"] == "u-1"      # 定义被完整注入
+    assert "dialer-proxy" not in by_name["[自建] R1"]  # 且自身无 dialer

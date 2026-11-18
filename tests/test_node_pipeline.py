@@ -140,6 +140,27 @@ def test_js_block_drift_detects_field_change():
     assert np.js_block_drift("t", group, "// no block") == ["<block-missing:t>"]
 
 
+def test_js_block_drift_detects_dialer_proxy_change():
+    """中继割接只改 manifest 的 dialer_proxy, 节点字段全不变 — 漂移判定必须覆盖 (2026-11-19 教训)."""
+    group = make_group()
+    group["dialer_proxy"] = "[自建] 🇯🇵VLESS-AWS-Tokyo-Reality"
+    script = "// a\n// ==================== Mihomo 节点兼容 ====================\n"
+    script = np.upsert_js_block(script, "t", np.gen_group_js("t", group))
+    assert np.js_block_drift("t", group, script) == []
+
+    # 中继换到另一节点: 节点字段零变化, 旧版检测漏报 → heal 静默空转
+    switched = json.loads(json.dumps(group))
+    switched["dialer_proxy"] = "[自建] 🇺🇸VLESS-AWS-Oregon-Reality"
+    assert np.js_block_drift("t", switched, script) == ["<dialer-proxy>"]
+
+    # 直连组 (dialer_proxy 缺失/null) 也不误报
+    direct = json.loads(json.dumps(group))
+    del direct["dialer_proxy"]
+    direct_script = np.upsert_js_block("// a\n", "t", np.gen_group_js("t", direct))
+    assert np.js_block_drift("t", direct, direct_script) == []
+    assert np.parse_managed_dialer(direct_script, "t") == (None, True)
+
+
 def test_js_block_drift_detects_udp_and_type_regression():
     """重构覆盖清洗逻辑时 (丢 udp/type), 漂移判定必须仍能拦截."""
     group = make_group()
@@ -155,7 +176,10 @@ def test_js_block_drift_detects_udp_and_type_regression():
     begin = np.BLOCK_BEGIN.format(group="t")
     end = np.BLOCK_END.format(group="t")
     body = script.split(begin, 1)[1].split(end, 1)[1]
-    script_dirty = script.split(begin, 1)[0] + begin + "\n  nodes: [\n      " + raw + "\n  ],\n" + end + body
+    # 手拼旧版块须带 dialerProxy 行 (与 gen 格式一致), 否则 dialer 漂移检测会额外报 <dialer-proxy>
+    script_dirty = (script.split(begin, 1)[0] + begin
+                    + '\n  dialerProxy: "[自建] AWS",\n  nodes: [\n      ' + raw + "\n  ],\n"
+                    + end + body)
     drift = np.js_block_drift("t", dirty, script_dirty)
     assert len(drift) == len(dirty["nodes"])  # 全部节点判漂移
 

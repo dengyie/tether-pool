@@ -34,6 +34,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -248,6 +249,11 @@ def js_check_or_rollback(path: Path, bak: Path | None):
     if r.returncode != 0:
         if bak and bak.exists():
             bak.replace(path)  # 回滚(备份文件转移回原位)
+        else:
+            # 2026-11-19 review P2: 首次部署 (无备份可回滚) 时必须撤销本次写入,
+            # 否则坏 JS 留在 Verge profiles 里让整个 profile 加载失败
+            path.unlink(missing_ok=True)
+            log("  [js-check] 无历史备份 (首次部署) — 已撤销本次写入 (unlink)")
         raise RuntimeError(f"node --check 失败, 已回滚: {r.stderr[:300]}")
 
 
@@ -502,8 +508,29 @@ def parse_managed_nodes(script: str, group_name: str) -> list[dict] | None:
     return objs
 
 
+def parse_managed_dialer(script: str, group_name: str) -> tuple[object, bool]:
+    """托管块内的 dialerProxy 值. 返回 (值, 块是否存在); 值 None=直连(null)."""
+    begin = BLOCK_BEGIN.format(group=group_name)
+    end = BLOCK_END.format(group=group_name)
+    i = script.find(begin)
+    if i < 0:
+        return None, False
+    j = script.find(end, i)
+    if j < 0:
+        return None, False
+    m = re.search(r"^\s*dialerProxy:\s*(.+?)\s*,?\s*$", script[i:j], re.M)
+    if not m:
+        return None, True
+    val = m.group(1)
+    return (None if val == "null" else json.loads(val)), True
+
+
 def js_block_drift(group_name: str, group: dict, script: str) -> list[str]:
-    """托管块与 manifest 期望(clean_nodes)的全字段对比. 返回漂移节点名列表(空=一致)."""
+    """托管块与 manifest 期望(clean_nodes)的全字段对比. 返回漂移节点名列表(空=一致).
+
+    dialerProxy 一并纳入 (教训 2026-11-19: 中继割接只改 manifest 的 dialer_proxy,
+    节点字段全不变, 旧检测漏报导致 heal 静默空转, 只能 --force-js 兜底).
+    """
     deployed = parse_managed_nodes(script, group_name)
     if deployed is None:
         return [f"<block-missing:{group_name}>"]
@@ -514,6 +541,9 @@ def js_block_drift(group_name: str, group: dict, script: str) -> list[str]:
         dep = dep_by.get(exp["name"])
         if dep is None or {k: v for k, v in dep.items()} != exp:
             drift.append(exp["name"])
+    cur_dialer, found = parse_managed_dialer(script, group_name)
+    if found and cur_dialer != group.get("dialer_proxy"):
+        drift.append("<dialer-proxy>")
     return drift
 
 
@@ -787,7 +817,9 @@ def cmd_import(args):
         log("[-] --relay-node 不能为空串")
         return 1
 
-    log(f"[1/7] 拉取订阅: {args.source}")
+    # 2026-11-19 review P3: bearer-token 型订阅 URL 即凭据, 日志只留 scheme://host
+    _sp = urllib.parse.urlsplit(args.source)
+    log(f"[1/7] 拉取订阅: {_sp.scheme}://{_sp.netloc}/<redacted>" if _sp.scheme else f"[1/7] 读取本地: {args.source}")
     sub = fetch_subscription(args.source)
     proxies = [p for p in sub.get("proxies", []) if p.get("server") and p.get("port")]
     log(f"      解析到 {len(proxies)} 个节点")
@@ -988,6 +1020,7 @@ def cmd_heal(args):
 
     script = None if standalone or mesh else read_script()
     drift = [] if standalone or mesh else js_block_drift(gname, group, script)
+    js_rebuilt = False
     if js_skip_reason is None and (drift or args.force_js):
         log(f"[heal] 重建 Script.js 托管块 (漂移: {drift[:4] if drift else 'force'})")
         bak = backup(SCRIPT_JS, f"heal-{gname}")
@@ -1001,8 +1034,13 @@ def cmd_heal(args):
             atomic_write_text(SCRIPT_JS, script)
             js_check_or_rollback(SCRIPT_JS, bak)
             fixed.append("Script.js")
+            js_rebuilt = True
     if js_skip_reason:
         log(f"[heal] ⚠️ 跳过 JS 重建: {js_skip_reason}")
+
+    # 重启 Verge 使重建后的托管块进入渲染 (此前参数只在 cmd_import 生效, heal 静默忽略)
+    if js_rebuilt and getattr(args, "restart_verge", False):
+        restart_verge_app()
 
     ny = yaml.safe_load(open(NODES_YAML, encoding="utf-8")) or {}
     by_name = {n.get("name"): n for n in ny.get("nodes", [])}

@@ -20,6 +20,7 @@ groups:
       group: 🇺🇸PIGEONW中转
       type: fallback
       candidates:
+      - '[自建] 🇯🇵VLESS-AWS-Tokyo-Reality'
       - '[自建] 🇺🇸VLESS-AWS-Oregon-Reality'
       - '[自建] 🇺🇸TUIC-googlevps'
       - '[自建] 🇺🇸AnyTLS-googlevps'
@@ -48,7 +49,7 @@ frozen_base_insurance:
     type: socks
     port: 11052
     listen: 127.0.0.1
-    proxy: '[自建] 🇺🇸VLESS-AWS-Oregon-Reality'
+    proxy: '[自建] 🇯🇵VLESS-AWS-Tokyo-Reality'
 # ---------------------------------------------------------------- mesh 宿主机组
 # kind=mesh (2026-11-18): EasyTier mesh 宿主机直连 socks5 收编。宿主机跑免认证
 # sing-box socks5 (端口约定 10801=native), 节点 host=mesh IP, 无桥核/无 Verge 注入。

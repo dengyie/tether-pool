@@ -17,10 +17,10 @@ config/*.bak-*
 *.bak-*
 # 桥核运行时配置 (各宿主自有): vendor 凭据 + 大二进制仅存本地
 # (mihomo 二进制从 Clash Verge 复制: cp "/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo" bin/mihomo)
-config/teleapi-bridge.yaml
-config/teleapi-bridge/
-config/pigeonw-bridge.yaml
-config/pigeonw-bridge/
+# 2026-11-19 review P1: 改为模式匹配 —— 逐文件枚举在新增组时必漏
+# (teleapisub-bridge.yaml 一夜之间成为凭据泄漏向量)
+config/*-bridge.yaml
+config/*-bridge/
 config/pigeonw-subscription.yaml
 bin/mihomo
 # 自建中转节点凭据 (import_standalone.py relay 注入源), 见 NODE_ONBOARDING.md §六

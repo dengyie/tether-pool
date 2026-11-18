@@ -22,6 +22,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -36,6 +37,19 @@ REPO = Path(__file__).resolve().parent.parent
 PINNED_IP_RE = re.compile(r"-ip-(\d+\.\d+\.\d+\.\d+)$")
 CITY_RE = re.compile(r"「(.+?)」")
 RELAY_LOCAL_YAML = REPO / "config/relay-nodes.local.yaml"
+
+
+def load_relay_names() -> set:
+    """本地凭据文件里登记的全部中继节点名 (2026-11-19 review P1: 接线时必须
+    把所有中继定义排除出 leaf 集合 —— 否则旧中继定义被当作普通节点接线,
+    形成链式双跳且 watchdog 读到多值判 AMBIGUOUS 静默失效)。"""
+    if not RELAY_LOCAL_YAML.exists():
+        return set()
+    try:
+        data = yaml.safe_load(open(RELAY_LOCAL_YAML, encoding="utf-8")) or {}
+    except Exception:
+        return set()
+    return {p.get("name") for p in data.get("relay_nodes", []) if p.get("name")}
 
 
 def load_relay_definition(relay_name: str) -> Optional[dict]:
@@ -59,7 +73,9 @@ def log(msg):
 
 def load_source(source: str) -> dict:
     if source.startswith("http://") or source.startswith("https://"):
-        log(f"[1/6] 拉取订阅: {source}")
+        # 2026-11-19 review P3: bearer-token 型订阅 URL 即凭据, 日志只留 scheme://host
+        _p = urllib.parse.urlsplit(source)
+        log(f"[1/6] 拉取订阅: {_p.scheme}://{_p.netloc}/<redacted>")
         with urllib.request.urlopen(source, timeout=60) as r:
             data = yaml.safe_load(r.read())
     else:
@@ -285,7 +301,10 @@ def cmd_relay(args):
 
     --relay-node 需已存在于桥核配置; 不存在时从本地凭据文件
     config/relay-nodes.local.yaml (gitignored, 格式见 docs/NODE_ONBOARDING.md §六)
-    读取同名节点定义注入。改完杀核, keeper 以新配置重生。
+    读取同名节点定义注入。
+    ⚠️ 本命令只改配置文件, **不会**重启桥核 —— 改完需手动 kill 桥核进程,
+    bridge_keeper.sh 才会以新配置重生 (docstring 曾声称"改完杀核"与实现不符,
+    2026-11-19 review P2 修正)。
     """
     cfg_path = REPO / f"config/{args.group}-bridge.yaml"
     cfg = yaml.safe_load(open(cfg_path, encoding="utf-8"))
@@ -307,12 +326,21 @@ def cmd_relay(args):
         cfg.setdefault("proxies", []).insert(0, relay)
         log(f"[relay] 从 relay-nodes.local.yaml 注入中转节点 {relay_name}")
     wired = 0
+    cleaned = 0
+    known_relays = load_relay_names() | {relay_name}
     for p in cfg.get("proxies", []):
-        if p.get("name") != relay_name:
+        if p.get("name") in known_relays:
+            # 2026-11-19 review P1: 中继定义 (含被提拔者与历史中继) 一律不接线,
+            # 并清掉历史 dialer —— 残留会形成链式双跳 (Oregon→Tokyo), 且
+            # watchdog 的 current_relay() 读到多值判 AMBIGUOUS 静默失效。
+            if p.pop("dialer-proxy", None) is not None:
+                cleaned += 1
+        else:
             p["dialer-proxy"] = relay_name
             wired += 1
     np.atomic_write_text(cfg_path, yaml.dump(cfg, allow_unicode=True, sort_keys=False))
-    log(f"[relay] dialer-proxy 已接线 {wired} 节点 → {relay_name} ({cfg_path})")
+    extra = f", 中继定义残留 dialer 已清理 {cleaned}" if cleaned else ""
+    log(f"[relay] dialer-proxy 已接线 {wired} 节点 → {relay_name} ({cfg_path}){extra}")
     return 0
 
 
@@ -341,7 +369,7 @@ def main():
     p_relay = sub.add_parser("relay", help="桥核中转杠杆: 直拨劣化时接线 dialer-proxy (教训 #6)")
     p_relay.add_argument("--group", required=True)
     p_relay.add_argument("--mode", default="on", choices=["on", "off"])
-    p_relay.add_argument("--relay-node", default="[自建] 🇺🇸VLESS-AWS-Oregon-Reality")
+    p_relay.add_argument("--relay-node", default="[自建] 🇯🇵VLESS-AWS-Tokyo-Reality")
 
     args = ap.parse_args()
     if args.cmd == "import":
