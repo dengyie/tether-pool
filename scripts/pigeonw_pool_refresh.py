@@ -133,10 +133,19 @@ def main():
                       f"keep current state", file=sys.stderr)
                 return 1
         if not fetched:
+            # 2026-11-19 review 自查根修: 上游清空订阅与 fetch 失败同为死亡形态 ——
+            # 旧版在此恒 return 1, 计数器无限累积但永不淘汰 (死代码分支)
             fails = bump_failure(DEATH_STATE, DEATH_KEY)
-            print(f"[PIGEONW_REFRESH_FAIL] fetch empty (连续 {fails}/{DEATH_AFTER} 轮), "
-                  f"keep current state", file=sys.stderr)
-            return 1
+            if fails >= DEATH_AFTER:
+                force_drop = True
+                print(f"[PIGEONW_SOURCE_DEAD] fetch empty 连续 {fails}/{DEATH_AFTER} 轮 "
+                      f"→ 淘汰本源全部节点 (listeners/nodes.yaml/绑定随重建链路逐级回收)",
+                      file=sys.stderr)
+                # 不 return: 带空 fetched 走重建链, force_drop 已绕过 alive 守卫
+            else:
+                print(f"[PIGEONW_REFRESH_FAIL] fetch empty (连续 {fails}/{DEATH_AFTER} 轮), "
+                      f"keep current state", file=sys.stderr)
+                return 1
         # 订阅条目统一改名 PIGEONW-NNN 在匹配后再定; 先去重 (重名会硬失败 mihomo -t)
         seen = set()
         for p in fetched:
