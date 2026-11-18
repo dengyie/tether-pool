@@ -140,6 +140,34 @@ def test_js_block_drift_detects_field_change():
     assert np.js_block_drift("t", group, "// no block") == ["<block-missing:t>"]
 
 
+def test_gen_emits_relay_group_and_drift_detects_candidate_change():
+    """2026-11-19 可用性根修: relay_group fallback 组 —— 组名 dialer + 组创建 JS;
+    候选顺序即主备优先级 (可用性契约), 变化必须判漂移。"""
+    group = make_group()
+    group["dialer_proxy"] = "[自建] PIGEONW-中继"
+    group["relay_group"] = {"name": "[自建] PIGEONW-中继", "type": "fallback",
+                            "candidates": ["[自建] Tokyo", "[自建] Oregon"],
+                            "url": "http://x", "interval": 300}
+    script = "// a\n// ==================== Mihomo 节点兼容 ====================\n"
+    script = np.upsert_js_block(script, "t", np.gen_group_js("t", group))
+    assert np.js_block_drift("t", group, script) == []
+    # JS 组创建带候选存在性守卫 (防悬空引用) 与 fallback 类型
+    assert "avail.length > 0" in script and 'type: rg.type || "fallback"' in script
+    d, found = np.parse_managed_dialer(script, "t")
+    assert found and d == "[自建] PIGEONW-中继"
+    rg, rgf = np.parse_managed_relay_group(script, "t")
+    assert rgf and rg == group["relay_group"]
+    # 主备顺序变化 → 漂移
+    switched = json.loads(json.dumps(group))
+    switched["relay_group"]["candidates"] = ["[自建] Oregon", "[自建] Tokyo"]
+    assert np.js_block_drift("t", switched, script) == ["<relay-group>"]
+    # 无 relay_group 的组: relayGroup=null, 不误报
+    plain = make_group()
+    plain_script = np.upsert_js_block("// a\n", "t", np.gen_group_js("t", plain))
+    assert np.parse_managed_relay_group(plain_script, "t") == (None, True)
+    assert np.js_block_drift("t", plain, plain_script) == []
+
+
 def test_js_block_drift_detects_dialer_proxy_change():
     """中继割接只改 manifest 的 dialer_proxy, 节点字段全不变 — 漂移判定必须覆盖 (2026-11-19 教训)."""
     group = make_group()
