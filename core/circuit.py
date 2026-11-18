@@ -11,6 +11,13 @@ from core.models import ProxyNode, HealthStatus
 BASE_COOLDOWN_SECONDS = 60.0
 MAX_COOLDOWN_SECONDS = 1800.0
 JITTER_MAX_SECONDS = 10.0
+# Host-level failure dampening (2026-11-19 warp 隧道僵死事故): 同一宿主机
+# 隧道层抖动 (sing-box 重启握手窗口 / mesh 抖动) 会让 sweep 把主机级事件
+# 分散成 N 个独立断路, 每个都按指数退避各自叠加 → 恢复比底层慢 ~30min。
+# 规则: 同主机短窗口内 dead 越多, 新触发的 DEAD 退避越短 (主机事件是
+# 共同原因, 底层一修全体同时恢复, 长退避只会延迟拉活)。
+HOST_FAILURE_WINDOW_MINUTES = 15
+HOST_DEAD_CAP_FOR_SHORT_BACKOFF = 5  # 同主机 15min 内 dead >= 此数 → 退避打 1/4
 
 
 class CircuitBreaker:
@@ -36,6 +43,32 @@ class CircuitBreaker:
         jitter = random.uniform(0, JITTER_MAX_SECONDS)
         return round(backoff + jitter, 2)
 
+    @staticmethod
+    def host_dampen_cooldown(cooldown_sec: float, conn, host: str) -> float:
+        """同主机短窗口 mass-failure → 新 DEAD 退避打 1/4 (2026-11-19 事故根修).
+
+        sweep 在宿主机隧道层抖动 (重启握手窗口) 期间会把主机级事件分散成
+        N 个独立断路; 各自走满指数退避会让池侧恢复远慢于底层修复。共同原因
+        的证据 = 同主机窗口内已有多个 dead —— 此时缩短新触发节点的退避,
+        让下一轮 sweep 尽快复核 (失败会再退避, 不会探活风暴)。
+        """
+        if not host:
+            return cooldown_sec
+        try:
+            window_start = (datetime.now()
+                            - timedelta(minutes=HOST_FAILURE_WINDOW_MINUTES)).isoformat()
+            row = conn.execute(
+                "SELECT COUNT(*) FROM probe_history ph JOIN nodes n ON n.name = ph.node_name "
+                "WHERE n.host = ? AND ph.success = 0 AND ph.probed_at >= ?",
+                (host, window_start),
+            ).fetchone()
+            recent_failures = row[0] if row else 0
+            if recent_failures >= HOST_DEAD_CAP_FOR_SHORT_BACKOFF:
+                return round(cooldown_sec / 4.0, 2)
+        except Exception:
+            pass  # 查询失败按无主机信号处理, 不阻塞熔断主路径
+        return cooldown_sec
+
     @classmethod
     def evaluate(
         cls,
@@ -44,6 +77,7 @@ class CircuitBreaker:
         latency_ms: float = 0.0,
         error: Optional[str] = None,
         consecutive_successes: int = 0,
+        conn=None,
     ) -> Tuple[str, str, Optional[datetime]]:
         """
         Evaluates a probe result and determines the next circuit state,
@@ -54,6 +88,10 @@ class CircuitBreaker:
         a DEAD/HALF_OPEN node's first canary success only enters a DEGRADED
         observation period; a second consecutive success confirms HEALTHY.
         consecutive_successes is the post-increment value the caller computed.
+
+        conn (optional, 2026-11-19): storage 事务内连接 —— 传入时 DEAD 退避
+        经 host_dampen_cooldown 感知同主机短窗口 mass-failure (共同原因 →
+        短退避快复核); 测试路径不传 conn 时行为与旧版完全一致。
         """
         current_state = node.status
         now = datetime.now()
@@ -100,6 +138,8 @@ class CircuitBreaker:
             elif current_state == HealthStatus.DEGRADED.value:
                 # 2nd failure -> Tripped into DEAD (Open)
                 cooldown_sec = cls.compute_cooldown(new_failures)
+                if conn is not None:
+                    cooldown_sec = cls.host_dampen_cooldown(cooldown_sec, conn, node.host)
                 next_allowed = now + timedelta(seconds=cooldown_sec)
                 return (
                     HealthStatus.DEAD.value,
@@ -109,6 +149,8 @@ class CircuitBreaker:
             elif current_state == HealthStatus.HALF_OPEN.value:
                 # Half-open trial failed -> Retrip into DEAD (Open) with longer cooldown
                 cooldown_sec = cls.compute_cooldown(new_failures)
+                if conn is not None:
+                    cooldown_sec = cls.host_dampen_cooldown(cooldown_sec, conn, node.host)
                 next_allowed = now + timedelta(seconds=cooldown_sec)
                 return (
                     HealthStatus.DEAD.value,
@@ -118,6 +160,8 @@ class CircuitBreaker:
             else:
                 # Already DEAD
                 cooldown_sec = cls.compute_cooldown(new_failures)
+                if conn is not None:
+                    cooldown_sec = cls.host_dampen_cooldown(cooldown_sec, conn, node.host)
                 next_allowed = now + timedelta(seconds=cooldown_sec)
                 return (
                     HealthStatus.DEAD.value,

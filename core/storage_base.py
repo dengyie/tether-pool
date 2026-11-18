@@ -122,7 +122,8 @@ class StorageBase:
                     fault_domain TEXT DEFAULT '',
                     provider_region TEXT DEFAULT '',
                     probe_url TEXT DEFAULT '',
-                    self_reported_at TEXT
+                    self_reported_at TEXT,
+                    last_probe_error TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS leases (
@@ -265,7 +266,9 @@ class StorageBase:
                 # 节点生命周期 janitor (2026-11-15): 连续 DEAD 24h -> 冻结
                 # (探活降频 + 不进分配), 连续 7d -> 驱逐 (DB 删除 + tombstone
                 # 防 yaml 重载复活)。DEAD 落锤时写, 离开 DEAD 时清。
-                ("dead_since", "TEXT", "NULL")
+                ("dead_since", "TEXT", "NULL"),
+                # 最近探活失败摘要 (2026-11-19 P1-5 skip 语义可见化)
+                ("last_probe_error", "TEXT", "NULL")
             ]:
                 if col not in existing_cols:
                     conn.execute(f"ALTER TABLE nodes ADD COLUMN {col} {col_type} DEFAULT {default_val}")
@@ -376,5 +379,6 @@ class StorageBase:
             fault_domain=row["fault_domain"] if "fault_domain" in keys and row["fault_domain"] else "",
             provider_region=row["provider_region"] if "provider_region" in keys and row["provider_region"] else "",
             probe_url=row["probe_url"] if "probe_url" in keys and row["probe_url"] else "",
-            self_reported_at=row["self_reported_at"] if "self_reported_at" in keys else None
+            self_reported_at=row["self_reported_at"] if "self_reported_at" in keys else None,
+            last_probe_error=row["last_probe_error"] if "last_probe_error" in keys else None
         )

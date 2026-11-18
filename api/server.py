@@ -91,6 +91,9 @@ metrics_collector = MetricsCollector(storage)
 # Single-flight guard so overlapping sweeps (startup + manual trigger) cannot
 # both hammer the pool at once.
 _probe_lock = asyncio.Lock()
+# host-level force sweep 独立 single-flight (不占全池 _probe_lock, 见 /v1/probe/host)
+_host_probe_lock = asyncio.Lock()
+HOST_PROBE_CONCURRENCY = int(os.environ.get("IP_POOL_HOST_PROBE_CONCURRENCY", "10"))
 _last_probe_trigger_at: float = 0.0
 _probe_pending: bool = False  # 已排队但尚未跑完的 sweep (sweep 排队时长可能超过合并窗口)
 PROBE_TRIGGER_COALESCE_SECONDS = 15  # 同窗口重复触发合并 (含 start.sh 确认式重试)
@@ -934,6 +937,35 @@ async def trigger_probe(
         "coalesced": False,
         "queued_behind_running_sweep": was_locked,
     }
+
+
+@app.post("/v1/probe/host", response_model=List[ProbeResult])
+async def probe_host(
+    host: str = Query(..., description="Host IP (e.g. 10.144.144.81) to force-probe all its nodes"),
+):
+    """Host-level force probe (2026-11-19 warp 隧道僵死事故的运维抓手).
+
+    场景: 宿主机 sing-box 重启/隧道层修复后, 单节点断路器退避使恢复最长等
+    ~30min (MAX_COOLDOWN)。本端点对该 host 全部节点逐个 force=True 探活
+    (绕过冷却), 同步返回每个节点的结果 —— 「重启 sing-box → 强制拉活」
+    SOP 的一条命令通道。
+
+    语义: 独立于全池 sweep 的 single-flight (自持小锁, 不占 _probe_lock),
+    节点级 force probe 无冷却跳过, 失败也如实返回 —— 调用方 (运维/看门狗)
+    拿到的就是隧道层的真实判决。
+    """
+    nodes = await asyncio.to_thread(storage.list_nodes)
+    host_nodes = [n for n in nodes if n.host == host]
+    if not host_nodes:
+        raise HTTPException(status_code=404, detail=f"No nodes found for host {host}")
+
+    async with _host_probe_lock:
+        print(f"[probe] host sweep starting: {host} ({len(host_nodes)} nodes, force)")
+        results = await prober.probe_all(concurrency=HOST_PROBE_CONCURRENCY,
+                                         nodes=host_nodes, force=True)
+        healthy = sum(1 for r in results if r.success)
+        print(f"[probe] host sweep finished: {host} {healthy}/{len(results)} healthy")
+    return results
 
 
 @app.post("/v1/probe/test_node", response_model=ProbeResult)

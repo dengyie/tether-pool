@@ -149,6 +149,7 @@ class NodeStore:
                     latency_ms=res.latency_ms,
                     error=res.error,
                     consecutive_successes=new_succs,
+                    conn=conn,  # 2026-11-19: host_dampen_cooldown 需事务内查询同主机失败窗口
                 )
 
                 # Mass-ejection guard (Envoy outlier safeguards, 2026-11-15): before
@@ -216,7 +217,8 @@ class NodeStore:
                             tags = ?,
                             region = ?,
                             provider_region = ?,
-                            dead_since = NULL
+                            dead_since = NULL,
+                            last_probe_error = NULL
                         WHERE name = ?
                     """, (
                         res.exit_ip, res.latency_ms, new_state, new_state,
@@ -246,12 +248,14 @@ class NodeStore:
                             last_probed_at = ?,
                             tier = ?,
                             quality_score = ?,
-                            dead_since = ?
+                            dead_since = ?,
+                            last_probe_error = ?
                         WHERE name = ?
                     """, (
                         new_state, new_state, new_fails, new_succs,
                         next_allowed_str, now_str,
-                        q_tier, q_score, dead_since_val, res.node_name
+                        q_tier, q_score, dead_since_val,
+                        (res.error or "")[:120] or None, res.node_name
                     ))
 
                 # 4. Record circuit event if state changed

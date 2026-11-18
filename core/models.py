@@ -61,6 +61,10 @@ class ProxyNode(BaseModel):
     consecutive_failures: int = 0
     consecutive_successes: int = 0
     next_probe_allowed_at: Optional[str] = None
+    # 最近一次探活失败摘要 (2026-11-19 P1-5): 断路器冷却内节点在 GET /v1/nodes
+    # 只能看到 "dead + 退避锚点", 看不到为什么 —— 运维排障要再查 probe_history。
+    # 冗余一份最新 error 到节点行, 排障一眼可见 (skip 语义可见化的存储侧)。
+    last_probe_error: Optional[str] = None
     relay_mode: str = RelayMode.RELAY_FALLBACK.value
     relay_hop_node: Optional[str] = None
     tier: str = Tier.STANDARD.value
