@@ -1283,12 +1283,17 @@ class ForwardProxyGateway:
                 if not self._password_ok(headers_dict.get("proxy-authorization", "")):
                     # 提取 presented username 做观测 (与 F1 同规: utf-8/replace 解码,
                     # 只留用户名前 40 字符, 不落密码), 用于定位无凭据/坏凭据的调用方。
+                    # pre-auth 可控输入: 不可打印字符一律替 '?' —— 防日志伪造
+                    # (decoded 可含 \n, 直接落日志会伪造日志行)。
                     presented_user = ""
                     raw_auth = headers_dict.get("proxy-authorization", "")
                     if raw_auth.lower().startswith("basic "):
                         try:
                             decoded = base64.b64decode(raw_auth[6:].strip()).decode("utf-8", "replace")
-                            presented_user = decoded.split(":", 1)[0][:40]
+                            presented_user = "".join(
+                                ch if ch.isprintable() else "?"
+                                for ch in decoded.split(":", 1)[0]
+                            )[:40]
                         except Exception:
                             presented_user = "<b64-error>"
                     logger.warning(
