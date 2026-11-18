@@ -1154,9 +1154,76 @@ class ForwardProxyGateway:
             f"Last error: {last_err}",
         )
 
+    async def _relay_and_monitor(self, client_reader, client_writer, upstream_node,
+                                 remote_reader, remote_writer) -> None:
+        """双分支共用的转发尾段: 泵流 (CONNECT 已写 200 / HTTP 已写请求行) +
+        流中断反馈 + 确保上游 socket 关闭。upstream_reset 是唯一计入节点反馈
+        的 outcome (P0 语义: 客户端先断/正常 EOF 不算上游之过)。
+        """
+        try:
+            outcome = await pump_streams(client_reader, client_writer, remote_reader, remote_writer)
+            if outcome == "upstream_reset":
+                self._handle_midstream_eol(upstream_node.name, outcome)
+        finally:
+            remote_writer.close()
+
     def _metrics_exempt(self, method: str, target: str) -> bool:
         """GET /metrics (含 query 串) 免密; 路径变形 (/metrics/, //metrics) 不豁免。"""
         return method.upper() == "GET" and target.split("?")[0] == "/metrics"
+
+    async def _write_and_close(self, client_writer: asyncio.StreamWriter, resp: bytes) -> None:
+        """写一个完整 HTTP 响应并关闭连接 (每个 early-return 错误路径共用)。"""
+        client_writer.write(resp)
+        try:
+            await client_writer.drain()
+        finally:
+            client_writer.close()
+
+    @staticmethod
+    def _error_response(status_line: str, headers_and_body: str) -> bytes:
+        """拼一个 status line + 完整头部/正文块 的错误响应 (全部 early-return 路径共用)。"""
+        return f"HTTP/1.1 {status_line}\r\n{headers_and_body}".encode()
+
+    async def _open_upstream_or_respond(
+        self, client_writer: asyncio.StreamWriter, route_ctx: "RoutingContext",
+        target_host: str, target_port: int,
+    ):
+        """_open_upstream + 三类异常 -> 直接向客户端写响应并返回 None。
+
+        成功时返回 (node, reader, writer)。错误分类与语义与原 handle_client 内联
+        版本逐字一致: 503 池空 / failover 码透传 (+retry) / 其余一律 502。
+        """
+        try:
+            return await self._open_upstream(
+                account_id=route_ctx.account_id,
+                region=route_ctx.region,
+                egress_type=route_ctx.egress_type,
+                service=route_ctx.service,
+                target_host=target_host,
+                target_port=target_port,
+                tier=route_ctx.tier,
+                tier_policy=route_ctx.tier_policy,
+                force_rebind=route_ctx.force_rebind,
+                region_strict=route_ctx.region_strict,
+                bind_persist=route_ctx.bind_persist,
+            )
+        except NoPoolNodesError as pool_err:
+            await self._write_and_close(client_writer, self._error_response(
+                "503 Service Unavailable",
+                f"X-TetherPool-Error: {ERR_POOL_EXHAUSTED}\r\nContent-Type: text/plain\r\n\r\n{pool_err}\r\n"))
+            return None
+        except UpstreamFailoverError as failover_err:
+            retry_hdr = f", retry={failover_err.retry}" if failover_err.retry else ""
+            await self._write_and_close(client_writer, self._error_response(
+                f"{failover_err.http_status} {failover_err.http_reason}",
+                f"X-TetherPool-Error: {failover_err.code}{retry_hdr}\r\n"
+                f"Content-Type: text/plain\r\n\r\n{failover_err.message}\r\n"))
+            return None
+        except Exception as conn_err:
+            await self._write_and_close(client_writer, self._error_response(
+                "502 Bad Gateway",
+                f"Content-Type: text/plain\r\n\r\nFailed to connect upstream SOCKS5 node: {conn_err}\r\n"))
+            return None
 
     def _password_ok(self, auth_header: str) -> bool:
         """Constant-shape check of the Basic password part against GATEWAY_PASSWORD.
@@ -1247,55 +1314,20 @@ class ForwardProxyGateway:
                     client_writer.close()
                     return
 
-                try:
-                    upstream_node, remote_reader, remote_writer = await self._open_upstream(
-                        account_id=route_ctx.account_id,
-                        region=route_ctx.region,
-                        egress_type=route_ctx.egress_type,
-                        service=route_ctx.service,
-                        target_host=target_host,
-                        target_port=target_port,
-                        tier=route_ctx.tier,
-                        tier_policy=route_ctx.tier_policy,
-                        force_rebind=route_ctx.force_rebind,
-                        region_strict=route_ctx.region_strict,
-                        bind_persist=route_ctx.bind_persist,
-                    )
-                except NoPoolNodesError as pool_err:
-                    err_resp = f"HTTP/1.1 503 Service Unavailable\r\nX-TetherPool-Error: {ERR_POOL_EXHAUSTED}\r\nContent-Type: text/plain\r\n\r\n{pool_err}\r\n".encode()
-                    client_writer.write(err_resp)
-                    await client_writer.drain()
-                    client_writer.close()
+                upstream = await self._open_upstream_or_respond(
+                    client_writer, route_ctx, target_host, target_port,
+                )
+                if upstream is None:
                     return
-                except UpstreamFailoverError as failover_err:
-                    retry_hdr = f", retry={failover_err.retry}" if failover_err.retry else ""
-                    err_resp = (
-                        f"HTTP/1.1 {failover_err.http_status} {failover_err.http_reason}\r\n"
-                        f"X-TetherPool-Error: {failover_err.code}{retry_hdr}\r\n"
-                        f"Content-Type: text/plain\r\n\r\n{failover_err.message}\r\n"
-                    ).encode()
-                    client_writer.write(err_resp)
-                    await client_writer.drain()
-                    client_writer.close()
-                    return
-                except Exception as conn_err:
-                    err_resp = f"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\n\r\nFailed to connect upstream SOCKS5 node: {conn_err}\r\n".encode()
-                    client_writer.write(err_resp)
-                    await client_writer.drain()
-                    client_writer.close()
-                    return
+                upstream_node, remote_reader, remote_writer = upstream
 
                 # The upstream socket belongs to this request from the moment it is open:
                 # close it on every exit path, including a client disconnect in the window
                 # before the 200 response has been written.
-                try:
-                    client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                    await client_writer.drain()
-                    outcome = await pump_streams(client_reader, client_writer, remote_reader, remote_writer)
-                    if outcome == "upstream_reset":
-                        self._handle_midstream_eol(upstream_node.name, outcome)
-                finally:
-                    remote_writer.close()
+                client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                await client_writer.drain()
+                await self._relay_and_monitor(
+                    client_reader, client_writer, upstream_node, remote_reader, remote_writer)
 
             # 4. Handle standard HTTP GET/POST/etc.
             else:
@@ -1314,78 +1346,42 @@ class ForwardProxyGateway:
                 if parsed_url.query:
                     path_and_query += f"?{parsed_url.query}"
 
-                try:
-                    upstream_node, remote_reader, remote_writer = await self._open_upstream(
-                        account_id=route_ctx.account_id,
-                        region=route_ctx.region,
-                        egress_type=route_ctx.egress_type,
-                        service=route_ctx.service,
-                        target_host=target_host,
-                        target_port=target_port,
-                        tier=route_ctx.tier,
-                        tier_policy=route_ctx.tier_policy,
-                        force_rebind=route_ctx.force_rebind,
-                        region_strict=route_ctx.region_strict,
-                        bind_persist=route_ctx.bind_persist,
-                    )
-                except NoPoolNodesError as pool_err:
-                    err_resp = f"HTTP/1.1 503 Service Unavailable\r\nX-TetherPool-Error: {ERR_POOL_EXHAUSTED}\r\nContent-Type: text/plain\r\n\r\n{pool_err}\r\n".encode()
-                    client_writer.write(err_resp)
-                    await client_writer.drain()
-                    client_writer.close()
+                upstream = await self._open_upstream_or_respond(
+                    client_writer, route_ctx, target_host, target_port,
+                )
+                if upstream is None:
                     return
-                except UpstreamFailoverError as failover_err:
-                    retry_hdr = f", retry={failover_err.retry}" if failover_err.retry else ""
-                    err_resp = (
-                        f"HTTP/1.1 {failover_err.http_status} {failover_err.http_reason}\r\n"
-                        f"X-TetherPool-Error: {failover_err.code}{retry_hdr}\r\n"
-                        f"Content-Type: text/plain\r\n\r\n{failover_err.message}\r\n"
-                    ).encode()
-                    client_writer.write(err_resp)
-                    await client_writer.drain()
-                    client_writer.close()
-                    return
-                except Exception as conn_err:
-                    err_resp = f"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\n\r\nFailed to connect upstream SOCKS5 node: {conn_err}\r\n".encode()
-                    client_writer.write(err_resp)
-                    await client_writer.drain()
-                    client_writer.close()
-                    return
+                upstream_node, remote_reader, remote_writer = upstream
 
-                try:
-                    # Reconstruct clean HTTP request without internal headers.
-                    # 2026-11-15 review #8: 除逐名过滤外, 还必须剥 Connection 头
-                    # 点名的 hop-by-hop 头 + 无条件剥 transfer-encoding/te/upgrade/
-                    # keep-alive/trailer —— 网关把 body 当不透明字节流泵, 转发
-                    # 分帧头会产生冲突框架 (request-smuggling 面)。
-                    connection_named: set = set()
-                    for line in lines[1:]:
-                        if ":" in line:
-                            k, v = line.split(":", 1)
-                            if k.strip().lower() == "connection":
-                                connection_named.update(
-                                    t.strip().lower() for t in v.split(",") if t.strip())
-                    HOP_BY_DROP = {"transfer-encoding", "te", "upgrade",
-                                   "keep-alive", "trailer", "proxy-connection"}
-                    new_req_lines = [f"{method} {path_and_query} {version}"]
-                    for line in lines[1:]:
-                        if ":" in line:
-                            k, _ = line.split(":", 1)
-                            kl = k.strip().lower()
-                            if not _is_internal_header(k) and kl not in connection_named \
-                                    and kl not in HOP_BY_DROP:
-                                new_req_lines.append(line)
-                    new_req_lines.append("Connection: close")
-                    new_req_payload = "\r\n".join(new_req_lines) + "\r\n\r\n"
+                # Reconstruct clean HTTP request without internal headers.
+                # 2026-11-15 review #8: 除逐名过滤外, 还必须剥 Connection 头
+                # 点名的 hop-by-hop 头 + 无条件剥 transfer-encoding/te/upgrade/
+                # keep-alive/trailer —— 网关把 body 当不透明字节流泵, 转发
+                # 分帧头会产生冲突框架 (request-smuggling 面)。
+                connection_named: set = set()
+                for line in lines[1:]:
+                    if ":" in line:
+                        k, v = line.split(":", 1)
+                        if k.strip().lower() == "connection":
+                            connection_named.update(
+                                t.strip().lower() for t in v.split(",") if t.strip())
+                HOP_BY_DROP = {"transfer-encoding", "te", "upgrade",
+                               "keep-alive", "trailer", "proxy-connection"}
+                new_req_lines = [f"{method} {path_and_query} {version}"]
+                for line in lines[1:]:
+                    if ":" in line:
+                        k, _ = line.split(":", 1)
+                        kl = k.strip().lower()
+                        if not _is_internal_header(k) and kl not in connection_named \
+                                and kl not in HOP_BY_DROP:
+                            new_req_lines.append(line)
+                new_req_lines.append("Connection: close")
+                new_req_payload = "\r\n".join(new_req_lines) + "\r\n\r\n"
 
-                    remote_writer.write(new_req_payload.encode("iso-8859-1"))
-                    await remote_writer.drain()
-
-                    outcome = await pump_streams(client_reader, client_writer, remote_reader, remote_writer)
-                    if outcome == "upstream_reset":
-                        self._handle_midstream_eol(upstream_node.name, outcome)
-                finally:
-                    remote_writer.close()
+                remote_writer.write(new_req_payload.encode("iso-8859-1"))
+                await remote_writer.drain()
+                await self._relay_and_monitor(
+                    client_reader, client_writer, upstream_node, remote_reader, remote_writer)
 
         except Exception as e:
             print(f"[-] Gateway client error ({client_ip}): {e}")
