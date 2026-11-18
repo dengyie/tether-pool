@@ -269,14 +269,19 @@ async def pump_streams(r1: asyncio.StreamReader, w1: asyncio.StreamWriter, r2: a
     responses whenever the client half-closed early.
 
     Returns the relay outcome (2026-11-18 流中级 EOF 反馈, review 二次根修):
-    - 'upstream_reset': 上游在客户端仍活跃时异常重置 (RST/error) —— 唯一计入
+    - 'upstream_reset': 上游侧故障 (上游读失败, 或客户端写上游失败) —— 唯一计入
       节点反馈的信号 (线路故障与上游崩溃的公共形态)。
     - 'upstream_eof'  : 上游 clean FIN 先到 —— 不计入。keep-alive 的常规生命周期
       (服务端 idle timeout / Connection: close 响应后关连接), 计入会以每分钟
       数十次的频率误杀健康节点 (review P0 根修)。
     - 'client_first' / 'client_error': 客户端先收尾/中止 —— 不计入 (客户端
       行为; 客户端中止后上游跟着 RST 属正常传播)。
-    - 'both_error'    : 双侧异常 —— 不计入 (歧义)。
+    - 'both_error'    : 双侧异常且来源不可分 —— 不计入。
+
+    2026-11-19 review P2: _forward 现在回报失败来源 ("read"=读对端失败=对端
+    故障, "write"=写给对端失败=对端侧管道已死)。旧分类靠"谁先完成"猜根因,
+    把「客户端活跃上传时上游死亡」(t1 写半边失败) 误判为 client_error —— 半个
+    EOF 闭环一直开着。
     """
     async def _forward(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
@@ -286,13 +291,15 @@ async def pump_streams(r1: asyncio.StreamReader, w1: asyncio.StreamWriter, r2: a
                     break
                 writer.write(data)
                 await writer.drain()
-            return "eof"
+            return ("eof", None)
         except (asyncio.IncompleteReadError, ConnectionError, OSError):
-            return "error"
+            # reader.read 失败 = 我读的对端故障
+            return ("error", "read")
         except asyncio.CancelledError:
             raise
         except Exception:
-            return "error"
+            # 其余 (write/drain 失败) = 我写的对端侧管道已死
+            return ("error", "write")
         finally:
             try:
                 if writer.can_write_eof():
@@ -300,8 +307,8 @@ async def pump_streams(r1: asyncio.StreamReader, w1: asyncio.StreamWriter, r2: a
             except (NotImplementedError, RuntimeError, OSError):
                 pass
 
-    t1 = asyncio.create_task(_forward(r1, w2))  # 读客户端
-    t2 = asyncio.create_task(_forward(r2, w1))  # 读上游
+    t1 = asyncio.create_task(_forward(r1, w2))  # 读客户端, 写上游
+    t2 = asyncio.create_task(_forward(r2, w1))  # 读上游, 写客户端
     try:
         done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
         t1_done, t1_res = t1 in done, None
@@ -329,16 +336,21 @@ async def pump_streams(r1: asyncio.StreamReader, w1: asyncio.StreamWriter, r2: a
                 await w.wait_closed()
             except Exception:
                 pass
-    # 分类 (review 二次根修): 只有「客户端仍活跃 + 上游异常重置」才反馈。
-    # 宽限期内对端行为受先断侧影响 (客户端中止 -> 上游跟着 RST 属正常传播),
-    # 故只看 FIRST_COMPLETED 阶段, 不看宽限期; finally cancel 后 result() 会抛
-    # CancelledError, 未完成任务一律视作 client 侧延续。
-    if t2_done and t2_res == "error" and not t1_done:
+    # 分类 (2026-11-19 根修): 失败来源取代完成方向。t1 读客户端失败 / t2 写客户端
+    # 失败 = 客户端故障; t2 读上游失败 / t1 写上游失败 = 上游故障。客户端 clean
+    # close 先到时, 宽限期内的上游传播属正常, 仍优先 client_first。
+    if t1_done and t1_res[0] == "eof":
+        return "client_first"
+    upstream_fault = (
+        (t2_done and t2_res[0] == "error" and t2_res[1] == "read")
+        or (t1_done and t1_res[0] == "error" and t1_res[1] == "write")
+    )
+    if upstream_fault:
         return "upstream_reset"
     if t1_done:
-        return "client_first" if t1_res == "eof" else "client_error"
+        return "client_error"
     if t2_done:
-        return "upstream_eof"
+        return "upstream_eof" if t2_res[0] == "eof" else "client_error"
     return "both_error"
 
 
@@ -590,6 +602,9 @@ class ForwardProxyGateway:
         # 上游站自身断流同样计入, 故阈值取多事件而非单发, 写入后清零重新累积 ——
         # 单渠道偶发上游抖动不会踢掉对其他消费方正常的节点。
         self._midstream_eof: dict = {}
+        # fire-and-forget 后台任务持有集 (2026-11-19 review P3: 无引用的 task
+        # 可能被 GC 中途回收; done 回调负责记日志)
+        self._bg_tasks: set = set()
         self.host = host
         self.port = port
         self.server = None
@@ -682,11 +697,23 @@ class ForwardProxyGateway:
             if len(dq) < self.MIDSTREAM_EOF_THRESHOLD:
                 return
             dq.clear()
-            print(f"[!] Midstream premature close threshold reached for {node_name} "
-                  f"({outcome}) — recording probe failure (circuit breaker will degrade/exclude)")
-            asyncio.get_running_loop().create_task(self._record_midstream_failure(node_name, outcome))
+            logger.warning("Midstream premature close threshold reached for %s (%s) — "
+                           "recording probe failure (circuit breaker will degrade/exclude)",
+                           node_name, outcome)
+            # 2026-11-19 review P3: fire-and-forget task 需持引用 + done 回调,
+            # 否则 CPython 可能中途回收 (反馈信号静默丢失且无痕迹)
+            t = asyncio.get_running_loop().create_task(
+                self._record_midstream_failure(node_name, outcome))
+            self._bg_tasks.add(t)
+            t.add_done_callback(self._bg_task_done)
         except Exception as e:
-            print(f"[-] Midstream EOF feedback failed for {node_name}: {e}")
+            logger.error("Midstream EOF feedback failed for %s: %s", node_name, e)
+
+    def _bg_task_done(self, task: "asyncio.Task") -> None:
+        """后台任务回收: 记录非取消异常, 释放引用。"""
+        self._bg_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("background task failed: %s", task.exception())
 
     async def _record_midstream_failure(self, node_name: str, outcome: str) -> None:
         try:
@@ -1298,7 +1325,11 @@ class ForwardProxyGateway:
                             presented_user = "<b64-error>"
                     logger.warning(
                         "gateway auth rejected: peer=%s target=%s user=%s",
-                        client_ip, target[:80], presented_user or "<none>",
+                        client_ip,
+                        # 2026-11-19 review P2: target 与 user 同样可注入换行
+                        # (裸 \n 不被 \r\n split 捕获), 一律过可打印过滤
+                        "".join(ch if ch.isprintable() else "?" for ch in target)[:80],
+                        presented_user or "<none>",
                     )
                     if method.upper() == "CONNECT":
                         resp = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"tetherpool\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -1342,10 +1373,21 @@ class ForwardProxyGateway:
                 # The upstream socket belongs to this request from the moment it is open:
                 # close it on every exit path, including a client disconnect in the window
                 # before the 200 response has been written.
-                client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                await client_writer.drain()
-                await self._relay_and_monitor(
-                    client_reader, client_writer, upstream_node, remote_reader, remote_writer)
+                # 2026-11-19 review P1: 上面这条注释此前只是"声称" —— 200 写出/
+                # drain 抛异常(浏览器取消竞态/上游 RST)会跳到外层 except, finally
+                # 只关 client_writer, upstream fd 泄漏。现在 finally 兜底。
+                try:
+                    client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    await client_writer.drain()
+                    await self._relay_and_monitor(
+                        client_reader, client_writer, upstream_node, remote_reader, remote_writer)
+                finally:
+                    try:
+                        if not remote_writer.is_closing():
+                            remote_writer.close()
+                        await remote_writer.wait_closed()
+                    except Exception:
+                        pass
 
             # 4. Handle standard HTTP GET/POST/etc.
             else:
@@ -1370,6 +1412,19 @@ class ForwardProxyGateway:
                 if upstream is None:
                     return
                 upstream_node, remote_reader, remote_writer = upstream
+
+                # 2026-11-19 review P3: 网关把 body 当不透明字节泵 —— 剥掉 TE 后
+                # chunked body 变成无框架字节流 (smuggling 形状的正确性缺陷)。
+                # 显式拒绝, 让客户端改用 Content-Length。
+                if any(l.strip().lower().startswith("transfer-encoding:")
+                       for l in lines[1:] if ":" in l):
+                    client_writer.write(
+                        b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n"
+                        b"Connection: close\r\n\r\n"
+                        b"chunked request bodies are not supported by this proxy; use Content-Length\r\n")
+                    await client_writer.drain()
+                    client_writer.close()
+                    return
 
                 # Reconstruct clean HTTP request without internal headers.
                 # 2026-11-15 review #8: 除逐名过滤外, 还必须剥 Connection 头
@@ -1396,13 +1451,25 @@ class ForwardProxyGateway:
                 new_req_lines.append("Connection: close")
                 new_req_payload = "\r\n".join(new_req_lines) + "\r\n\r\n"
 
-                remote_writer.write(new_req_payload.encode("iso-8859-1"))
-                await remote_writer.drain()
-                await self._relay_and_monitor(
-                    client_reader, client_writer, upstream_node, remote_reader, remote_writer)
+                # 2026-11-19 review P1: 与 CONNECT 分支同款 fd 泄漏兜底 ——
+                # 请求写出/drain 阶段的异常不得跳过 upstream socket 的释放。
+                try:
+                    remote_writer.write(new_req_payload.encode("iso-8859-1"))
+                    await remote_writer.drain()
+                    await self._relay_and_monitor(
+                        client_reader, client_writer, upstream_node, remote_reader, remote_writer)
+                finally:
+                    try:
+                        if not remote_writer.is_closing():
+                            remote_writer.close()
+                        await remote_writer.wait_closed()
+                    except Exception:
+                        pass
 
         except Exception as e:
-            print(f"[-] Gateway client error ({client_ip}): {e}")
+            # 2026-11-19 review P3: print 改 logger (数据面诊断进统一日志管道,
+            # 且 {e} 可能内嵌请求原文, logging 的转义路径比裸 print 稳)
+            logger.error("Gateway client error (%s): %s", client_ip, e)
         finally:
             # Every exit path (early returns included) must release the client socket.
             try:
@@ -1466,9 +1533,11 @@ class ForwardProxyGateway:
             return
         entries, self._metrics_buffer = self._metrics_buffer, []
         try:
-            self.storage.incr_metrics(entries)
+            # 2026-11-19 review P1: 批量落库 (可达 5 万条) 曾直接跑在事件环上,
+            # 与 prober 争 SQLite 锁时会卡住全部 relay 连接 —— 移入线程。
+            await asyncio.to_thread(self.storage.incr_metrics, entries)
         except Exception as exc:
-            print(f"[-] Failed to flush gateway metrics: {exc}")
+            logger.error("Failed to flush gateway metrics: %s", exc)
             self._metrics_buffer = entries + self._metrics_buffer
             if len(self._metrics_buffer) > 50000:
                 del self._metrics_buffer[:len(self._metrics_buffer) - 50000]
@@ -1486,7 +1555,9 @@ class ForwardProxyGateway:
             await asyncio.sleep(self.target_probe_interval)
             round_start = time.monotonic()
             try:
-                healthy = [n for n in self.storage.list_nodes()
+                # 2026-11-19 review P1: 全表读移出事件环 (与 prober 争锁可达秒级)
+                nodes = await asyncio.to_thread(self.storage.list_nodes)
+                healthy = [n for n in nodes
                            if n.status == HealthStatus.HEALTHY.value]
                 # 内存卫生: 已删/退役节点的 (node, class) 条目永远不会再被
                 # record/TTL 触达, 每轮裁剪一次 (数据流 review 2026-11-14)。

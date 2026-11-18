@@ -575,6 +575,14 @@ class Router:
                 if c:
                     return c
             if allow_region_relax:
+                # 2026-11-19 review P2: 镜像 healthy 梯子的同 egress 步 —— region-less
+                # 的 egress 钉定账号此前在 degraded 档直接跳 match_egress=False,
+                # 2026-11-16 "127 个 cpa 账号被 rehome 到 native-v4" 的事故类
+                # 在部分降级时仍可复现。
+                if egress_type:
+                    c = find_pool(t, HealthStatus.DEGRADED.value, match_egress=True, match_region=False)
+                    if c:
+                        return c
                 c = find_pool(t, HealthStatus.DEGRADED.value, match_egress=False, match_region=False)
                 if c:
                     return c

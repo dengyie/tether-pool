@@ -78,12 +78,16 @@ def node_isp(node: ProxyNode) -> str:
 
 
 def build_ban_excluded_networks(quarantines, avoid_cidrs: Optional[List[str]]) -> List[Any]:
-    """被封 exit_ip 的 /24 + 显式 avoid_cidr 网段 (非法 CIDR 跳过, 不炸请求)。"""
+    """被封 exit_ip 的网段 + 显式 avoid_cidr 网段 (非法 CIDR 跳过, 不炸请求)。
+    2026-11-19 review P3: v4 用 /24, v6 用 /64 —— 与 router battery 路径的
+    地址族规则对齐 (v6 /24 罩住 2^104 个地址 ≈ 一个被封 v6 出口就封掉整个 v6 池)。"""
     nets: List[Any] = []
     for q in quarantines:
         try:
             if q.exit_ip:
-                nets.append(ipaddress.ip_network(f"{q.exit_ip}/24", strict=False))
+                addr = ipaddress.ip_address(q.exit_ip)
+                prefix = 24 if addr.version == 4 else 64
+                nets.append(ipaddress.ip_network(f"{q.exit_ip}/{prefix}", strict=False))
         except ValueError:
             continue
     for cidr in avoid_cidrs or []:

@@ -476,3 +476,73 @@ async def test_midstream_eof_non_reset_outcomes_never_feedback(temp_gateway):
             gateway._handle_midstream_eol("innocent-node", outcome)
     await asyncio.sleep(0.1)
     assert storage.get_node("innocent-node").fail_count == 0
+
+
+# ---------------------------------------------------------------- pump_streams 分类学 (2026-11-19 review)
+
+class _TaxReader:
+    def __init__(self, chunks=(), hang=False, read_fail=False):
+        self._chunks = list(chunks)
+        self._hang = hang
+        self._read_fail = read_fail
+    async def read(self, n):
+        if self._read_fail:
+            raise ConnectionResetError("peer RST")
+        if self._hang:
+            await asyncio.sleep(999)
+        if not self._chunks:
+            return b""
+        return self._chunks.pop(0)
+
+class _TaxWriter:
+    def __init__(self, write_fail=False):
+        self._closed = False
+        self._write_fail = write_fail
+    def write(self, data):
+        if self._write_fail:
+            raise ConnectionResetError("peer pipe dead")
+    async def drain(self):
+        if self._write_fail:
+            raise ConnectionResetError("peer pipe dead")
+    def can_write_eof(self):
+        return not self._closed
+    def write_eof(self):
+        pass
+    def is_closing(self):
+        return self._closed
+    def close(self):
+        self._closed = True
+    async def wait_closed(self):
+        return None
+
+
+def test_pump_streams_client_upload_with_upstream_death_is_upstream_reset():
+    """2026-11-19 review P2 根修回归: 客户端活跃上传时上游死亡 (t1 写半边
+    失败 + t2 读半边失败) —— 旧分类判 both_error/client_error 不反馈,
+    EOF 闭环半开; 新分类按失败来源判 upstream_reset。"""
+    r1 = _TaxReader(chunks=[b"POST data"], hang=True)   # 客户端持续上传
+    w2 = _TaxWriter(write_fail=True)                    # 写上游失败 = 上游死了
+    r2 = _TaxReader(read_fail=True)                     # 读上游失败 = 上游死了
+    w1 = _TaxWriter()
+    out = asyncio.run(gateway_mod.pump_streams(r1, w1, r2, w2))
+    assert out == "upstream_reset"
+
+
+def test_pump_streams_client_rst_is_client_error():
+    """客户端 RST (t1 读失败) 而上游健康 → client_error, 不反馈。"""
+    r1 = _TaxReader(read_fail=True)
+    w2 = _TaxWriter()
+    r2 = _TaxReader(chunks=[b"resp"])
+    w1 = _TaxWriter()
+    out = asyncio.run(gateway_mod.pump_streams(r1, w1, r2, w2))
+    assert out == "client_error"
+
+
+def test_pump_streams_client_clean_close_first():
+    """客户端 clean FIN 先到 → client_first (宽限期上游传播不计)。"""
+    r1 = _TaxReader()            # 立即 EOF
+    w2 = _TaxWriter()
+    r2 = _TaxReader(read_fail=True)   # 上游随后出错 (传播)
+    w1 = _TaxWriter()
+    out = asyncio.run(gateway_mod.pump_streams(r1, w1, r2, w2))
+    assert out == "client_first"
