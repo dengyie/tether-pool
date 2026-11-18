@@ -545,6 +545,18 @@ def parse_proxy_credentials(raw_user: str) -> ParsedCredentials:
     tier = tier.strip() if tier and tier.strip() else None
     tier_policy = tier_policy.strip() if tier_policy and tier_policy.strip() else None
 
+    # 格式命中可观察 (2026-11-18 review F4): 四种格式共享一条线性探测链, 字面
+    # 账号名撞上 `?` / `__` / `k=v` 关键词会被静默改写成别的格式解析 (绑定落到
+    # 非预期名字下), 无日志时这类误触发无法排查。DEBUG 级: 稳态消费方一行/请求。
+    fmt = ("query" if "?" in raw_user else "dunder" if "__" in raw_user else
+           "dashkv" if any(t in raw_user.lower() for t in ("account=", "region=", "type=", "service=", "tier=", "rebind=")) else "plain")
+    if fmt != "plain":
+        logger.debug(
+            "credential format=%s account=%s region=%s egress=%s service=%s tier=%s policy=%s rebind=%s strict=%s persist=%s",
+            fmt, account_id, region, egress_type, service, tier, tier_policy,
+            force_rebind, region_strict, bind_persist,
+        )
+
     return ParsedCredentials(
         account_id=account_id,
         region=region,
@@ -776,7 +788,10 @@ class ForwardProxyGateway:
             auth_val = headers_dict["proxy-authorization"].strip()
             if auth_val.lower().startswith("basic "):
                 try:
-                    decoded = base64.b64decode(auth_val[6:].strip()).decode("utf-8")
+                    # 解码容错与 _password_ok 同规 (errors="replace"): 密码门用
+                    # replace 解码可放行非 UTF-8 用户名, 这里若用严格解码会把
+                    # 已过 407 的请求静默打成 anon (不落库/丢粘性/无日志)。
+                    decoded = base64.b64decode(auth_val[6:].strip()).decode("utf-8", "replace")
                     user_part = decoded.split(":", 1)[0] if ":" in decoded else decoded
                     parsed = parse_proxy_credentials(user_part)
                     account_id = parsed.account_id
@@ -788,8 +803,13 @@ class ForwardProxyGateway:
                     auth_force_rebind = parsed.force_rebind
                     auth_region_strict = parsed.region_strict
                     auth_bind_persist = parsed.bind_persist
-                except Exception:
-                    pass
+                except Exception as parse_err:
+                    # 唯一剩余来源: b64 非法 (密码门已用同一 b64decode 放行,
+                    # 理论不可达, 防御性兜底)。必须可观察, 不再静默吞。
+                    logger.warning(
+                        "credential parse failed (routing as anonymous): peer=%s err=%s",
+                        client_ip, parse_err,
+                    )
 
         if not account_id:
             # Ephemeral ID for anonymous requests so pool naturally distributes without pinning all localhost requests

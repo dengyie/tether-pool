@@ -323,6 +323,21 @@ class Router:
                 # Ensure existing node is HEALTHY (Closed)
                 elif node and node.status == HealthStatus.HEALTHY.value and node.name not in excluded:
                     if _node_matches_constraints(node):
+                        # 孤儿镜像自愈 (2026-11-18 review F2 根修): set_lease 与
+                        # batch_save_allocations 是两个事务, 崩在中间会留下只写
+                        # 了 leases 的孤儿行 —— auto_rehome 扫 allocations 表,
+                        # 孤儿账号静默脱离 rehome 保护网。采纳时补建权威行,
+                        # reason=lease_adopt; 本调用的约束集一并落 (bound_*)。
+                        # 写失败不拦请求: 下一请求会再次尝试补建。
+                        try:
+                            honoured = _honoured_constraints(node)
+                            self.storage.batch_save_allocations(
+                                [(svc, account_id, node.name, existing.assigned_at or datetime.now().isoformat())],
+                                reason="lease_adopt",
+                                constraints_by_account={(svc, account_id): honoured} if honoured else {},
+                            )
+                        except Exception as adopt_err:
+                            print(f"[-] lease_adopt persistence failed for {account_id}: {adopt_err}")
                         return existing
                     binding_conflict = True
                 elif (

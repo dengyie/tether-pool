@@ -12,6 +12,7 @@ R-C: `region_strict_true` hardens the region filter at acquire time (no cross-re
 Unconstrained leases keep the availability-first behaviour byte-for-byte.
 """
 
+import base64
 import os
 import tempfile
 import pytest
@@ -42,6 +43,20 @@ def temp_pool():
 
     yield router, storage
 
+    if os.path.exists(db_path):
+        from tests.conftest import cleanup_sqlite_artifacts
+        cleanup_sqlite_artifacts(db_path)
+
+
+@pytest.fixture
+def temp_gateway():
+    """Local mirror of tests/test_gateway.py::temp_gateway (F1 tests live here)."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+    storage = Storage(db_path=db_path)
+    router = Router(storage)
+    gateway = ForwardProxyGateway(storage, router, host="127.0.0.1", port=0)
+    yield gateway, storage, router
     if os.path.exists(db_path):
         from tests.conftest import cleanup_sqlite_artifacts
         cleanup_sqlite_artifacts(db_path)
@@ -659,3 +674,92 @@ def test_unconstrained_force_rebind_preserves_existing_promise(temp_pool):
     alloc2 = storage.find_allocation_by_account("pin_acc")
     assert alloc2["bound_region"] == "us-west", \
         f"unconstrained rebind stripped the region promise: {alloc2['bound_region']!r}"
+
+
+# ---------------------------------------------------------------- 2026-11-18 review fixes (F1-F4)
+
+def test_extract_routing_headers_non_utf8_username_not_anonymous(temp_gateway):
+    """F1 root-fix: a Basic credential whose username carries non-UTF-8 bytes must
+    NOT silently degrade to an anon_* account (the password gate decodes with
+    errors='replace' and lets it pass; the routing extractor must stay in lockstep
+    so stickiness survives instead of every request landing on a random node)."""
+    gateway, storage, router = temp_gateway
+    raw = base64.b64encode("acct\xff:user-pw".encode("latin-1")).decode("ascii")
+    ctx = gateway._extract_routing_headers(
+        {"proxy-authorization": f"Basic {raw}"}, client_ip="10.144.144.4"
+    )
+    assert ctx.account_id == "acct\ufffd", ctx.account_id
+    assert not ctx.account_id.startswith("anon_")
+
+    # And the same header passes the password gate (lockstep decode).
+    gateway.password = "user-pw"
+    assert gateway._password_ok(f"Basic {raw}")
+
+
+def test_extract_routing_headers_malformed_b64_logs_warning(temp_gateway, caplog):
+    """F1 observability: an undecodable credential never passes silently — the
+    warning path must fire (previously `except Exception: pass`)."""
+    gateway, storage, router = temp_gateway
+    with caplog.at_level("WARNING", logger="tetherpool.gateway"):
+        ctx = gateway._extract_routing_headers(
+            {"proxy-authorization": "Basic !!!notb64!!!"}, client_ip="10.144.144.4"
+        )
+    assert ctx.account_id.startswith("anon_")  # degraded, but observable now
+    assert any("credential parse failed" in r.message for r in caplog.records)
+
+
+def test_constraint_backfill_on_parameterized_rebind(temp_pool):
+    """F3: bare credential creates the binding, then a __tier_standard credential
+    for the SAME account must keep the sticky node AND backfill bound_tier
+    (the production-verified Mode A gradual-onboarding trajectory)."""
+    router, storage = temp_pool
+
+    # egress_type=None mirrors the gateway call shape for an unconstrained
+    # credential (the API-level warp_ipv6 default is never exercised by the
+    # HTTP layer; with it the ladder relaxes onto native nodes and the
+    # parameterized call below would be a binding-conflict, not a backfill).
+    l1 = router.acquire_for_account("alpaca4", egress_type=None)
+    assert l1 is not None
+    alloc1 = storage.find_allocation_by_account("alpaca4")
+    assert alloc1["bound_tier"] == ""
+
+    # Parameterized call: same account, tier=standard constraint. Node is
+    # standard-tier in the fixture pool, so the fast path must hold the node.
+    l2 = router.acquire_for_account("alpaca4", tier="standard", egress_type=None)
+    assert l2.node_name == alloc1["node_name"]
+
+    alloc2 = storage.find_allocation_by_account("alpaca4")
+    assert alloc2["node_name"] == alloc1["node_name"], "fast path moved the node"
+    assert alloc2["bound_tier"] == "standard", \
+        f"constraint backfill did not run: bound_tier={alloc2['bound_tier']!r}"
+
+    # Steady state: repeat call is stable and keeps the backfilled promise.
+    l3 = router.acquire_for_account("alpaca4", tier="standard", egress_type=None)
+    assert l3.node_name == alloc1["node_name"]
+    assert storage.find_allocation_by_account("alpaca4")["bound_tier"] == "standard"
+
+
+def test_lease_orphan_adopted_into_allocations(temp_pool):
+    """F2 root-fix: a leases-mirror row left behind by a crash between set_lease
+    and batch_save_allocations must be re-materialized into account_allocations
+    on adoption — otherwise the account silently drops out of every auto_rehome
+    sweep (they scan the allocations table)."""
+    router, storage = temp_pool
+
+    # Simulate the orphan: only the legacy mirror exists.
+    storage.set_lease("orphan_acc", "gcp-uswest-native-v4")
+    assert storage.find_allocation_by_account("orphan_acc") is None
+
+    # egress_type=None mirrors the gateway call shape for an unconstrained
+    # credential (the acquire API default of warp_ipv6 is a router-level
+    # legacy default the HTTP layer never exercises).
+    lease = router.acquire_for_account("orphan_acc", egress_type=None)
+    assert lease.node_name == "gcp-uswest-native-v4"  # sticky still honored
+
+    alloc = storage.find_allocation_by_account("orphan_acc")
+    assert alloc is not None, "lease_adopt did not rebuild the authoritative row"
+    assert alloc["node_name"] == "gcp-uswest-native-v4"
+
+    changes = storage.list_binding_changes_since("default", 0)
+    assert any(c.reason == "lease_adopt" and c.account_id == "orphan_acc"
+               for c in changes), f"lease_adopt not in change log: {[c.reason for c in changes]}"
