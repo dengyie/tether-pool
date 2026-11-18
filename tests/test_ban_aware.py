@@ -747,7 +747,7 @@ def test_battery_swap_no_cross_service_lease_constraint_leak(storage):
 
 
 def test_target_health_adaptive_ttl_and_cache(storage):
-    """#1: 轮长 > TTL 时 TTL 自适应放宽 (只放宽不收紧); 缓存与 is_bad 一致。"""
+    """#1: 轮长 > TTL 时 TTL 自适应放宽; 缓存与 is_bad 一致。"""
     from core.target_health import TargetHealthTracker
     t = TargetHealthTracker(bad_ttl_seconds=300.0)
     # bad_streak=2: 连败 2 次才判坏 (快速恢复优先于惩罚)
@@ -755,11 +755,14 @@ def test_target_health_adaptive_ttl_and_cache(storage):
     t.record("n1", "google", False, "timeout")
     t.record("n2", "google", True)
     assert t.bad_nodes("google") == {"n1"}
-    # 轮长 750s -> TTL 放宽到 >=750, 不回落
+    # 轮长 750s -> TTL 放宽到 >=750, 不低于盖住当前轮长的下限
     t.note_round_duration(750.0)
     assert t.bad_ttl_seconds >= 750.0
+    # 轮长回落 -> TTL 直接回落到下限 max(配置基线, 当前轮长/1.5)
+    # (2026-11-18 双向自适应): 保证 TTL 永远盖住当前轮长, 又不让一次慢轮把
+    # 恢复延迟永久钉在高位
     t.note_round_duration(10.0)
-    assert t.bad_ttl_seconds >= 750.0  # 只放宽不收紧
+    assert t.bad_ttl_seconds == 300.0  # 回落到配置基线 (轮长 10s 时 floor=基线)
     # 缓存路径与 is_bad 一致
     t.refresh_bad_cache()
     assert t.cached_bad_nodes("google") == {"n1"}

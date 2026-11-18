@@ -630,7 +630,7 @@ class ForwardProxyGateway:
             0.0, float(os.environ.get("IP_POOL_TARGET_PROBE_INTERVAL", "120"))
         )
         self.target_probe_concurrency = max(
-            1, int(os.environ.get("IP_POOL_TARGET_PROBE_CONCURRENCY", "10"))
+            1, int(os.environ.get("IP_POOL_TARGET_PROBE_CONCURRENCY", "40"))
         )
         self.target_probe_timeout = max(
             2.0, float(os.environ.get("IP_POOL_TARGET_PROBE_TIMEOUT", "8"))
@@ -1281,7 +1281,20 @@ class ForwardProxyGateway:
             # Prometheus scrapers need no proxy credentials.
             if self.password and not self._metrics_exempt(method, target):
                 if not self._password_ok(headers_dict.get("proxy-authorization", "")):
-                    logger.warning("gateway auth rejected: peer=%s target=%s", client_ip, target[:80])
+                    # 提取 presented username 做观测 (与 F1 同规: utf-8/replace 解码,
+                    # 只留用户名前 40 字符, 不落密码), 用于定位无凭据/坏凭据的调用方。
+                    presented_user = ""
+                    raw_auth = headers_dict.get("proxy-authorization", "")
+                    if raw_auth.lower().startswith("basic "):
+                        try:
+                            decoded = base64.b64decode(raw_auth[6:].strip()).decode("utf-8", "replace")
+                            presented_user = decoded.split(":", 1)[0][:40]
+                        except Exception:
+                            presented_user = "<b64-error>"
+                    logger.warning(
+                        "gateway auth rejected: peer=%s target=%s user=%s",
+                        client_ip, target[:80], presented_user or "<none>",
+                    )
                     if method.upper() == "CONNECT":
                         resp = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"tetherpool\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     else:

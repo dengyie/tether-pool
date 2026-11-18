@@ -66,6 +66,10 @@ class TargetHealthTracker:
 
     def __init__(self, bad_streak: int = 2, bad_ttl_seconds: float = 300.0):
         self.bad_streak = max(1, bad_streak)
+        # TTL 自适应基线 (2026-11-18): 棘轮只放宽会把一次偶发慢轮 (456 节点 ×
+        # 3 类, 轮长 500s+) 的 TTL 永久钉在 ~750s, 节点恢复后坏记录多滞留一轮
+        # 才过期 -> 恢复慢。允许回落到初始基线之下限: 至少覆盖配置值。
+        self._ttl_floor = bad_ttl_seconds
         self.bad_ttl_seconds = bad_ttl_seconds
         # (node, class) -> {"window": deque(maxlen=4), "ts": float, "err": str}
         self._state: Dict[Tuple[str, str], Dict] = {}
@@ -74,9 +78,16 @@ class TargetHealthTracker:
     def note_round_duration(self, seconds: float) -> None:
         """TTL 自适应: TTL 必须盖住一整轮探活 + 间隙, 否则轮尾记录在下一轮判定时
         已过 TTL -> bad 集恒空, steering 静默失效 (二轮 review: 3000 节点 × 3 类 ×
-        并发 10, 轮长可达 750s+, 远超默认 TTL 300s)。只放宽不收紧 (人工调大的 env 生效)。"""
+        并发 10, 轮长可达 750s+, 远超默认 TTL 300s)。
+
+        双向自适应 (2026-11-18): 轮长涨则放宽 (×1.5), 轮长回落则直接设为下限
+        max(配置基线, round/1.5) —— 保证 TTL 永远盖住当前轮长, 又不让一次慢轮
+        把恢复延迟永久钉在高位。"""
+        floor = max(self._ttl_floor, seconds / 1.5)
         if seconds > self.bad_ttl_seconds:
             self.bad_ttl_seconds = seconds * 1.5
+        elif self.bad_ttl_seconds > floor:
+            self.bad_ttl_seconds = floor
 
     def refresh_bad_cache(self) -> None:
         """每轮探活结束重算一次坏集缓存; 热路径 (_open_upstream) 读缓存,
