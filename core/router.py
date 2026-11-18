@@ -508,10 +508,25 @@ class Router:
         policy: str,
         region_strict: bool = False
     ) -> List[ProxyNode]:
+        # 2026-11-19 性能重构: 梯子一次调用最多触发 12+4 次独立 SQLite 连接+查询
+        # (每次 list_nodes 都 _get_conn 开新连接), 单次 acquire 在消费高并发下
+        # 是放大器。改为单快照 + 内存过滤 —— 过滤语义逐字段等价 (等值匹配 +
+        # ORDER BY name), 且同一次 acquire 内各梯级看到一致快照。
+        snapshot = sorted(self.storage.list_nodes(), key=lambda n: n.name)
+
+        def _sel(n: ProxyNode, r: Optional[str], e: Optional[str],
+                 status: Optional[str], tier: Optional[str]) -> bool:
+            # truthiness 边界与 SQL 的 `if param:` 拼接语义一致 (空串同样省略)
+            return ((not r or n.region == r)
+                    and (not e or n.egress_type == e)
+                    and (not status or n.status == status)
+                    and (not tier or n.tier == tier))
+
         def find_pool(p_tier: Optional[str], p_status: str, match_egress: bool, match_region: bool) -> List[ProxyNode]:
             r = region if match_region else None
             e = egress_type if match_egress else None
-            nodes = self.storage.list_nodes(region=r, egress_type=e, status=p_status, tier=p_tier)
+            nodes = [n for n in snapshot
+                     if _sel(n, r, e, p_status, p_tier)]
             if egress_type is None:
                 # 计量型 vendor 家宽 (residential 标签) 是显式 opt-in 资源:
                 # 未声明 egress_type 的请求 (匿名/无类型) 不得默认落在其上,
@@ -591,18 +606,20 @@ class Router:
 
         # 3. Final fallback if cross-tier allowed (strictly exclude DEAD nodes to respect circuit breaker)
         if allow_cross_tier:
-            c = [n for n in self.storage.list_nodes(region=region, egress_type=egress_type) if n.status not in (HealthStatus.DEAD.value, HealthStatus.DISABLED.value)]
+            alive = [n for n in snapshot
+                     if n.status not in (HealthStatus.DEAD.value, HealthStatus.DISABLED.value)]
+            c = [n for n in alive if _sel(n, region, egress_type, None, None)]
             if c:
                 return c
             # 2026-11-15 review #4: region-only 中间档 (region 承诺仍在, 只放
             # egress) —— 旧逻辑非 strict 时直接从 region+egress 跳到全球池,
             # 同区明明有其他 egress 的健康节点却拿到外国出口。
-            c_region_only = [n for n in self.storage.list_nodes(region=region) if n.status not in (HealthStatus.DEAD.value, HealthStatus.DISABLED.value)]
+            c_region_only = [n for n in alive if _sel(n, region, None, None, None)]
             if c_region_only:
                 return c_region_only
             if allow_region_relax:
-                return [n for n in self.storage.list_nodes() if n.status not in (HealthStatus.DEAD.value, HealthStatus.DISABLED.value)]
-            c_region = [n for n in self.storage.list_nodes(region=region) if n.status not in (HealthStatus.DEAD.value, HealthStatus.DISABLED.value)]
+                return alive
+            c_region = [n for n in alive if _sel(n, region, None, None, None)]
             if c_region:
                 return c_region
 
