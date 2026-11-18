@@ -290,17 +290,24 @@ def clean_nodes(group: dict) -> list[dict]:
 def gen_group_js(group_name: str, group: dict) -> str:
     nodes_js = ",\n      ".join(json.dumps(n, ensure_ascii=False) for n in clean_nodes(group))
     dialer = json.dumps(group.get("dialer_proxy"), ensure_ascii=False)
+    # 2026-11-19 可用性根修: relay_group (fallback 组) —— 节点 dialer-proxy 指向组,
+    # mihomo 健康检查自动在候选中继间切换 (亚秒级, 无需外部 watchdog/重渲染)。
+    rg = group.get("relay_group") or None
+    relay_group = json.dumps(rg, ensure_ascii=False) if rg else "null"
     inject = json.dumps(group.get("inject_into_groups", []), ensure_ascii=False)
     legacy = json.dumps(group.get("legacy_groups_cleanup", []), ensure_ascii=False)
     realized = group["bridge_ports"].get("realized", "")
     fn = f"ensureNPGroup_{group_name}"
     return f"""// >>> NODE-PIPELINE:{group_name}:v1
 // 由 scripts/node_pipeline.py 管理(managed block), 手改会被 import/heal 覆盖。
-// 设计: 固定中转(dialer-proxy 单节点, 不建中转组) + 节点注入现有组(不独立成组)。
+// 设计: 中继(dialer-proxy 指向 fallback 组, mihomo 健康检查自动切换候选中继;
+// 无 relay_group 时退化为固定单节点; 候选全缺失时退直连防悬空引用)
+// + 节点注入现有组(不独立成组)。
 // TetherPool 桥接 listener 驻留在 Verge 冻结底座({realized}
 // → 本数组节点), Merge.yaml 内为同目标重建镜像(按代理去重, 勿重复加)。
 const NP_{group_name.upper()} = {{
   dialerProxy: {dialer},
+  relayGroup: {relay_group},
   injectIntoGroups: {inject},
   legacyGroupsCleanup: {legacy},
   nodes: [
@@ -315,14 +322,44 @@ function {fn}(config) {{
     proxies.map((proxy) => proxy?.name).filter(Boolean)
   );
 
-  // 固定中转: dialer-proxy 指向单节点; 该节点不存在时退直连(防止悬空引用炸配置)
-  const relayFixed = spec.dialerProxy && names.has(spec.dialerProxy)
-    ? spec.dialerProxy
-    : null;
+  // 中继选择 (2026-11-19 可用性根修):
+  // 1) relayGroup 且候选存在 -> 创建/刷新 fallback 组, dialer 指向组名
+  //    (mihomo 健康检查自动在候选中继间切换, 无需外部 watchdog);
+  // 2) 否则退固定单节点 (旧语义);
+  // 3) 全部不存在 -> 直连 (防悬空引用炸配置)。
+  let dialer = null;
+  const groupsAll =
+    config["proxy-groups"] ||
+    (config["proxy-groups"] = []);
+  const rg = spec.relayGroup;
+  if (rg) {{
+    const avail = (rg.candidates || []).filter((c) => names.has(c));
+    if (avail.length > 0) {{
+      let g = groupsAll.find((x) => x?.name === rg.name);
+      if (!g) {{
+        groupsAll.push({{
+          name: rg.name,
+          type: rg.type || "fallback",
+          url: rg.url || "http://www.gstatic.com/generate_204",
+          interval: rg.interval || 300,
+          proxies: avail,
+        }});
+      }} else {{
+        g.type = rg.type || "fallback";
+        g.url = rg.url || "http://www.gstatic.com/generate_204";
+        g.interval = rg.interval || 300;
+        g.proxies = avail;
+      }}
+      dialer = rg.name;
+    }}
+  }}
+  if (!dialer && spec.dialerProxy && names.has(spec.dialerProxy)) {{
+    dialer = spec.dialerProxy;
+  }}
 
   for (const base of spec.nodes) {{
-    const node = relayFixed
-      ? {{ ...base, "dialer-proxy": relayFixed }}
+    const node = dialer
+      ? {{ ...base, "dialer-proxy": dialer }}
       : {{ ...base }};
     if (names.has(node.name)) {{
       const idx = proxies.findIndex((p) => p?.name === node.name);
@@ -544,7 +581,27 @@ def js_block_drift(group_name: str, group: dict, script: str) -> list[str]:
     cur_dialer, found = parse_managed_dialer(script, group_name)
     if found and cur_dialer != group.get("dialer_proxy"):
         drift.append("<dialer-proxy>")
+    cur_rg, rg_found = parse_managed_relay_group(script, group_name)
+    if rg_found and cur_rg != (group.get("relay_group") or None):
+        drift.append("<relay-group>")
     return drift
+
+
+def parse_managed_relay_group(script: str, group_name: str) -> tuple[object, bool]:
+    """托管块内的 relayGroup 对象 (fallback 中继组定义). 返回 (值, 块是否存在)."""
+    begin = BLOCK_BEGIN.format(group=group_name)
+    end = BLOCK_END.format(group=group_name)
+    i = script.find(begin)
+    if i < 0:
+        return None, False
+    j = script.find(end, i)
+    if j < 0:
+        return None, False
+    m = re.search(r"^\s*relayGroup:\s*(.+?)\s*,?\s*$", script[i:j], re.M)
+    if not m:
+        return None, True
+    val = m.group(1)
+    return (None if val == "null" else json.loads(val)), True
 
 
 # ---------------------------------------------------------------- check

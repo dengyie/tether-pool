@@ -12,8 +12,27 @@ s<n>- 前缀 (is_sub 识别依赖); 某源拉取失败时沿用该源上一轮�
 - 失败非零退出 + 明确 stderr 标记 [SUB_REFRESH_FAIL], 日志可 grep 告警
 - 备份带时间戳并保留最近 7 份, 不再覆盖固定名
 """
-import fcntl, json, re, socket, subprocess, sys, time, urllib.request, os, glob
+import fcntl, json, re, socket, subprocess, sys, time, urllib.request, urllib.error, os, glob
 from pathlib import Path
+
+# 订阅侧拒绝的分层 (2026-11-19 review): 410/404 = 链接冻结/失效, 重试只会
+# 加重风控或纯浪费; 401/403 = 鉴权/风控拒绝, 重试有害; 429 = 限速, 语义是
+# "退避后可再试" —— 读 Retry-After 等一次, 无头时仅重试 1 次 (而非 3 次)。
+PERMANENT_HTTP = {401, 403, 404, 410}
+RATE_LIMITED_HTTP = {429}
+
+
+class PermanentSubError(Exception):
+    """源侧永久性拒绝 (冻结/失效/鉴权), 不做重试, 直接 carry-over。"""
+
+
+class RateLimitedSubError(Exception):
+    """429 限速: 语义与永久拒绝不同 —— Retry-After 内退避一次, 超时交回主流程
+    (走 [SUB_SOURCE_FAIL] carry-over, 次日 cron 自然重试)。"""
+
+    def __init__(self, code, retry_after=None):
+        self.retry_after = retry_after
+        super().__init__(f"HTTP {code}" + (f" (Retry-After {retry_after}s)" if retry_after else ""))
 
 # bearer-token 型订阅 URL 即凭据, 仓库不落盘: 从 /etc/ip-pool-secrets.env 读。
 def _sub_sources():
@@ -62,23 +81,54 @@ def _unbool_proxies(proxies):
     return proxies
 
 
+def _classify_http_error(e):
+    """HTTPError -> (异常实例, 剩余重试次数)。分类是唯一的, fetch 只按它循环。"""
+    detail = ""
+    try:
+        detail = e.read()[:200].decode("utf-8", "replace").strip()
+    except Exception:
+        pass
+    if e.code in PERMANENT_HTTP:
+        return PermanentSubError(f"HTTP {e.code} {detail}".strip()), 0
+    if e.code in RATE_LIMITED_HTTP:
+        ra = e.headers.get("Retry-After") if e.headers else None
+        try:
+            wait = int(ra) if ra else None
+        except (TypeError, ValueError):
+            wait = None
+        if wait is not None and wait <= 60:
+            # Retry-After 可等且不长: 等这一次, 之后按预算耗尽处理 (不再连打)
+            time.sleep(wait)
+            return RateLimitedSubError(e.code, wait), 0
+        # 无头或等待过长: 傻等不如低频再试, 给 1 次重试预算
+        return RateLimitedSubError(e.code), 1
+    return e, 2  # 瞬时错误: 保持原 3 次全量重试
+
+
 def fetch_and_parse(url):
     import yaml
     # 部分机场订阅拒默认 python-urllib UA (403): 与 pigeonw 刷新同款 curl 身份;
     # VPS 直连偶发握手超时, 3 次重试后才交回主流程 (触发该源 carry-over)。
-    last = None
-    for attempt in range(3):
+    # 但 4xx 明确拒绝不重试: 机场风控把连续拉取算作"异常拉取", 越重试越封。
+    remaining = 2  # 首次之外的重试预算
+    while True:
         try:
             req = urllib.request.Request(url, headers={
                 "User-Agent": "clash-verge/1.6.6", "Accept": "*/*"})
             raw = urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "replace")
             d = yaml.safe_load(raw) or {}
             return _unbool_proxies(d.get("proxies") or [])
+        except urllib.error.HTTPError as e:
+            err, retries = _classify_http_error(e)
+            if retries == 0:
+                raise err from e
+            remaining = min(remaining, retries)
         except Exception as e:
-            last = e
-            if attempt < 2:
-                time.sleep(2)
-    raise last
+            err = e
+        if remaining <= 0:
+            raise err
+        remaining -= 1
+        time.sleep(2)
 
 
 def normalize_source_proxies(proxies, src_idx):
@@ -118,6 +168,27 @@ _CN_REGION = {
     "澳大利亚": "au", "土耳其": "tr", "阿联酋": "ae", "巴西": "br",
 }
 
+# 英文城市/国家名兜底: 机场常用 "[vless]Tokyo1 - B Group" 这类无国家码命名。
+# 交集词 (india/indiana 类) 用词边界规避子串误报 (Indianapolis 不再命中 india);
+# 边界右侧把数字也算进来 (Tokyo1/HongKong3 是机场高频命名), 左侧保持 \b 防前缀粘连。
+_EN_REGION = {
+    "tokyo": "jp", "osaka": "jp", "japan": "jp",
+    "singapore": "sg",
+    "hongkong": "hk", "hong kong": "hk",
+    "taiwan": "tw", "taipei": "tw",
+    "frankfurt": "de", "germany": "de", "berlin": "de",
+    "california": "us-west", "los angeles": "us-west", "seattle": "us-west",
+    "london": "gb", "united kingdom": "gb",
+    "amsterdam": "nl", "netherlands": "nl",
+    "paris": "fr", "france": "fr",
+    "seoul": "kr", "korea": "kr",
+    "sydney": "au", "australia": "au",
+    "mumbai": "in", "india": "in",
+}
+_EN_REGION_PAT = re.compile(
+    r"\b(?:" + "|".join(sorted(_EN_REGION, key=len, reverse=True)) + r")\d?\b",
+    re.IGNORECASE)
+
 def _flag_cc(name):
     """国旗 emoji (两个区域指示符) -> ISO 国家码小写; 非国旗开头的名字返回 None。"""
     ri = [ord(ch) - 0x1F1E6 for ch in name if 0x1F1E6 <= ord(ch) <= 0x1F1FF]
@@ -126,13 +197,16 @@ def _flag_cc(name):
     return None
 
 def region_of(name):
-    # 优先级: 国旗 emoji > "US ..."/"s1-HK_11" 国家码 > 中文国名
+    # 优先级: 国旗 emoji > "US ..."/"s1-HK_11" 国家码 > 中文国名 > 英文城市名
     cc = _flag_cc(name)
     if not cc:
         m = re.search(r"(?:^|s\d-)([A-Z]{2})(?:[\s_-]|$)", name)
         cc = m.group(1).lower() if m else None
     if not cc:
         cc = next((v for k, v in _CN_REGION.items() if k in name), None)
+    if not cc:
+        m = _EN_REGION_PAT.search(name)
+        cc = _EN_REGION[m.group(0).rstrip("0123456789").lower()] if m else None
     return "us-west" if cc == "us" else (cc or "misc")
 
 def main():
@@ -169,6 +243,12 @@ def main():
                 got = fetch_and_parse(url)
                 ok_any = True
                 print(f"SUB{src_idx}: fetched {len(got)} proxies")
+            except (PermanentSubError, RateLimitedSubError) as e:
+                # 冻结/失效/限速: 重试无意义或有害, 沿用上一轮条目, 由日志告警人工处理
+                tag = "SUB_SOURCE_FROZEN" if isinstance(e, PermanentSubError) else "SUB_SOURCE_THROTTLED"
+                got = [dict(p) for p in old_sub if str(p.get("name", "")).startswith(f"s{src_idx}-")]
+                print(f"[{tag}] SUB{src_idx}: {e}; carrying {len(got)} previous nodes",
+                      file=sys.stderr)
             except Exception as e:
                 # 单源失败不中止: 沿用该源上一轮条目, 其余源照常刷新
                 got = [dict(p) for p in old_sub if str(p.get("name", "")).startswith(f"s{src_idx}-")]

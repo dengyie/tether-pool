@@ -231,37 +231,57 @@ def test_disabled_node_skipped_by_probe_node(temp_env):
     assert after.consecutive_failures == 0  # fail_count 家族没被动过
 
 
-def test_disabled_excluded_from_probe_all(temp_env):
-    """probe_all 默认过滤 DISABLED; force 不滤。"""
+def test_disabled_excluded_from_probe_all(temp_env, monkeypatch):
+    """probe_all 默认过滤 DISABLED/frozen; force 不滤。
+    2026-11-19 根修: 原版在测试内重写过滤逻辑自证 (同义反复), 现在打真
+    probe_all (monkeypatch probe_node 记录被探测者)。"""
+    import asyncio as _asyncio
     storage, _ = temp_env
     _mk(storage, "pa-1", status=HealthStatus.DISABLED.value, port=51001)
+    frozen = _mk(storage, "pa-frozen", status=HealthStatus.DEAD.value, port=51003)
+    frozen.tags = (frozen.tags or []) + ["frozen"]
+    storage.update_node("pa-frozen", {"tags": frozen.tags})
     _mk(storage, "pa-2", status=HealthStatus.HEALTHY.value, port=51002)
     from core.prober import Prober
     prober = Prober(storage, router=None, timeout=1.0)
-    import asyncio
-    nodes = [n for n in storage.list_nodes() if n.status != HealthStatus.DISABLED.value]
-    # 直接断言过滤逻辑 (probe_all 会真发请求, 这里验证过滤集合)
-    all_nodes = storage.list_nodes()
-    assert any(n.status == HealthStatus.DISABLED.value for n in all_nodes)
-    filtered = [n for n in all_nodes if n.status != HealthStatus.DISABLED.value]
-    assert all(n.status != HealthStatus.DISABLED.value for n in filtered)
+    seen = []
+
+    async def fake_probe_node(node, retries=1, force=False):
+        seen.append(node.name)
+        return ProbeResult(node_name=node.name, success=True, error="")
+
+    monkeypatch.setattr(prober, "probe_node", fake_probe_node)
+    _asyncio.run(prober.probe_all(concurrency=2))
+    assert "pa-1" not in seen and "pa-frozen" not in seen
+    assert seen == ["pa-2"]
 
 
-def test_disabled_excluded_from_allocator_fallback(temp_env):
-    """分配兜底 (只排 DEAD 的那层) 必须同时排除 DISABLED。"""
+def test_ladder_never_returns_disabled_or_dead(temp_env):
+    """真实 acquire 梯子 (healthy→degraded→fallback) 永不返回 DISABLED/DEAD。
+    2026-11-19 根修: 原版在测试内重写过滤自证, 现在打真梯子。"""
     storage, router = temp_env
-    dead = _mk(storage, "al-dead", port=52001, status=HealthStatus.DEAD.value)
-    disabled = _mk(storage, "al-disabled", port=52002, status=HealthStatus.DISABLED.value)
-    alive = _mk(storage, "al-alive", port=52003, status=HealthStatus.DEGRADED.value)
-    # 兜底层: 非 DEAD 也非 DISABLED 才能通过
-    from core.allocator import AllocationEngine
-    eng = AllocationEngine(storage)
-    nodes = [n for n in storage.list_nodes()
-             if n.status not in (HealthStatus.DEAD.value, HealthStatus.DISABLED.value)]
-    names = {n.name for n in nodes}
-    assert "al-dead" not in names
-    assert "al-disabled" not in names
-    assert "al-alive" in names
+    _mk(storage, "al-dead", port=52001, status=HealthStatus.DEAD.value)
+    _mk(storage, "al-disabled", port=52002, status=HealthStatus.DISABLED.value)
+    _mk(storage, "al-alive", port=52003, status=HealthStatus.DEGRADED.value)
+    lease = router.acquire_for_account(account_id="acc-ladder",
+                                       egress_type=EgressType.WARP_IPV6.value)
+    assert lease is not None
+    assert lease.node_name == "al-alive"
+
+
+def test_degraded_ladder_prefers_same_egress(temp_env):
+    """2026-11-19 review P2: degraded 梯子镜像 healthy 的同 egress 步 ——
+    egress 钉定账号在降级档不再从混合池里随机落到跨 egress 节点
+    (2026-11-16 127 个 cpa 账号错落 native-v4 的事故类)。"""
+    storage, router = temp_env
+    _mk(storage, "dg-native", port=52101, status=HealthStatus.DEGRADED.value,
+        egress=EgressType.NATIVE_IPV4.value)
+    _mk(storage, "dg-warp", port=52102, status=HealthStatus.DEGRADED.value,
+        egress=EgressType.WARP_IPV6.value)
+    lease = router.acquire_for_account(account_id="acc-eg",
+                                       egress_type=EgressType.WARP_IPV6.value)
+    assert lease is not None
+    assert lease.node_name == "dg-warp"
 
 
 def test_disabled_survives_upsert(temp_env):
@@ -295,26 +315,48 @@ def test_enable_returns_to_unprobed(temp_env):
 
 # ---------------- sick sweep ----------------
 
-def test_sick_sweep_targets_only_degraded(temp_env):
-    """_sick_probe_sweep 的候选集只含 DEGRADED, cap 生效。"""
+def test_sick_sweep_targets_only_degraded(temp_env, monkeypatch):
+    """_sick_probe_sweep 的候选集只含 DEGRADED。
+    2026-11-19 根修: 打真 sweep (monkeypatch 模块级 storage/prober)。"""
+    import asyncio as _asyncio
+    import api.server as api_mod
     storage, _ = temp_env
     for i in range(3):
         _mk(storage, "sk-h%d" % i, port=53000 + i, status=HealthStatus.HEALTHY.value)
     _mk(storage, "sk-d1", port=54001, status=HealthStatus.DEGRADED.value)
     _mk(storage, "sk-d2", port=54002, status=HealthStatus.DEGRADED.value)
     _mk(storage, "sk-dead", port=54003, status=HealthStatus.DEAD.value)
-    # 与 api/server.py::_sick_probe_sweep 相同的候选逻辑
-    cap = 100
-    sick = [n for n in storage.list_nodes(status=HealthStatus.DEGRADED.value)][:cap]
-    assert sorted(n.name for n in sick) == ["sk-d1", "sk-d2"]
+    seen = []
+
+    class FakeProber:
+        async def probe_all(self, concurrency=25, force=False, nodes=None):
+            seen.extend(n.name for n in nodes or [])
+            return [ProbeResult(node_name=n.name, success=True, error="") for n in nodes or []]
+
+    monkeypatch.setattr(api_mod, "storage", storage)
+    monkeypatch.setattr(api_mod, "prober", FakeProber())
+    _asyncio.run(api_mod._sick_probe_sweep())
+    assert sorted(seen) == ["sk-d1", "sk-d2"]
 
 
-def test_sick_sweep_cap_respected(temp_env):
+def test_sick_sweep_cap_respected(temp_env, monkeypatch):
+    import asyncio as _asyncio
+    import api.server as api_mod
     storage, _ = temp_env
     for i in range(5):
         _mk(storage, "cap-%d" % i, port=55000 + i, status=HealthStatus.DEGRADED.value)
-    sick = [n for n in storage.list_nodes(status=HealthStatus.DEGRADED.value)][:2]
-    assert len(sick) == 2
+    seen = []
+
+    class FakeProber:
+        async def probe_all(self, concurrency=25, force=False, nodes=None):
+            seen.extend(n.name for n in nodes or [])
+            return [ProbeResult(node_name=n.name, success=True, error="") for n in nodes or []]
+
+    monkeypatch.setattr(api_mod, "storage", storage)
+    monkeypatch.setattr(api_mod, "prober", FakeProber())
+    monkeypatch.setattr(api_mod, "PROBE_SICK_CAP", 2)
+    _asyncio.run(api_mod._sick_probe_sweep())
+    assert len(seen) == 2
 
 
 # ---------------- disable/enable/bulk-disable API ----------------

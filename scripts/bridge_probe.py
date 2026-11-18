@@ -14,6 +14,7 @@ probe_via_listeners: 起临时 mihomo 核, 为每个 proxy 开一个本地 socks
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -22,6 +23,91 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 MIHOMO_BIN = "/opt/ip-pool/bin/mihomo"
+
+
+def _parse_ss_ports(text):
+    """从 `ss -tlnp` 输出提取 (端口, pid) 对; 无 pid 归属时 pid=None。
+
+    行样例: `LISTEN 0 4096 127.0.0.1:39001 0.0.0.0:* users:(("mihomo",pid=1234,fd=18))`
+    pid 归属是防串扰的关键: 刷新脚本各自 flock, 但探活段可并发,
+    整机端口集会把别的临时核 listener 误当自己就绪 (出口 IP 错配)。
+    """
+    pairs = set()
+    for line in text.splitlines():
+        m = re.search(r":(\d+)\s", line)
+        if not m:
+            continue
+        pm = re.search(r"pid=(\d+)", line)
+        pairs.add((int(m.group(1)), int(pm.group(1)) if pm else None))
+    return pairs
+
+
+def _parse_lsof_ports(text):
+    """从 lsof -nP -iTCP -sTCP:LISTEN 输出提取 (端口, pid) 对 (跳过表头)。"""
+    pairs = set()
+    for line in text.splitlines()[1:]:
+        f = line.split()
+        if len(f) >= 9 and f[1].isdigit():
+            port = f[8].rsplit(":", 1)[-1]
+            if port.isdigit():
+                pairs.add((int(port), int(f[1])))
+    return pairs
+
+
+def _listening_ports():
+    """(端口, pid) 集合; ss 不可用 (如 macOS 本地调试) 时回退 lsof, 再不行返回 None。"""
+    try:
+        r = subprocess.run(["ss", "-tlnp"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return _parse_ss_ports(r.stdout)
+    except Exception:
+        pass
+    try:  # macOS / 无 ss 环境: lsof 按端口归属查
+        r = subprocess.run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            return _parse_lsof_ports(r.stdout)
+    except Exception:
+        pass
+    return None
+
+
+def wait_for_listeners(core, probe_pool, count, timeout=40):
+    """等临时核的 probe listener 全部就位再开探。
+
+    固定 sleep(4) 在节点数多时不够: mihomo 按配置顺序建 listener, 末尾节点首轮
+    探活时端口尚未 listen → 被误判 dead (2026-11-19 SUB4 实测 15 全活只入 5)。
+
+    就绪判定优先按 pid 圈定 (core.pid 的 listener 才算数) —— 各刷新脚本独立
+    flock 可并发, 整机端口集会把别的临时核 listener 误当自己就绪, 探到的端口
+    实际落在别的核上 (出口 IP 错配)。pid 不可得时退回整机端口集, 都不可得时
+    逐端口 connect 试探首尾两个 (宽松但可用的最后兜底)。
+    """
+    if count <= 0:
+        return True
+    want = set(range(probe_pool, probe_pool + count))
+    want_pairs = {(p, core.pid) for p in want}
+    want_any = {(p, None) for p in want}
+    deadline = time.time() + timeout
+    while time.time() < deadline and core.poll() is None:
+        have = _listening_ports()
+        if have is not None:
+            # 严格: 本核 pid 持有全部端口; 宽容: 端口在且无 pid 归属 (ss 无权限等)
+            if want_pairs <= have or (want_any <= have and not (want & {p for p, pid in have if pid is not None})):
+                return True
+        else:  # 端口归属完全不可得: 逐端口 connect 试探 (首尾)
+            if all(_port_open(p) for p in (probe_pool, probe_pool + count - 1)):
+                return True
+        time.sleep(0.4)
+    return False
+
+
+def _port_open(port, timeout=0.4):
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=timeout).close()
+        return True
+    except OSError:
+        return False
 
 
 def probe_via_listeners(
@@ -66,7 +152,8 @@ def probe_via_listeners(
         return []
     core = subprocess.Popen([MIHOMO_BIN, "-d", str(pdir), "-f", str(tmp)],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(4)
+    if not wait_for_listeners(core, probe_pool, len(proxies)):
+        print("probe listeners not all up after timeout; probing anyway", file=sys.stderr)
 
     def probe(i_p):
         i, p = i_p

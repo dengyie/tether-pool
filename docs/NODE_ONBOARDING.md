@@ -197,7 +197,7 @@ python3 scripts/import_standalone.py realize --group NAME
 | 机制 | 约定 |
 |---|---|
 | 多源发现 | `/etc/ip-pool-secrets.env` 写 `SUB1_URL` / `SUB2_URL` / `SUB3_URL`…，逐源拉取；节点名统一加 `s<n>-` 前缀（`is_sub` 识别与清理依赖） |
-| 拉取身份 | 必须带 `User-Agent: clash-verge/1.6.6`（机场普遍 403 默认 python-urllib UA），失败 3 次重试后才交回主流程 |
+| 拉取身份 | 必须带 `User-Agent: clash-verge/1.6.6`（机场普遍 403 默认 python-urllib UA）；重试按语义分层（2026-11-19 review 根修）：**401/403/404/410 永不重试**（`PermanentSubError` + `[SUB_SOURCE_FROZEN]`）——机场风控把连续拉取算「异常拉取」，越重试越封（SUB4 实测 410 冻结）；**429 读 `Retry-After`**：≤60s 等一次即止、无头/过长仅 1 次重试（`RateLimitedSubError` + `[SUB_SOURCE_THROTTLED]`）；其余瞬时错误保持 3 次全量重试 |
 | 单源失败 | **沿用该源上一轮条目**继续刷新其余源（`[SUB_SOURCE_FAIL]` 可 grep）；全部源失败才保留现状 |
 | 伪节点过滤 | `server=127.0.0.1/localhost/::1` 或 `port<=1`（订阅常见的「📅时间」到期提示）一律剔除 |
 | 跨源去重 | `(type, server, port, username, password, uuid)` 相同只保留一份（`upstream dups dropped=N`） |
@@ -205,6 +205,8 @@ python3 scripts/import_standalone.py realize --group NAME
 | 源级中转 | `SUB<n>_RELAY=<桥核已有代理名>` 给该源每条代理接 `dialer-proxy`；中转定义经 `bridge_probe(extra_proxies=…)` 注入探活配置，失败节点补探一次 |
 
 **实测（2026-11-18）**：`SUB2`（saki）24 条，直拨 5–12 活/日（mieru/anytls/vless）；`SUB3`（sub.ip.cn.com）直拨 0 活——上游屏蔽中国大陆 VPS，`SUB3_RELAY='SKYWARD-01'` 后间歇放行 0–2 条（SW 系中转出口随机，节点自身也拒部分出口）。免费池按日自愈，熔断兜底，不追单日满编。
+
+**2026-11-19 源动态**：`SUB4`（ai01.teleapi.top，15 条 vless-reality AWS 节点）首日 15/15 全活入池，次日仅 4–5 活。排查（临时核 debug 日志）证实节点配置未变（uuid/server/port 不变），故障在上游：`REALITY authentication failed` → 供给不稳/轮换，非探活代码问题。同日 SUB3 链接 404（token 失效）、SUB4 高频调试拉取触发机场风控 410 冻结（Mac 侧 0/15 假象为本地 mihomo fake-ip DNS 劫持所致——Mac 排查订阅问题须在 VPS 上验证 DNS/连通性）。冻结/失效源靠 carry-over 撑到恢复或人工换链。
 
 ### 免费订阅探活判死标准（2026-11-14 实战沉淀）
 

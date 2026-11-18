@@ -20,6 +20,15 @@ import sub_pool_refresh as spr  # noqa: E402
     ("🇺🇸 美国 | 1000M", "us-west"),
     ("东京 IEPL 专线", "misc"),                  # 无法识别时不猜
     ("📅时间| 2026-12-23 23:59", "misc"),
+    # 英文城市名 (机场 "[vless]Tokyo1 - B Group" 风格)
+    ("[vless]Tokyo1 - B Group", "jp"),
+    ("[vless]Frankfurt2 - B Group", "de"),
+    ("[vless]Singapore3 - B Group", "sg"),
+    ("[vless]HongKong1 - B Group", "hk"),
+    ("[vless]California1 - B Group", "us-west"),
+    # 词边界: 子串误报不得命中 (india 在 Indianapolis 内)
+    ("Indianapolis 01", "misc"),
+    ("India Gate 01", "in"),
 ])
 def test_region_of(name, region):
     assert spr.region_of(name) == region
@@ -96,6 +105,112 @@ def test_fetch_sends_browser_ua(monkeypatch):
     monkeypatch.setattr(spr.urllib.request, "urlopen", fake_urlopen)
     assert spr.fetch_and_parse("https://example.com/sub") == []
     assert seen["ua"] == "clash-verge/1.6.6"
+
+
+def _http_error(code, body=b""):
+    import io
+    import urllib.error
+    return urllib.error.HTTPError("https://example.com/sub", code, "err", {}, io.BytesIO(body))
+
+
+def test_fetch_does_not_retry_on_frozen_410(monkeypatch):
+    """410 = 机场冻结链接, 重试会被计为异常拉取, 只会更难解封。"""
+    import urllib.error
+    calls = []
+
+    def fake_urlopen(req, timeout):
+        calls.append(1)
+        raise _http_error(410, "这条链接因异常拉取已被冻结".encode())
+
+    monkeypatch.setattr(spr.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(spr.time, "sleep", lambda s: None)
+    with pytest.raises(spr.PermanentSubError) as ei:
+        spr.fetch_and_parse("https://example.com/sub")
+    assert len(calls) == 1
+    assert "410" in str(ei.value) and "冻结" in str(ei.value)
+
+
+@pytest.mark.parametrize("code", [401, 403, 404, 410])
+def test_fetch_treats_other_4xx_as_permanent(monkeypatch, code):
+    calls = []
+
+    def fake_urlopen(req, timeout):
+        calls.append(1)
+        raise _http_error(code)
+
+    monkeypatch.setattr(spr.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(spr.time, "sleep", lambda s: None)
+    with pytest.raises(spr.PermanentSubError):
+        spr.fetch_and_parse("https://example.com/sub")
+    assert len(calls) == 1
+
+
+def test_fetch_429_with_retry_after_waits_once(monkeypatch):
+    """429 + Retry-After ≤60s: 退避等一次, 不再重试 (限速下连打有害)。"""
+    import io
+    import urllib.error
+    calls = []
+
+    def fake_urlopen(req, timeout):
+        calls.append(1)
+        raise urllib.error.HTTPError("u", 429, "Too Many Requests",
+                                     {"Retry-After": "30"}, io.BytesIO(b""))
+
+    monkeypatch.setattr(spr.urllib.request, "urlopen", fake_urlopen)
+    slept = []
+    monkeypatch.setattr(spr.time, "sleep", lambda s: slept.append(s))
+    with pytest.raises(spr.RateLimitedSubError):
+        spr.fetch_and_parse("https://example.com/sub")
+    assert len(calls) == 1 and slept == [30]
+
+
+def test_fetch_429_without_header_retries_once(monkeypatch):
+    """429 无 Retry-After: 只重试 1 次 (瞬时错误是 3 次), 之后交回主流程。"""
+    calls = []
+
+    def fake_urlopen(req, timeout):
+        calls.append(1)
+        raise _http_error(429)
+
+    monkeypatch.setattr(spr.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(spr.time, "sleep", lambda s: None)
+    with pytest.raises(Exception) as ei:
+        spr.fetch_and_parse("https://example.com/sub")
+    assert not isinstance(ei.value, spr.PermanentSubError)
+    assert len(calls) == 2  # 首次 + 1 重试
+
+
+def test_fetch_429_long_retry_after_skips_waiting(monkeypatch):
+    """Retry-After > 60s: 不傻等, 走 1 次重试预算。"""
+    import io
+    import urllib.error
+    calls = []
+
+    def fake_urlopen(req, timeout):
+        calls.append(1)
+        raise urllib.error.HTTPError("u", 429, "T",
+                                     {"Retry-After": "3600"}, io.BytesIO(b""))
+
+    monkeypatch.setattr(spr.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(spr.time, "sleep", lambda s: None)
+    with pytest.raises(spr.RateLimitedSubError):
+        spr.fetch_and_parse("https://example.com/sub")
+    assert len(calls) == 2
+
+
+def test_fetch_still_retries_transient_errors(monkeypatch):
+    calls = []
+
+    def fake_urlopen(req, timeout):
+        calls.append(1)
+        raise _http_error(502)
+
+    monkeypatch.setattr(spr.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(spr.time, "sleep", lambda s: None)
+    with pytest.raises(Exception) as ei:
+        spr.fetch_and_parse("https://example.com/sub")
+    assert not isinstance(ei.value, spr.PermanentSubError)
+    assert len(calls) == 3
 
 
 # ---------------------------------------------------------------- 源级中转
