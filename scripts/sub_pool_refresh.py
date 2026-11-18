@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """sub 订阅池每日刷新: 拉取 -> 探活 -> 全量替换 sub-xxx 节点 (桥核 25001+ 端口段复用).
 
+多源 (2026-11-18): 支持 SUB1_URL / SUB2_URL / ... 任意多个订阅源, 按源序号加
+s<n>- 前缀 (is_sub 识别依赖); 某源拉取失败时沿用该源上一轮条目, 只有全部源都
+失败才保留现状 —— 单源挂掉不再冻结整个池子.
+
 加固 (2026-11-14 深度 review):
 - flock 单实例锁 (cron 与手动运行互斥, 探活临时 mihomo 不与主探活/其他刷新打架)
 - 换绑悬空清理: 替换后 sub 节点名集变化, 旧节点名上的 account 绑定直接释放
@@ -12,12 +16,17 @@ import fcntl, json, re, socket, subprocess, sys, time, urllib.request, os, glob
 from pathlib import Path
 
 # bearer-token 型订阅 URL 即凭据, 仓库不落盘: 从 /etc/ip-pool-secrets.env 读。
-def _sub_url() -> str:
-    url = os.environ.get("SUB1_URL", "").strip()
-    if not url:
-        print("[SUB_REFRESH_FAIL] SUB1_URL not set (see /etc/ip-pool-secrets.env)", file=sys.stderr)
+def _sub_sources():
+    """发现所有 SUB<n>_URL 订阅源, 返回 [(序号, url)] (按序号排序)。"""
+    found = []
+    for k, v in os.environ.items():
+        m = re.fullmatch(r"SUB(\d+)_URL", k)
+        if m and v.strip():
+            found.append((int(m.group(1)), v.strip()))
+    if not found:
+        print("[SUB_REFRESH_FAIL] no SUB<n>_URL set (see /etc/ip-pool-secrets.env)", file=sys.stderr)
         sys.exit(1)
-    return url
+    return sorted(found)
 
 CFG = Path("/opt/ip-pool/config/huawei-bridge.yaml")
 NODES = Path("/opt/ip-pool/config/nodes.yaml")
@@ -25,8 +34,10 @@ DB = Path("/opt/ip-pool/data/ip_pool.db")
 LOCK = Path("/tmp/sub_pool_refresh.lock")
 BACKUP_DIR = Path("/opt/ip-pool/config/backups")
 BASE_PORT = 25001
+MAX_PORT = 25500          # skyward-bridge 从 25501 起, sub 段必须止步于此
 PROBE_POOL = 39001
 KEEP_BACKUPS = 7
+JUNK_SERVERS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 
 def backup_with_rotation():
     BACKUP_DIR.mkdir(exist_ok=True)
@@ -51,21 +62,77 @@ def _unbool_proxies(proxies):
     return proxies
 
 
-def fetch_and_parse():
+def fetch_and_parse(url):
     import yaml
-    raw = urllib.request.urlopen(_sub_url(), timeout=30).read().decode("utf-8", "replace")
-    d = yaml.safe_load(raw)
-    return _unbool_proxies(d.get("proxies", []))
+    # 部分机场订阅拒默认 python-urllib UA (403): 与 pigeonw 刷新同款 curl 身份;
+    # VPS 直连偶发握手超时, 3 次重试后才交回主流程 (触发该源 carry-over)。
+    last = None
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "clash-verge/1.6.6", "Accept": "*/*"})
+            raw = urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "replace")
+            d = yaml.safe_load(raw) or {}
+            return _unbool_proxies(d.get("proxies") or [])
+        except Exception as e:
+            last = e
+            if attempt < 2:
+                time.sleep(2)
+    raise last
 
-def probe_via_listeners(proxies):
+
+def normalize_source_proxies(proxies, src_idx):
+    """源内规范: 统一 s<n>- 前缀 + 剔除伪节点 (到期提示 socks5 127.0.0.1:1 之类)。"""
+    out = []
+    for p in proxies:
+        name = re.sub(r"^s\d+-", "", str(p.get("name") or ""))
+        server = str(p.get("server") or "")
+        try:
+            port = int(p.get("port") or 0)
+        except (TypeError, ValueError):
+            port = 0
+        if not name or not server or port <= 1 or server in JUNK_SERVERS:
+            continue
+        p["name"], p["server"], p["port"] = f"s{src_idx}-" + name, server, port
+        out.append(p)
+    return out
+
+
+def upstream_key(p):
+    """跨源上游去重键: 同一条线路在多个订阅里重复出现时只留一份。"""
+    return (str(p.get("type")), str(p.get("server")).lower(), p.get("port"),
+            str(p.get("username") or ""), str(p.get("password") or ""), str(p.get("uuid") or ""))
+
+def probe_via_listeners(proxies, extra_proxies=None):
     # F9 (二轮 review): 与 pigeonw 刷新共享的探活实现抽到 scripts/bridge_probe.py
     from bridge_probe import probe_via_listeners as _shared
     return _shared(proxies, probe_pool=PROBE_POOL, probe_dir="/tmp/mihomo-probe-sub",
-                   mode="direct", external_controller="127.0.0.1:39998", max_workers=50)
+                   mode="direct", external_controller="127.0.0.1:39998", max_workers=50,
+                   extra_proxies=extra_proxies)
+
+_CN_REGION = {
+    "新加坡": "sg", "香港": "hk", "台湾": "tw", "日本": "jp", "韩国": "kr",
+    "美国": "us", "加拿大": "ca", "英国": "gb", "德国": "de", "法国": "fr",
+    "荷兰": "nl", "瑞士": "ch", "俄罗斯": "ru", "印度": "in", "越南": "vn",
+    "马来西亚": "my", "泰国": "th", "印尼": "id", "菲律宾": "ph",
+    "澳大利亚": "au", "土耳其": "tr", "阿联酋": "ae", "巴西": "br",
+}
+
+def _flag_cc(name):
+    """国旗 emoji (两个区域指示符) -> ISO 国家码小写; 非国旗开头的名字返回 None。"""
+    ri = [ord(ch) - 0x1F1E6 for ch in name if 0x1F1E6 <= ord(ch) <= 0x1F1FF]
+    if len(ri) >= 2:
+        return chr(ord("a") + ri[0]) + chr(ord("a") + ri[1])
+    return None
 
 def region_of(name):
-    m = re.search(r"(?:s\d-)?([A-Z]{2})[_-]", name)
-    cc = m.group(1).lower() if m else None
+    # 优先级: 国旗 emoji > "US ..."/"s1-HK_11" 国家码 > 中文国名
+    cc = _flag_cc(name)
+    if not cc:
+        m = re.search(r"(?:^|s\d-)([A-Z]{2})(?:[\s_-]|$)", name)
+        cc = m.group(1).lower() if m else None
+    if not cc:
+        cc = next((v for k, v in _CN_REGION.items() if k in name), None)
     return "us-west" if cc == "us" else (cc or "misc")
 
 def main():
@@ -77,28 +144,80 @@ def main():
         print("[SUB_REFRESH_SKIP] another refresh is running", file=sys.stderr)
         return 0
     try:
-        proxies = fetch_and_parse()
-        # 强制 s1- 前缀 (is_sub 识别依赖; 裸名事故教训) + 订阅内部重名去重
-        seen = set()
-        for p in proxies:
-            if not re.match(r"^s\d-", p["name"]):
-                p["name"] = "s1-" + p["name"]
-            base, n = p["name"], p["name"]
-            i = 2
-            while n in seen:
-                n = f"{base}-{i}"; i += 1
-            seen.add(n)
-            p["name"] = n
-        print(f"fetched {len(proxies)} proxies from sub")
-        alive = probe_via_listeners(proxies)
+        sources = _sub_sources()
+        main = yaml.safe_load(CFG.read_text())
+        old_sub = [p for p in main.get("proxies", []) if re.match(r"^s\d-", str(p.get("name") or ""))]
+
+        # 源级中转: SUB<n>_RELAY=<桥核已有代理名>, 给该源每条代理接 dialer-proxy。
+        # 用于上游屏蔽中国大陆直连的机场 (实测 SUB3 直拨 0 活, 经 SKYWARD 中转 2 活)。
+        by_name = {str(p.get("name")): p for p in main.get("proxies", [])}
+        relay_for, extra_relays = {}, {}
+        for src_idx, _ in sources:
+            relay = os.environ.get(f"SUB{src_idx}_RELAY", "").strip()
+            if not relay:
+                continue
+            if relay in by_name:
+                relay_for[src_idx] = relay
+                extra_relays[relay] = dict(by_name[relay])
+            else:
+                print(f"[SUB_RELAY_FAIL] SUB{src_idx}_RELAY={relay} not in bridge config; "
+                      f"this source stays direct", file=sys.stderr)
+
+        proxies, seen_names, seen_up, ok_any, dropped = [], set(), set(), False, 0
+        for src_idx, url in sources:
+            try:
+                got = fetch_and_parse(url)
+                ok_any = True
+                print(f"SUB{src_idx}: fetched {len(got)} proxies")
+            except Exception as e:
+                # 单源失败不中止: 沿用该源上一轮条目, 其余源照常刷新
+                got = [dict(p) for p in old_sub if str(p.get("name", "")).startswith(f"s{src_idx}-")]
+                print(f"[SUB_SOURCE_FAIL] SUB{src_idx}: {e}; carrying {len(got)} previous nodes",
+                      file=sys.stderr)
+            for p in normalize_source_proxies(got, src_idx):
+                if src_idx in relay_for:
+                    p["dialer-proxy"] = relay_for[src_idx]
+                up = upstream_key(p)
+                if up in seen_up:
+                    dropped += 1
+                    continue
+                seen_up.add(up)
+                base, n, i = p["name"], p["name"], 2
+                while n in seen_names:
+                    n, i = f"{base}-{i}", i + 1
+                seen_names.add(n)
+                p["name"] = n
+                proxies.append(p)
+        if not ok_any:
+            print("[SUB_REFRESH_FAIL] all sources failed, keep current state", file=sys.stderr)
+            return 1
+        if not proxies:
+            print("[SUB_REFRESH_FAIL] no usable proxies from any source, keep current state",
+                  file=sys.stderr)
+            return 1
+        print(f"merged {len(proxies)} proxies from {len(sources)} source(s), "
+              f"upstream dups dropped={dropped}")
+        alive = probe_via_listeners(proxies, extra_proxies=list(extra_relays.values()))
+        # 中继源上游对中转出口随机放行, 单轮探活波动大: 失败的中继节点补探一次
+        if relay_for:
+            alive_names = {p["name"] for _, p, _, _ in alive}
+            retry = [p for p in proxies if p.get("dialer-proxy") and p["name"] not in alive_names]
+            if retry:
+                more = probe_via_listeners(retry, extra_proxies=list(extra_relays.values()))
+                print(f"relay retry: {len(more)}/{len(retry)} recovered")
+                alive.extend(more)
         print(f"alive {len(alive)}/{len(proxies)}")
         if len(alive) < 5:
             print("[SUB_REFRESH_FAIL] alive too few, keep current state", file=sys.stderr)
             return 1
+        slots = MAX_PORT - BASE_PORT + 1
+        if len(alive) > slots:
+            print(f"[SUB_REFRESH_WARN] {len(alive)} alive > {slots} slots ({BASE_PORT}-{MAX_PORT}), "
+                  f"truncating", file=sys.stderr)
+            alive = alive[:slots]
         backup_with_rotation()
 
         # 替换桥核 (sub 前缀条目)
-        main = yaml.safe_load(CFG.read_text())
         is_sub = lambda name: bool(re.match(r"^s\d-", name or "") or "【机房】" in (name or "") or "【商宽】" in (name or ""))
         main["proxies"] = [p for p in main["proxies"] if not is_sub(p["name"])]
         main["listeners"] = [l for l in main["listeners"] if not str(l.get("name", "")).startswith("sub-bridge-")]
@@ -110,7 +229,8 @@ def main():
                                   "port": BASE_PORT + i, "listen": "127.0.0.1", "proxy": p["name"]})
             reg = region_of(p["name"])
             kind = "residential" if "商宽" in p["name"] else ("datacenter" if "机房" in p["name"] else "")
-            tags = ["clash", "bridge", "sub", str(p.get("type", "http"))]
+            src_tag = p["name"].split("-", 1)[0]
+            tags = ["clash", "bridge", "sub", src_tag, str(p.get("type", "http"))]
             if kind: tags.append(kind)
             if reg == "us-west" and kind == "residential": tags.append("us-residential")
             new_nodes.append({"name": f"clash-{500+i:03d}-sub-{i:03d}", "host": "127.0.0.1",

@@ -183,12 +183,28 @@ python3 scripts/import_standalone.py realize --group NAME
 
 | 件 | 值 |
 |---|---|
-| 桥核端口段 | 25001+（sub 专用；gen 21001–24873 / teleapi 11101–11239 / pigeonw 12053–12072 之外） |
+| 桥核端口段 | 25001–25500（sub 专用；gen 21001–24873 / teleapi 11101–11239 / pigeonw 12053–12072 / skyward 25501+ 之外） |
 | fault_domain | `huawei-sub-bridge`（独立故障域） |
-| region 映射 | 名字国家码 `us`→us-west，其余国家码直作 region（hk/de/fr/nl/…） |
+| region 映射 | 国旗 emoji → ISO 码；`US ...` / `s1-HK_11` 国家码；中文国名兜底；`us`→us-west，无法识别落 `misc` |
 | 刷新脚本 | `/opt/ip-pool/scripts/sub_pool_refresh.py`（拉取→临时 mihomo 探活→**全量替换** sub 前缀条目→`mihomo -t` 不过自动回滚→重启三服务） |
 | cron | `30 4 * * *` root，日志 `/var/log/sub_pool_refresh.log` |
-| tier/tags | standard；tags 含 `sub` + 协议类型 + 商宽→`residential`/机房→`datacenter` |
+| tier/tags | standard；tags 含 `sub` + 源标签（`s1`/`s2`…）+ 协议类型 + 商宽→`residential`/机房→`datacenter` |
+
+### 多源扩展与源级中转（2026-11-18）
+
+订阅不再写死单条，`sub_pool_refresh.py` 自动发现环境里所有 `SUB<n>_URL`（序号排序）：
+
+| 机制 | 约定 |
+|---|---|
+| 多源发现 | `/etc/ip-pool-secrets.env` 写 `SUB1_URL` / `SUB2_URL` / `SUB3_URL`…，逐源拉取；节点名统一加 `s<n>-` 前缀（`is_sub` 识别与清理依赖） |
+| 拉取身份 | 必须带 `User-Agent: clash-verge/1.6.6`（机场普遍 403 默认 python-urllib UA），失败 3 次重试后才交回主流程 |
+| 单源失败 | **沿用该源上一轮条目**继续刷新其余源（`[SUB_SOURCE_FAIL]` 可 grep）；全部源失败才保留现状 |
+| 伪节点过滤 | `server=127.0.0.1/localhost/::1` 或 `port<=1`（订阅常见的「📅时间」到期提示）一律剔除 |
+| 跨源去重 | `(type, server, port, username, password, uuid)` 相同只保留一份（`upstream dups dropped=N`） |
+| 端口上限 | `25001–25500`；超出容量截断并打 `[SUB_REFRESH_WARN]`（防撞 skyward 25501+） |
+| 源级中转 | `SUB<n>_RELAY=<桥核已有代理名>` 给该源每条代理接 `dialer-proxy`；中转定义经 `bridge_probe(extra_proxies=…)` 注入探活配置，失败节点补探一次 |
+
+**实测（2026-11-18）**：`SUB2`（saki）24 条，直拨 5–12 活/日（mieru/anytls/vless）；`SUB3`（sub.ip.cn.com）直拨 0 活——上游屏蔽中国大陆 VPS，`SUB3_RELAY='SKYWARD-01'` 后间歇放行 0–2 条（SW 系中转出口随机，节点自身也拒部分出口）。免费池按日自愈，熔断兜底，不追单日满编。
 
 ### 免费订阅探活判死标准（2026-11-14 实战沉淀）
 
@@ -201,7 +217,7 @@ python3 scripts/import_standalone.py realize --group NAME
 
 ### 中转（dialer-proxy）判定
 
-华为云境内→上游直拨无跨 GFW RST（与 Mac §六场景相反），**本批未挂中转**。判定法：探活若出现大量 `TimeoutError`/连接重置而节点 vendor 侧正常，才按 §六 `relay` 流程接 AWS 中转。
+华为云境内→上游直拨无跨 GFW RST（与 Mac §六场景相反），**2026-11-14 批次未挂中转**。判定法：探活若出现大量 `TimeoutError`/连接重置而节点 vendor 侧正常，才按 §六 `relay` 流程接 AWS 中转。**2026-11-18 更新**：SUB3 直拨 0 活、同批节点从 Mac 直拨全活，证实部分机场按来源 IP 屏蔽大陆 VPS（不是 GFW RST）——此类源用 `SUB<n>_RELAY` 逐源挂中转，不污染其他源。
 
 ### 深度 review 加固（2026-11-14 高可用迭代）
 

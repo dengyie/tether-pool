@@ -747,7 +747,7 @@ async def test_incident_mesh_nl_pool_never_returns_dead_exit(storage):
 
     try:
         for i in range(20):
-            reader, writer = await gateway._open_upstream(
+            _node, reader, writer = await gateway._open_upstream(
                 account_id=f"incident-{i}", region=None, egress_type=WARP,
                 service="grok2api", target_host="example.com", target_port=443,
             )
