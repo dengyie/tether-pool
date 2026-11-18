@@ -48,6 +48,13 @@ for _pair in os.environ.get("IP_POOL_SERVICE_TOKENS", "").split(","):
         _svc, _tok = _pair.split("=", 1)
         if _svc.strip() and _tok.strip():
             SERVICE_TOKENS[_svc.strip()] = _tok.strip()
+# 2026-11-19 review P0: 两类令牌都未设时鉴权中间件整体旁路, 破坏性端点
+# (DELETE 节点 / bulk-disable / config reload / release) 全靠网络层隔离。
+# 不能在这里 fail-closed (会把未配令牌的消费方全部打断), 但必须告警可见。
+if not API_TOKEN and not SERVICE_TOKENS:
+    print("[auth] ⚠️ IP_POOL_API_TOKEN / IP_POOL_SERVICE_TOKENS 均未设置: "
+          "全部端点 (含 DELETE/bulk-disable/config reload 等破坏性写) 仅靠 mesh 网络隔离保护; "
+          "生产部署请至少配置其一")
 AUTH_COOKIE_NAME = "ip_pool_token"
 PROBE_INTERVAL_SECONDS = int(os.environ.get("IP_POOL_PROBE_INTERVAL", "300"))
 # 全池 sweep 的并发度。50 并发下 347 节点一轮 ~1 分钟（12s 超时 + warp 高延迟），
@@ -456,10 +463,11 @@ async def bearer_auth_middleware(request: Request, call_next):
                 else:
                     authorized = False
             elif svc not in SERVICE_TOKENS:
-                # 未配专用令牌的 service: 读放行; 写 (绑定分配等状态变更) 持
-                # 失败凭据的请求按无效令牌拒绝 (fail closed, 防 A 服务令牌被
-                # 误用于 B 服务)。
-                authorized = not token or request.method in ("GET", "HEAD", "OPTIONS")
+                # 未配专用令牌的 service: 读放行; 写一律要求凭据。
+                # 2026-11-19 review P0: 旧写法 `not token or method in GET...` 在
+                # "无凭据 + 写端点 + ?service=<任意未配名>" 时 fail-open, 一句
+                # query 参数就绕过了整个 fail-closed 设计 (注释声称的方向相反)。
+                authorized = request.method in ("GET", "HEAD", "OPTIONS")
             else:
                 # 目标 service 配了专用令牌: 必须持匹配令牌。
                 authorized = False
@@ -525,9 +533,12 @@ def list_nodes(
     region: Optional[str] = None,
     egress_type: Optional[str] = None,
     status: Optional[str] = None,
-    tier: Optional[str] = Query(None, description="Optional quality tier filter: premium or standard")
+    tier: Optional[str] = Query(None, description="Optional quality tier filter: premium or standard"),
+    # 2026-11-19 review P2: 全表 ~3600 行 × 30 字段无界返回, 加游标式上限
+    limit: int = Query(0, ge=0, le=20000, description="Cap the number of returned nodes (0 = no cap)")
 ):
-    return storage.list_nodes(region=region, egress_type=egress_type, status=status, tier=tier)
+    nodes = storage.list_nodes(region=region, egress_type=egress_type, status=status, tier=tier)
+    return nodes[:limit] if limit else nodes
 
 
 @app.get("/v1/nodes/{name}", response_model=ProxyNode)
@@ -814,9 +825,13 @@ def get_bound_lease(
     alloc = storage.find_allocation_by_account(account_id, service=svc)
     lease = _lease_from_allocation(account_id, alloc) if alloc else None
     if not lease:
-        legacy = storage.get_lease(account_id)
-        if legacy:
-            lease = legacy
+        # 2026-11-19 review P3: legacy leases 表无 service 维度, 仅当该账号在
+        # 任何 service 下都没有 allocation 时才可信 —— 否则会把 B 服务的绑定
+        # 以 A 服务的名义泄露 (与 _resolve_ban_node 的守卫同口径)。
+        if storage.find_allocation_by_account(account_id) is None:
+            legacy = storage.get_lease(account_id)
+            if legacy:
+                lease = legacy
     if not lease:
         raise HTTPException(status_code=404, detail=f"No binding for account '{account_id}' in service '{svc}'")
     return lease
@@ -830,6 +845,9 @@ def acquire_node(
     tier: Optional[str] = Query(None, description="Optional quality tier constraint (premium or standard)"),
     tier_policy: Optional[str] = Query(None, description="Optional tier routing policy (standard_first, premium_first, premium_only, standard_only)"),
     force_rebind: bool = Query(False, description="Force re-allocating a new node"),
+    # 2026-11-19 review P2: /v1/allocation/acquire 用 force_rebalance, 两个名字
+    # 语义相同; 拼错的名字此前被 FastAPI 静默忽略 → 强制换绑 no-op 且 200。
+    force_rebalance: bool = Query(False, description="Alias of force_rebind (accepted on both endpoints to kill the param drift)"),
     service: Optional[str] = Query(None, description="Service namespace (defaults to 'default')"),
     region_strict: bool = Query(False, description="Treat region as a hard constraint: never relax it to another region (empty candidate set instead)"),
     bind_persist: bool = Query(False, description="Persist the selected node even when the stored binding only failed this call's constraint filter (reason=constraint_rebind)")
@@ -855,7 +873,7 @@ def acquire_node(
         region=region,
         tier=tier,
         tier_policy=tier_policy,
-        force_rebind=force_rebind,
+        force_rebind=force_rebind or force_rebalance,
         service=service,
         region_strict=region_strict,
         bind_persist=bind_persist
@@ -976,13 +994,22 @@ def export_grok2api(
         current = storage.get_binding_epoch(service) or {
             "epoch": 0, "changed_at": None, "last_change_reason": None
         }
+        # 2026-11-19 review P2: 旧实现每条 change 两次串行 SQLite 点查 (2N 次往返,
+        # mass-rehome 后 N=数千), 改为两把全量快照 + 内存取用; 变更行上限 20000
+        # 防止单次 reconcile 拉爆响应体。
+        _EXPORT_CHANGES_CAP = 20000
+        truncated = len(changes) > _EXPORT_CHANGES_CAP
+        if truncated:
+            changes = changes[:_EXPORT_CHANGES_CAP]
+        allocs = {a["account_id"]: a for a in storage.list_allocations_by_service(service)}
+        nodes_by_name = {n.name: n for n in storage.list_nodes()}
         assignments = {}
         for change in changes:
             acc = change.account_id
             if acc in assignments:
                 continue
-            alloc = storage.get_allocation(service, acc)
-            node = storage.get_node(alloc["node_name"]) if alloc else None
+            alloc = allocs.get(acc)
+            node = nodes_by_name.get(alloc["node_name"]) if alloc else None
             if not node:
                 continue
             assignments[acc] = {
@@ -994,6 +1021,7 @@ def export_grok2api(
             }
         return {
             "count": len(assignments),
+            "truncated": truncated,
             "nodes": list(assignments.values()),
             "assignments": assignments,
             "epoch": current["epoch"],
@@ -1254,6 +1282,8 @@ def acquire_account_allocation(
     tier: Optional[str] = Query(None, description="Optional tier filter: premium or standard"),
     tier_policy: Optional[str] = Query(None, description="Optional tier policy: standard_first, premium_first, premium_only, standard_only"),
     force_rebalance: bool = Query(False, description="Force reallocating to a different node"),
+    # 2026-11-19 review P2: 与 /v1/acquire 的 force_rebind 同语义, 两个端点互认别名
+    force_rebind: bool = Query(False, description="Alias of force_rebalance (accepted on both endpoints to kill the param drift)"),
     avoid_banned: bool = Query(False, description="Exclude quarantined (banned) nodes and their /24 for this service"),
     avoid_cidr: Optional[str] = Query(None, description="Comma-separated CIDR list to exclude, e.g. 23.230.200.0/24"),
     avoid_same_isp: bool = Query(False, description="Cross-ISP selection: skip nodes whose isp=<name> tag matches a banned node's ISP")
@@ -1289,7 +1319,7 @@ def acquire_account_allocation(
             region=region,
             tier=tier,
             tier_policy=tier_policy,
-            force_rebalance=force_rebalance,
+            force_rebalance=force_rebalance or force_rebind,
             avoid_banned=avoid_banned,
             avoid_cidrs=avoid_cidrs,
             avoid_same_isp=avoid_same_isp,
@@ -1372,11 +1402,16 @@ def get_account_allocation_status(
 
 
 @app.get("/v1/allocation/accounts")
-def list_service_allocations(service: str = Query(..., description="Service identifier")):
+def list_service_allocations(
+    service: str = Query(..., description="Service identifier"),
+    # 2026-11-19 review P2: 大服务 (cpa 1564 / grok2api 2100+) 全量返回无界
+    limit: int = Query(0, ge=0, le=20000, description="Cap the number of returned allocations (0 = no cap)")
+):
     """
     List all active account allocations for a given service.
     """
-    return storage.list_allocations_by_service(service)
+    allocs = storage.list_allocations_by_service(service)
+    return allocs[:limit] if limit else allocs
 
 
 @app.post("/v1/allocation/release")

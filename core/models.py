@@ -311,7 +311,8 @@ class AccountAllocationItem(BaseModel):
 
 class BatchAllocationRequest(BaseModel):
     service: str = "default"
-    accounts: List[str]
+    # 2026-11-19 review P2: 无上限 accounts 会在 BINDING_WRITE_LOCK 下阻塞全控制面
+    accounts: List[str] = Field(..., max_length=5000)
     strategy: str = AllocationStrategy.BALANCED_ROUND_ROBIN.value
     egress_preference: Optional[str] = EgressType.WARP_IPV6.value
     region: Optional[str] = None

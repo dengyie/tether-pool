@@ -60,10 +60,13 @@ def test_build_ban_excluded_networks_slash24():
     nets = build_ban_excluded_networks([rec], ["23.2.0.0/16"])
     assert ipaddress.ip_address("23.1.1.99") in nets[0]
     assert ipaddress.ip_address("23.2.5.1") in nets[1]
-    # IPv6 exit_ip 产出 v6 /24 网段 (v4 家宽 /24 语义之外的一致处理); 非法串跳过
+    # 2026-11-19 review P3: v6 用 /64 (对齐 router battery 路径的地址族规则;
+    # v6 /24 罩 2^104 地址 ≈ 封整个 v6 池) —— ::1 的 /64 含 ::ffff, 不含下一段
     v6 = type("Q", (), {"exit_ip": "2001:db8::1"})()
     v6_nets = build_ban_excluded_networks([v6], [])
-    assert len(v6_nets) == 1 and ipaddress.ip_address("2001:db8::ffff") in v6_nets[0]
+    assert len(v6_nets) == 1
+    assert ipaddress.ip_address("2001:db8::ffff") in v6_nets[0]
+    assert ipaddress.ip_address("2001:db8:0:1::99") not in v6_nets[0]
 
 
 def test_ip_in_excluded_nets():
@@ -622,9 +625,11 @@ def test_service_token_query_and_other_endpoints_open(svc_client):
     assert r2.status_code == 200
     # /health 永远公开
     assert svc_client.get("/health").status_code == 200
-    # 未配置专用 token 的 service 维持 Mesh 内网现状 (无令牌放行)
+    # 2026-11-19 review P0 根修: 未配置专用 token 的 service, 读放行但写 fail-closed ——
+    # 旧实现 `not token or GET...` 在无凭据 + POST 时 fail-open, 任何
+    # ?service=<未配名> 都能绕过整个 tokenized 部署 (含 DELETE 节点)。
     r3 = svc_client.post("/v1/allocation/acquire?service=other-svc&account_id=acc&egress_preference=")
-    assert r3.status_code == 200
+    assert r3.status_code == 401
 
 
 def test_service_token_body_peek_does_not_break_pydantic(svc_client, seeded):
@@ -747,7 +752,7 @@ def test_battery_swap_no_cross_service_lease_constraint_leak(storage):
 
 
 def test_target_health_adaptive_ttl_and_cache(storage):
-    """#1: 轮长 > TTL 时 TTL 自适应放宽; 缓存与 is_bad 一致。"""
+    """#1: TTL 自适应 (慢轮放宽 ×1.5 / 快轮回落, 不变量 TTL ≥ 轮长); 缓存与 is_bad 一致。"""
     from core.target_health import TargetHealthTracker
     t = TargetHealthTracker(bad_ttl_seconds=300.0)
     # bad_streak=2: 连败 2 次才判坏 (快速恢复优先于惩罚)
@@ -758,11 +763,15 @@ def test_target_health_adaptive_ttl_and_cache(storage):
     # 轮长 750s -> TTL 放宽到 >=750, 不低于盖住当前轮长的下限
     t.note_round_duration(750.0)
     assert t.bad_ttl_seconds >= 750.0
-    # 轮长回落 -> TTL 直接回落到下限 max(配置基线, 当前轮长/1.5)
-    # (2026-11-18 双向自适应): 保证 TTL 永远盖住当前轮长, 又不让一次慢轮把
-    # 恢复延迟永久钉在高位
+    # 轮长回落 -> TTL 回落下限 max(配置基线, 轮长×1.25) (2026-11-18 双向自适应)
     t.note_round_duration(10.0)
     assert t.bad_ttl_seconds == 300.0  # 回落到配置基线 (轮长 10s 时 floor=基线)
+    # 不变量: TTL 永远盖住轮长 —— 轮长抖动序列下不得出现 TTL < 轮长
+    # (旧版 floor=round/1.5 在 400↔500 抖动时 TTL 最差比轮短 157s, 重新引入
+    # 「bad 集恒空 -> steering 静默失效」, 同日 review P1 钉死)
+    for s in (500.0, 400.0, 500.0, 400.0, 450.0, 460.0, 455.0):
+        t.note_round_duration(s)
+        assert t.bad_ttl_seconds >= s, (s, t.bad_ttl_seconds)
     # 缓存路径与 is_bad 一致
     t.refresh_bad_cache()
     assert t.cached_bad_nodes("google") == {"n1"}
@@ -844,3 +853,51 @@ def test_settings_block_honored(monkeypatch, tmp_path):
 
 
 import os  # noqa: E402  (test_settings_block_honored 使用)
+
+
+# --- 2026-11-19 review 根修回归 ---
+
+def test_update_node_accepts_circuit_counters(storage, capsys):
+    """enable/revive 传的计数清零键必须真实落库 (旧白名单静默丢弃导致
+    复活节点带陈旧 fail_count, 退避直接钉 2**stale 上限)。"""
+    from core.models import HealthStatus
+    _mk_node(storage, "wn-1")
+    storage.update_node("wn-1", {
+        "status": HealthStatus.UNPROBED.value,
+        "consecutive_failures": 0,
+        "consecutive_successes": 0,
+        "next_probe_allowed_at": None,
+    })
+    n = storage.get_node("wn-1")
+    assert n.consecutive_failures == 0
+    assert n.next_probe_allowed_at is None
+    # 非白名单键: 告警可见 (不再静默)
+    storage.update_node("wn-1", {"not_a_real_column": 1})
+    assert "ignored non-whitelisted keys" in capsys.readouterr().out
+
+
+def test_freeze_node_conditional_on_dead(storage):
+    """freeze 的复检+写入在同一事务, UPDATE 带 status='dead' 条件:
+    非 dead 节点不得被打上 frozen (revive 竞态守卫)。"""
+    from core.models import HealthStatus
+    _mk_node(storage, "fz-1")
+    storage.update_node("fz-1", {"status": HealthStatus.DEAD.value,
+                                 "circuit_state": HealthStatus.DEAD.value})
+    assert storage.freeze_node("fz-1") is True
+    assert "frozen" in storage.get_node("fz-1").tags
+    assert storage.freeze_node("fz-1") is True            # 幂等
+    # 被救活后再 freeze: 拒绝 (revive 会清 frozen 标签, 与 revive_node 一致)
+    tags = [t for t in storage.get_node("fz-1").tags if t != "frozen"]
+    storage.update_node("fz-1", {"status": HealthStatus.UNPROBED.value,
+                                 "circuit_state": HealthStatus.UNPROBED.value,
+                                 "tags": tags})
+    assert storage.freeze_node("fz-1") is False
+    assert "frozen" not in storage.get_node("fz-1").tags
+
+
+def test_batch_allocation_rejects_oversized(client):
+    """2026-11-19 review P2: accounts 无上限会在 BINDING_WRITE_LOCK 下
+    阻塞全控制面 —— Pydantic 层 5000 上限, 422 拒绝。"""
+    r = client.post("/v1/allocation/batch", json={
+        "service": "t", "accounts": [f"acc-{i}" for i in range(5001)]})
+    assert r.status_code == 422

@@ -818,17 +818,29 @@ class Storage:
         """冻结: tags 加 frozen + status 保持 dead (探活降频由 prober 按标签识别,
         分配本就排除 DEAD)。幂等。
         2026-11-15 review P2: 快照与写入之间节点可能被 revive/enable 成
-        UNPROBED —— 状态复检不过就不冻 (否则活节点被 frozen 标签挡出探活)。"""
-        node = self.get_node(node_name)
-        if not node:
-            return False
-        if node.status != HealthStatus.DEAD.value:
-            return False
-        tags = list(node.tags or [])
-        if "frozen" not in tags:
-            tags.append("frozen")
-            self.update_node(node_name, {"tags": tags, "status": HealthStatus.DEAD.value,
-                                         "circuit_state": HealthStatus.DEAD.value})
+        UNPROBED —— 状态复检不过就不冻 (否则活节点被 frozen 标签挡出探活)。
+        2026-11-19 review P3: 复检+写入合入同一 IMMEDIATE 事务, UPDATE 带
+        status='dead' 条件 —— 消除"读旧快照判 dead, 写前被并发救活又被盖回
+        dead+frozen"的状态腐坏窗口 (frozen 标签会挡住非强制探活, 卡死到人工 revive)。"""
+        with self._get_conn() as conn:
+            with self._immediate_txn(conn):
+                row = conn.execute("SELECT status, tags FROM nodes WHERE name = ?",
+                                   (node_name,)).fetchone()
+                if not row:
+                    return False
+                if row["status"] != HealthStatus.DEAD.value:
+                    return False
+                tags = json.loads(row["tags"] or "[]")
+                newly_frozen = "frozen" not in tags
+                if newly_frozen:
+                    tags.append("frozen")
+                cur = conn.execute(
+                    "UPDATE nodes SET tags = ?, circuit_state = ? WHERE name = ? AND status = ?",
+                    (json.dumps(tags), HealthStatus.DEAD.value,
+                     node_name, HealthStatus.DEAD.value))
+                if cur.rowcount == 0:
+                    return False
+        if newly_frozen:
             self.record_circuit_event(node_name, "dead", "dead", "janitor_frozen_dead_24h")
         return True
 
@@ -2067,9 +2079,17 @@ class Storage:
             "weight", "status", "circuit_state", "tier", "configured_tier",
             "relay_mode", "relay_hop_node", "quality_score",
             "fault_domain", "provider_region", "self_reported_at",
-            "dead_since"
+            "dead_since",
+            # 断路器计数与退避锚点 (2026-11-19 review P1): enable_node/revive_node
+            # 传这三个键做真正的"新鲜重启"; 旧白名单静默丢弃导致复活节点带着
+            # 陈旧 fail_count 重启, 一次 hiccup 退避直接钉到 2**stale 上限。
+            "consecutive_failures", "consecutive_successes", "next_probe_allowed_at",
         }
         valid_updates = {k: v for k, v in updates.items() if k in allowed_fields}
+        dropped = sorted(set(updates) - set(valid_updates))
+        if dropped:
+            # 2026-11-19 review P1: 静默丢键是陷阱 —— 非白名单键一律告警可见
+            print(f"[storage] update_node({name}): ignored non-whitelisted keys: {dropped}")
         if not valid_updates:
             return self.get_node(name)
 

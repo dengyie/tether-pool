@@ -80,14 +80,15 @@ class TargetHealthTracker:
         已过 TTL -> bad 集恒空, steering 静默失效 (二轮 review: 3000 节点 × 3 类 ×
         并发 10, 轮长可达 750s+, 远超默认 TTL 300s)。
 
-        双向自适应 (2026-11-18): 轮长涨则放宽 (×1.5), 轮长回落则直接设为下限
-        max(配置基线, round/1.5) —— 保证 TTL 永远盖住当前轮长, 又不让一次慢轮
-        把恢复延迟永久钉在高位。"""
-        floor = max(self._ttl_floor, seconds / 1.5)
-        if seconds > self.bad_ttl_seconds:
-            self.bad_ttl_seconds = seconds * 1.5
+        双向自适应 (2026-11-18, 同日 review 修订): 不变量是 TTL ≥ 轮长 + 间隙余量
+        —— 慢轮突发放宽到 ×1.5; 轮长回落后返回下限 max(配置基线, 轮长×1.25)。
+        下限必须 ≥ 轮长本身 (旧版 round/1.5 在轮长 400↔500 抖动时 TTL 最差比轮
+        还短 157s, 重新引入「bad 集恒空」), ×1.25 ≈ 盖住 120s 探测间隙。"""
+        floor = max(self._ttl_floor, seconds * 1.25)
+        if seconds * 1.25 > self.bad_ttl_seconds:
+            self.bad_ttl_seconds = seconds * 1.5  # 慢轮突发: 留 50% 余量
         elif self.bad_ttl_seconds > floor:
-            self.bad_ttl_seconds = floor
+            self.bad_ttl_seconds = floor  # 快轮: 回落但仍 ≥ 1.25×轮长
 
     def refresh_bad_cache(self) -> None:
         """每轮探活结束重算一次坏集缓存; 热路径 (_open_upstream) 读缓存,
