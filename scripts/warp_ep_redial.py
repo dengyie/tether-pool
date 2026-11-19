@@ -39,6 +39,9 @@ TAGMAP_FILE = os.environ.get("WARP_TAGMAP", os.path.join(
     os.environ.get("WARP_REDIAL_LOCK", "/root/warp-redial"), "tagmap.json"))
 DEAD_MIN = int(os.environ.get("WARP_DEAD_MIN", "3"))
 COOLDOWN = int(os.environ.get("WARP_COOLDOWN", "1800"))
+# restart 重摇全部会话: 21 轮实测 alive>=66 时期望净 -3.3/轮 (贴 CF 上限,
+# 重摇必亏), alive<66 时 +1.8/轮。>= ALIVE_CEILING 不 swap (只探针观察)。
+ALIVE_CEILING = int(os.environ.get("WARP_ALIVE_CEILING", "70"))
 PROBE_HOST = os.environ.get("WARP_PROBE_HOST", "10.144.144.81")
 PROBE_TIMEOUT = int(os.environ.get("WARP_PROBE_TIMEOUT", "6"))
 DRYRUN = os.environ.get("WARP_DRYRUN", "0") == "1"
@@ -121,6 +124,11 @@ def main():
 
     if len(dead) < DEAD_MIN:
         log("OK dead<%d, skip" % DEAD_MIN)
+        return
+
+    if alive >= ALIVE_CEILING:
+        log("OK alive=%d >= ceiling %d, restart expected-negative, skip" % (
+            alive, ALIVE_CEILING))
         return
 
     if not cooldown_ok():
