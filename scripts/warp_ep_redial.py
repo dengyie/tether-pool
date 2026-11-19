@@ -144,8 +144,25 @@ def main():
     except (OSError, ValueError):
         pass
     used_devices = set(dev_by_tag.values())
-    spare = [i for i in pool if i.get("device_id") not in used_devices and i.get("device_id")]
-    log("spare identities: %d (used %d)" % (len(spare), len(used_devices)))
+    # 黑名单: history.jsonl 出现过的 old/new device 一律不复用 —
+    # f5d30d25 案例 (2026-11-19): freed 死 identity 会重新漂进 spare 被第三次
+    # 分配 (ep04→ep16→ep12), 每次 swap 都白费一个名额; 死过的 device 不自愈。
+    banned = set()
+    try:
+        for line in open(HIST_FILE):
+            try:
+                e = json.loads(line)
+                banned.add(e.get("old"))
+                banned.add(e.get("new"))
+            except ValueError:
+                continue
+    except OSError:
+        pass
+    banned.discard(None)
+    spare = [i for i in pool if i.get("device_id") not in used_devices
+             and i.get("device_id") not in banned and i.get("device_id")]
+    log("spare identities: %d (used %d, banned %d)" % (
+        len(spare), len(used_devices), len(banned)))
 
     cfg_by_tag = {ep["tag"]: ep for ep in endpoints}
     swaps = []
