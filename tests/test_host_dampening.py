@@ -74,6 +74,38 @@ def test_host_dampen_isolated_host_no_cross_effect(temp_env):
         assert CircuitBreaker.host_dampen_cooldown(full, conn, "10.9.9.9") == full
 
 
+def test_host_dampen_ignores_repeated_failures_from_same_node(temp_env):
+    """同一节点多次失败不冒充多节点共同故障信号。"""
+    storage = temp_env
+    _mk(storage, "repeat-node")
+    for _ in range(HOST_DEAD_CAP_FOR_SHORT_BACKOFF):
+        storage.update_probe_result(ProbeResult(
+            node_name="repeat-node", success=False, error="timeout"))
+    with storage._get_conn() as conn:
+        full = CircuitBreaker.compute_cooldown(10)
+        assert CircuitBreaker.host_dampen_cooldown(full, conn, "10.9.9.9") == full
+
+
+def test_force_probe_can_recover_frozen_but_not_disabled(temp_env):
+    storage = temp_env
+    frozen = _mk(storage, "frozen-force", status=HealthStatus.DEAD.value)
+    frozen.tags.append("frozen")
+    storage.update_node("frozen-force", {"tags": frozen.tags})
+    storage.update_probe_result(ProbeResult(
+        node_name="frozen-force", success=True, exit_ip="2a09:bac5::1"), force=True)
+    recovered = storage.get_node("frozen-force")
+    assert recovered.status == HealthStatus.DEGRADED.value
+    assert "frozen" not in recovered.tags
+
+    disabled = _mk(storage, "disabled-force", status=HealthStatus.DISABLED.value,
+                    port=10001)
+    storage.update_probe_result(ProbeResult(
+        node_name="disabled-force", success=True, exit_ip="2a09:bac5::2"), force=True)
+    unchanged = storage.get_node("disabled-force")
+    assert unchanged.status == HealthStatus.DISABLED.value
+    assert unchanged.consecutive_successes == 0
+
+
 def test_evaluate_with_conn_applies_dampening(temp_env):
     """evaluate(conn=...) 端到端: mass-failure 主机的 tripped 退避被压短。"""
     storage = temp_env

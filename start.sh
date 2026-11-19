@@ -150,7 +150,8 @@ start_services() {
         echo "[*] Control Plane already running with PID $(cat "$PID_API")"
     else
         echo "[*] Starting Control Plane on $HOST:$PORT..."
-        nohup "$DIR/.venv/bin/uvicorn" api.server:app --host "$HOST" --port "$PORT" --workers 1 > "$LOG_API" 2>&1 &
+        nohup "$DIR/.venv/bin/uvicorn" api.server:app --host "$HOST" --port "$PORT" --workers 1 \
+            --log-config "$DIR/config/uvicorn-logging.json" > "$LOG_API" 2>&1 &
         echo $! > "$PID_API"
         sleep 1
     fi

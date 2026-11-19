@@ -231,6 +231,50 @@ def test_disabled_node_skipped_by_probe_node(temp_env):
     assert after.consecutive_failures == 0  # fail_count 家族没被动过
 
 
+def test_overlapping_probes_commit_in_start_order(temp_env, monkeypatch):
+    """同节点晚启动的探测不能先提交、再被旧结果覆盖。"""
+    import asyncio
+    from types import SimpleNamespace
+    from core.prober import Prober
+
+    storage, _ = temp_env
+    node = _mk(storage, "ordered-probe", egress=EgressType.NATIVE_IPV4.value)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    calls = 0
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, _url):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_started.set()
+                await release_first.wait()
+                return SimpleNamespace(status_code=200, text="198.51.100.1")
+            return SimpleNamespace(status_code=503, text="unavailable")
+
+    monkeypatch.setattr("core.prober.httpx.AsyncClient", lambda **_kwargs: FakeClient())
+    prober = Prober(storage, router=None, timeout=1.0)
+
+    async def run():
+        older = asyncio.create_task(prober.probe_node(node, retries=0))
+        await first_started.wait()
+        newer = asyncio.create_task(prober.probe_node(node, retries=0))
+        await asyncio.sleep(0.01)
+        assert calls == 1
+        release_first.set()
+        await asyncio.gather(older, newer)
+
+    asyncio.run(run())
+    assert storage.get_node("ordered-probe").last_probe_error == "HTTP status 503"
+
+
 def test_disabled_excluded_from_probe_all(temp_env, monkeypatch):
     """probe_all 默认过滤 DISABLED/frozen; force 不滤。
     2026-11-19 根修: 原版在测试内重写过滤逻辑自证 (同义反复), 现在打真

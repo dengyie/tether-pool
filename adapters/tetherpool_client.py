@@ -42,11 +42,21 @@ class TetherPoolClient:
         self,
         api_base: str = "http://127.0.0.1:9100",
         gateway_base: str = "http://127.0.0.1:9101",
-        timeout: float = 15.0
+        timeout: float = 15.0,
+        api_token: Optional[str] = None,
+        service_tokens: Optional[Dict[str, str]] = None,
     ):
         self.api_base = api_base.rstrip("/")
         self.gateway_base = gateway_base.rstrip("/")
         self.timeout = timeout
+        self.api_token = api_token if api_token is not None else os.environ.get("IP_POOL_API_TOKEN", "")
+        self.service_tokens = dict(service_tokens or {})
+        if service_tokens is None:
+            for pair in os.environ.get("IP_POOL_SERVICE_TOKENS", "").split(","):
+                if "=" in pair:
+                    service, token = pair.split("=", 1)
+                    if service.strip() and token.strip():
+                        self.service_tokens[service.strip()] = token.strip()
 
     def _http_request(
         self,
@@ -60,6 +70,15 @@ class TetherPoolClient:
             url += f"?{urlencode(params)}"
 
         headers = {"Accept": "application/json"}
+        service = None
+        if params:
+            service = params.get("target_service") or params.get("service")
+        if data:
+            service = data.get("target_service") or data.get("service") or service
+        token = self.service_tokens.get(service, "") if service else ""
+        token = token or self.api_token
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         req_body = None
         if data is not None:
             headers["Content-Type"] = "application/json"

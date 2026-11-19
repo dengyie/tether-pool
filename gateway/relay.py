@@ -38,22 +38,30 @@ async def pump_streams(r1: asyncio.StreamReader, w1: asyncio.StreamWriter, r2: a
     EOF 闭环一直开着。
     """
     async def _forward(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        result = ("eof", None)
         try:
             while True:
-                data = await reader.read(BUFFER_SIZE)
+                try:
+                    data = await reader.read(BUFFER_SIZE)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # The operation boundary, not the exception class, identifies
+                    # which peer failed: read failures belong to the peer we read.
+                    result = ("error", "read")
+                    break
                 if not data:
                     break
-                writer.write(data)
-                await writer.drain()
-            return ("eof", None)
-        except (asyncio.IncompleteReadError, ConnectionError, OSError):
-            # reader.read 失败 = 我读的对端故障
-            return ("error", "read")
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            # 其余 (write/drain 失败) = 我写的对端侧管道已死
-            return ("error", "write")
+                try:
+                    writer.write(data)
+                    await writer.drain()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # write/drain failures belong to the peer we write to.
+                    result = ("error", "write")
+                    break
+            return result
         finally:
             try:
                 if writer.can_write_eof():

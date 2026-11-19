@@ -11,14 +11,17 @@
 #       ④direct/AMBIGUOUS 状态区分 + 可 grep 告警标记; ⑤依赖 cmd_relay 的
 #       else-pop 根修, 不再需要行级 YAML hack。
 set -u
-REPO="/Users/mango/project/ip-pool"
+set -o pipefail
+REPO="${RELAY_WD_REPO:-/Users/mango/project/ip-pool}"
 LOG_TAG="[relay_watchdog]"
-ET_CLI="/opt/homebrew/bin/easytier-cli"
-PY="$REPO/.venv/bin/python"
-BRIDGE_CFG="$REPO/config/teleapi-bridge.yaml"
-LOCKDIR="/tmp/relay-watchdog.lockdir"
-TSF="/tmp/relay-watchdog.last-flip"
-DOWNF="/tmp/relay-watchdog.down-count"
+ET_CLI="${RELAY_WD_ET_CLI:-/opt/homebrew/bin/easytier-cli}"
+PY="${RELAY_WD_PY:-$REPO/.venv/bin/python}"
+BRIDGE_CFG="${RELAY_WD_BRIDGE_CFG:-$REPO/config/teleapi-bridge.yaml}"
+export RELAY_WD_BRIDGE_CFG="$BRIDGE_CFG"
+LOCKDIR="${RELAY_WD_LOCKDIR:-/tmp/relay-watchdog.lockdir}"
+TSF="${RELAY_WD_TSF:-/tmp/relay-watchdog.last-flip}"
+DOWNF="${RELAY_WD_DOWNF:-/tmp/relay-watchdog.down-count}"
+CLI_OUT="${RELAY_WD_CLI_OUT:-/tmp/relay-watchdog.cli.out}"
 
 # 候选: mesh IP | 桥核中继节点名 (须已在 relay-nodes.local.yaml / 桥核配置)
 CANDIDATES=(
@@ -52,7 +55,7 @@ log() { echo "$(date '+%F %T') $LOG_TAG $*"; }
 # ---------- 有界执行器: macOS 无 timeout, 用后台+wait+kill ----------
 run_bounded() {  # $1=timeout_s, 其余=命令 → stdout; 超时返回空
   local t="$1"; shift
-  "$@" > /tmp/relay-watchdog.cli.out 2>/dev/null &
+  "$@" > "$CLI_OUT" 2>/dev/null &
   local p=$!
   local waited=0
   while kill -0 "$p" 2>/dev/null && [ "$waited" -lt "$t" ]; do
@@ -63,14 +66,17 @@ run_bounded() {  # $1=timeout_s, 其余=命令 → stdout; 超时返回空
     return 1
   fi
   wait "$p" 2>/dev/null
-  cat /tmp/relay-watchdog.cli.out
+  rc=$?
+  cat "$CLI_OUT"
+  return "$rc"
 }
 
 # ---------- 当前中继读取 ----------
 current_relay() {
   "$PY" - <<'PYEOF'
+import os
 import yaml
-c = yaml.safe_load(open('/Users/mango/project/ip-pool/config/teleapi-bridge.yaml'))
+c = yaml.safe_load(open(os.environ['RELAY_WD_BRIDGE_CFG']))
 vals = {p.get('dialer-proxy') for p in c.get('proxies', []) if p.get('dialer-proxy')}
 vals = [v for v in vals if 'VLESS-AWS' in (v or '')]
 if len(vals) == 1:
@@ -83,16 +89,30 @@ PYEOF
 }
 
 peer_metric() {  # $1 = mesh IP → "lat loss"; 行首 '|' 产生空 $1: $2=ipv4 $5=lat $6=loss
-  local out
-  out=$(run_bounded "$CLI_TIMEOUT" "$ET_CLI" peer | grep -F "$1/" | grep -E 'p2p|relay' \
-        | awk -F'|' '{ gsub(/ms|%/,"",$5); gsub(/ms|%/,"",$6); print $5, $6 }' | head -1)
-  echo "$out"
+  local out rc
+  # Keep CLI execution separate from parsing: an empty parsed result can mean either
+  # a missing peer row or a CLI failure/timeout, and those states have different actions.
+  out=$(run_bounded "$CLI_TIMEOUT" "$ET_CLI" peer)
+  rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+  # awk always exits successfully, so an absent row remains an empty metric rather
+  # than being confused with a failed easytier-cli invocation.
+  out=$(printf '%s\n' "$out" | awk -F'|' -v needle="$1/" \
+    'index($0, needle) && ($0 ~ /p2p|relay/) { gsub(/ms|%/,"",$5); gsub(/ms|%/,"",$6); print $5, $6; exit }')
+  printf '%s\n' "$out"
 }
 
 flip_to() {  # $1 = 目标中继节点名
-  local target="$1" now
+  local target="$1" now output rc cfg_dir pidf
   log "⚡ 切换 → $target"
-  "$PY" "$REPO/scripts/import_standalone.py" relay --group teleapi --relay-node "$target" --mode on 2>&1 | while IFS= read -r l; do log "$l"; done
+  output=$("$PY" "$REPO/scripts/import_standalone.py" relay --group teleapi --relay-node "$target" --mode on 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf '%s\n' "$output" | while IFS= read -r l; do log "$l"; done
+    log "FAIL 中继配置切换失败 (rc=$rc), 保留桥核与冷却状态"
+    return "$rc"
+  fi
+  printf '%s\n' "$output" | while IFS= read -r l; do log "$l"; done
   # cmd_relay 只改配置; 杀桥核进程, bridge_keeper.sh 以新配置重生 (用 pidfile 精确定位)
   local pidf="$REPO/data/teleapi-bridge.pid"
   local pid=""
@@ -128,6 +148,11 @@ done
 if [ -z "$CUR_IP" ]; then log "[-] 当前中继 $CUR 不在候选表"; exit 0; fi
 
 METRIC=$(peer_metric "$CUR_IP")
+PEER_RC=$?
+if [ "$PEER_RC" -ne 0 ]; then
+  log "WARN easytier-cli peer 失败/超时 (rc=$PEER_RC), 本轮不改变状态"
+  exit 0
+fi
 if [ -z "$METRIC" ]; then
   # 2026-11-19 review P2: peer 行消失 = 到当前中继的链路整体不在 mesh 里
   # (比劣化更恶劣), 旧版在此直接 exit 0 —— 最恶劣态反而永不切换。
@@ -162,6 +187,11 @@ for c in "${CANDIDATES[@]}"; do
   ip="${c%%|*}"; name="${c#*|}"
   [ "$name" = "$CUR" ] && continue
   BMETRIC=$(peer_metric "$ip")
+  PEER_RC=$?
+  if [ "$PEER_RC" -ne 0 ]; then
+    log "备选=$name ($ip) easytier-cli 失败/超时 (rc=$PEER_RC), 跳过"
+    continue
+  fi
   [ -z "$BMETRIC" ] && { log "备选=$name ($ip) peer 行缺失, 跳过"; continue; }
   read -r BLAT BLOSS <<< "$BMETRIC"
   [ -z "$BLAT" ] && continue
@@ -171,4 +201,4 @@ for c in "${CANDIDATES[@]}"; do
   fi
 done
 [ -z "$BEST" ] && { log "无优质备选, 保持现状 (链路全断时等待冷却后重试)"; exit 0; }
-flip_to "$BEST"
+flip_to "$BEST" || exit 1

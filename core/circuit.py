@@ -58,7 +58,8 @@ class CircuitBreaker:
             window_start = (datetime.now()
                             - timedelta(minutes=HOST_FAILURE_WINDOW_MINUTES)).isoformat()
             row = conn.execute(
-                "SELECT COUNT(*) FROM probe_history ph JOIN nodes n ON n.name = ph.node_name "
+                "SELECT COUNT(DISTINCT ph.node_name) FROM probe_history ph "
+                "JOIN nodes n ON n.name = ph.node_name "
                 "WHERE n.host = ? AND ph.success = 0 AND ph.probed_at >= ?",
                 (host, window_start),
             ).fetchone()

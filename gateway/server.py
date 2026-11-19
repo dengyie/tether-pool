@@ -926,25 +926,23 @@ class ForwardProxyGateway:
                 if parsed_url.query:
                     path_and_query += f"?{parsed_url.query}"
 
+                # The body is relayed as opaque bytes, so chunked framing cannot
+                # safely be stripped or forwarded. Reject before acquiring an
+                # upstream socket; headers_dict already normalizes field names.
+                if "transfer-encoding" in headers_dict:
+                    client_writer.write(
+                        b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n"
+                        b"Connection: close\r\n\r\n"
+                        b"chunked request bodies are not supported by this proxy; use Content-Length\r\n")
+                    await client_writer.drain()
+                    return
+
                 upstream = await self._open_upstream_or_respond(
                     client_writer, route_ctx, target_host, target_port,
                 )
                 if upstream is None:
                     return
                 upstream_node, remote_reader, remote_writer = upstream
-
-                # 2026-11-19 review P3: 网关把 body 当不透明字节泵 —— 剥掉 TE 后
-                # chunked body 变成无框架字节流 (smuggling 形状的正确性缺陷)。
-                # 显式拒绝, 让客户端改用 Content-Length。
-                if any(l.strip().lower().startswith("transfer-encoding:")
-                       for l in lines[1:] if ":" in l):
-                    client_writer.write(
-                        b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n"
-                        b"Connection: close\r\n\r\n"
-                        b"chunked request bodies are not supported by this proxy; use Content-Length\r\n")
-                    await client_writer.drain()
-                    client_writer.close()
-                    return
 
                 # Reconstruct clean HTTP request without internal headers.
                 # 2026-11-15 review #8: 除逐名过滤外, 还必须剥 Connection 头

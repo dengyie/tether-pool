@@ -240,6 +240,36 @@ async def test_gateway_connect_malformed_target(temp_gateway):
     assert b"400 Bad Request" in resp
 
 
+@pytest.mark.asyncio
+async def test_gateway_rejects_transfer_encoding_before_opening_upstream(temp_gateway, monkeypatch):
+    gateway, _storage, _router = temp_gateway
+    opened = False
+
+    async def unexpected_open(*args, **kwargs):
+        nonlocal opened
+        opened = True
+        raise AssertionError("upstream must not be opened for unsupported framing")
+
+    monkeypatch.setattr(gateway, "_open_upstream_or_respond", unexpected_open)
+    server = await asyncio.start_server(gateway.handle_client, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(
+        b"POST http://example.com/upload HTTP/1.1\r\n"
+        b"Host: example.com\r\n"
+        b"Transfer-Encoding : chunked\r\n\r\n"
+    )
+    await writer.drain()
+    response = await reader.read(1024)
+    writer.close()
+    await writer.wait_closed()
+    server.close()
+    await server.wait_closed()
+
+    assert b"400 Bad Request" in response
+    assert not opened
+
+
 def test_relay_counters_and_metrics_rendering(temp_gateway):
     """Per-account relay counters aggregate anon ids under one label and the
     /metrics rendering is valid Prometheus text (ops attribution feature)."""
@@ -526,6 +556,30 @@ def test_pump_streams_client_upload_with_upstream_death_is_upstream_reset():
     w1 = _TaxWriter()
     out = asyncio.run(gateway_mod.pump_streams(r1, w1, r2, w2))
     assert out == "upstream_reset"
+
+
+def test_pump_streams_upstream_write_reset_is_upstream_reset(monkeypatch):
+    monkeypatch.setattr(gateway_mod, "HALF_CLOSE_GRACE_SECONDS", 0.01)
+    r1 = _TaxReader(chunks=[b"upload"])
+    w2 = _TaxWriter(write_fail=True)
+    r2 = _TaxReader(hang=True)
+    w1 = _TaxWriter()
+
+    out = asyncio.run(gateway_mod.pump_streams(r1, w1, r2, w2))
+
+    assert out == "upstream_reset"
+
+
+def test_pump_streams_client_write_reset_is_client_error(monkeypatch):
+    monkeypatch.setattr(gateway_mod, "HALF_CLOSE_GRACE_SECONDS", 0.01)
+    r1 = _TaxReader(hang=True)
+    w2 = _TaxWriter()
+    r2 = _TaxReader(chunks=[b"response"])
+    w1 = _TaxWriter(write_fail=True)
+
+    out = asyncio.run(gateway_mod.pump_streams(r1, w1, r2, w2))
+
+    assert out == "client_error"
 
 
 def test_pump_streams_client_rst_is_client_error():

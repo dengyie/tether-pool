@@ -6,6 +6,7 @@ import asyncio
 import datetime
 import time
 import httpx
+import threading
 from typing import List, Optional, Any
 from core.models import ProxyNode, ProbeResult, EgressType, HealthStatus
 from core.storage import Storage
@@ -55,12 +56,29 @@ class Prober:
         self.storage = storage
         self.router = router
         self.timeout = timeout
+        self._node_locks: dict[str, asyncio.Lock] = {}
+        self._node_locks_guard = threading.Lock()
+
+    def _node_lock(self, node_name: str) -> asyncio.Lock:
+        # asyncio.Lock is loop-bound; probe_all and direct API calls share this
+        # prober within one server loop. Guard dict creation for worker threads.
+        guard = getattr(self, "_node_locks_guard", None)
+        if guard is None:  # Keep lightweight __new__-constructed test probers valid.
+            guard = threading.Lock()
+            self._node_locks_guard = guard
+            self._node_locks = {}
+        with guard:
+            return self._node_locks.setdefault(node_name, asyncio.Lock())
 
     async def probe_node(self, node: ProxyNode, retries: int = 1, force: bool = False) -> ProbeResult:
-        # Admin-disabled nodes are never probed (force override: explicit
-        # operator intent). Returns without touching storage — no fail_count
-        # bump, no circuit event, no probe_history row.
-        if not force and node.status == HealthStatus.DISABLED.value:
+        async with self._node_lock(node.name):
+            return await self._probe_node_locked(node, retries=retries, force=force)
+
+    async def _probe_node_locked(self, node: ProxyNode, retries: int = 1, force: bool = False) -> ProbeResult:
+        # Disabled nodes require an explicit enable operation; force only bypasses
+        # circuit cooldown and permits a frozen-node recovery probe.
+        if node.status == HealthStatus.DISABLED.value:
+
             return ProbeResult(
                 node_name=node.name,
                 success=False,
@@ -145,7 +163,7 @@ class Prober:
                     )
                     # sqlite 写移出事件环 (二轮 review #2): sweep 并发下每次同步
                     # 写库都是一次全事件环停顿。
-                    _, event = await asyncio.to_thread(self.storage.update_probe_result, res)
+                    _, event = await asyncio.to_thread(self.storage.update_probe_result, res, force)
                     return res
                 else:
                     raise RuntimeError(f"HTTP status {resp.status_code}")
@@ -166,7 +184,7 @@ class Prober:
                     latency_ms=latency,
                     error=err_msg[:120]
                 )
-                _, event = await asyncio.to_thread(self.storage.update_probe_result, res)
+                _, event = await asyncio.to_thread(self.storage.update_probe_result, res, force)
 
                 # Automatic Self-Healing: If circuit tripped OPEN (DEAD), rehome attached leases
                 if event and event.to_state == HealthStatus.DEAD.value and self.router:

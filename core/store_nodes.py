@@ -94,7 +94,7 @@ class NodeStore:
                 WHERE name = ?
             """, (status, status, status, node_name))
 
-    def update_probe_result(self, res: ProbeResult) -> Tuple[ProbeResult, Optional[CircuitEvent]]:
+    def update_probe_result(self, res: ProbeResult, force: bool = False) -> Tuple[ProbeResult, Optional[CircuitEvent]]:
         """
         Records probe history and evaluates circuit breaker transition.
         Returns: (res, optional_circuit_event_if_transitioned)
@@ -132,9 +132,15 @@ class NodeStore:
                 # 回 degraded/healthy (恢复走 revive/enable 管理通道)。
                 # row_tags 取自事务内重读的行, 而非外层快照 node.tags。
                 row_tags = json.loads(row["tags"]) if row["tags"] else []
-                if (old_state == HealthStatus.DISABLED.value or "frozen" in row_tags) \
-                        and not res.force:
+                # Disabled is an explicit administrator decision and can only be
+                # lifted through enable/revive. Force probes may inspect frozen
+                # nodes; a successful forced result unfreezes them below.
+                if old_state == HealthStatus.DISABLED.value:
                     return res, None
+                if "frozen" in row_tags and not force:
+                    return res, None
+                if "frozen" in row_tags and force and res.success:
+                    row_tags = [tag for tag in row_tags if tag != "frozen"]
 
                 # 3. Evaluate circuit transition
                 # Calculate updated counters BEFORE evaluate: rise=2 recovery gate
@@ -186,6 +192,8 @@ class NodeStore:
                     from core.ban import refresh_isp_tag
                     updated_node = refresh_isp_tag(node, res.exit_ip)
                     new_tags = updated_node.tags if updated_node else node.tags
+                    if force and "frozen" in new_tags:
+                        new_tags = [tag for tag in new_tags if tag != "frozen"]
                     # gen 区域漂移纠偏 (R2 2026-11-14): CF trace loc= 是出口真实国家,
                     # gen 批次当初硬编码 us-west 但 ~50% 出口实际在 DE/CA —— 标签失真
                     # 击穿 region_strict 与 auto_rehome。与 exit_ip 同事务校正为真实

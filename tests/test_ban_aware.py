@@ -787,7 +787,7 @@ def test_probe_write_and_rehome_off_event_loop():
     sqlite 写阻塞)。源码级断言防回归。"""
     import inspect
     from core import prober
-    src = inspect.getsource(prober.Prober.probe_node)
+    src = inspect.getsource(prober.Prober._probe_node_locked)
     assert "to_thread(self.storage.update_probe_result" in src
     assert "to_thread(\n                            self.router.rehome_leases_for_node" in src
     from gateway import server as gw_server

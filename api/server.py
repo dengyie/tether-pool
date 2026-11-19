@@ -418,19 +418,33 @@ def _provided_token(request: Request) -> str:
 
 
 async def _request_service(request: Request) -> Optional[str]:
-    """请求目标的 service 标识 (per-service token 判定用): 先查 query, 再窥
-    JSON body (starlette 缓存 body, 端点二次读取安全)。"""
-    svc = request.query_params.get("service")
-    if svc:
-        return svc
+    """返回请求声明的唯一 service scope，冲突时返回不可授权哨兵。
+
+    支持通用 `service` 与反女巫/电池接口使用的 `target_service`；同时检查
+    query 和 JSON body，避免额外参数遮蔽 handler 实际消费的业务作用域。
+    Starlette 会缓存窥视过的 body，端点仍可正常解析。"""
+    scopes = [
+        value.strip()
+        for key in ("service", "target_service")
+        for value in request.query_params.getlist(key)
+        if value and value.strip()
+    ]
     if (request.headers.get("content-type", "") or "").startswith("application/json"):
         try:
             body = await request.json()
         except Exception:
-            return None
+            body = None
         if isinstance(body, dict):
-            return body.get("service")
-    return None
+            scopes.extend(
+                value.strip()
+                for key in ("service", "target_service")
+                for value in (body.get(key),)
+                if isinstance(value, str) and value.strip()
+            )
+    unique_scopes = set(scopes)
+    if len(unique_scopes) > 1:
+        return "__ambiguous_service_scope__"
+    return next(iter(unique_scopes), None)
 
 
 @app.middleware("http")

@@ -64,6 +64,93 @@ CN_REGION = {
 }
 
 
+def cleanup_retired_bindings(db_path, retired_nodes):
+    """释放退役节点绑定，并在同一 SQLite 事务内更新镜像与增量账本。"""
+    if not retired_nodes:
+        return 0
+    import sqlite3
+    from datetime import datetime as _dt
+
+    names = sorted(retired_nodes)
+    placeholders = ",".join("?" * len(names))
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        orphaned = conn.execute(
+            f"SELECT service, account_id, node_name FROM account_allocations "
+            f"WHERE node_name IN ({placeholders})",
+            names,
+        ).fetchall()
+        if not orphaned:
+            conn.commit()
+            return 0
+        conn.execute(
+            f"DELETE FROM account_allocations WHERE node_name IN ({placeholders})", names)
+        for account_id in {row[1] for row in orphaned}:
+            remaining = conn.execute(
+                "SELECT node_name, allocated_at FROM account_allocations "
+                "WHERE account_id = ? ORDER BY allocated_at DESC LIMIT 1",
+                (account_id,),
+            ).fetchone()
+            if remaining:
+                conn.execute(
+                    "UPDATE leases SET node_name = ?, assigned_at = ? WHERE account_id = ?",
+                    (remaining[0], remaining[1], account_id),
+                )
+            else:
+                conn.execute("DELETE FROM leases WHERE account_id = ?", (account_id,))
+        now_str = _dt.now().isoformat()
+        services = sorted({row[0] for row in orphaned})
+        for service in services:
+            conn.execute(
+                "INSERT INTO binding_epoch_state (service, epoch, changed_at) VALUES (?, 1, ?) "
+                "ON CONFLICT(service) DO UPDATE SET "
+                "epoch = binding_epoch_state.epoch + 1, changed_at = excluded.changed_at",
+                (service, now_str),
+            )
+            epoch = conn.execute(
+                "SELECT epoch FROM binding_epoch_state WHERE service = ?", (service,)
+            ).fetchone()[0]
+            conn.executemany(
+                "INSERT INTO binding_changes "
+                "(service, epoch, account_id, from_node, to_node, reason, created_at) "
+                "VALUES (?, ?, ?, ?, NULL, 'node_retired_dangling_cleanup', ?)",
+                [(svc, epoch, account_id, node_name, now_str)
+                 for svc, account_id, node_name in orphaned if svc == service],
+            )
+        conn.commit()
+        return len(orphaned)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def write_config_pair(cfg_text, nodes_text, cfg_path=CFG, nodes_path=NODES):
+    """Atomically replace both YAML files, restoring the pair if either write fails."""
+    from atomic_yaml import atomic_write_text
+
+    cfg_path, nodes_path = Path(cfg_path), Path(nodes_path)
+    cfg_before = cfg_path.read_bytes()
+    nodes_before = nodes_path.read_bytes()
+    try:
+        atomic_write_text(cfg_path, cfg_text)
+        atomic_write_text(nodes_path, nodes_text)
+    except Exception:
+        atomic_write_text(cfg_path, cfg_before.decode("utf-8"))
+        atomic_write_text(nodes_path, nodes_before.decode("utf-8"))
+        raise
+    return cfg_before, nodes_before
+
+
+def restore_config_pair(cfg_before, nodes_before, cfg_path=CFG, nodes_path=NODES):
+    from atomic_yaml import atomic_write_text
+
+    atomic_write_text(cfg_path, cfg_before.decode("utf-8"))
+    atomic_write_text(nodes_path, nodes_before.decode("utf-8"))
+
+
 def backup_with_rotation():
     BACKUP_DIR.mkdir(exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -231,16 +318,17 @@ def main():
         new_names = {n["name"] for n in new_nodes}
 
         # ---- 落盘前校验 ----
-        CFG.write_text(yaml.safe_dump(main_cfg, allow_unicode=True, sort_keys=False))
+        cfg_before, nodes_before = write_config_pair(
+            yaml.safe_dump(main_cfg, allow_unicode=True, sort_keys=False),
+            yaml.safe_dump(nodes_d, allow_unicode=True, sort_keys=False),
+        )
         t = subprocess.run(["/opt/ip-pool/bin/mihomo", "-t", "-d", "/opt/ip-pool/config/huawei-bridge",
                             "-f", str(CFG)], capture_output=True, text=True)
         if "successful" not in t.stdout + t.stderr:
             print("[TELEAPISUB_REFRESH_FAIL] mihomo -t failed: rc=%s out=%r err=%r" % (
                 t.returncode, t.stdout[-300:], t.stderr[-300:]), file=sys.stderr)
-            latest_cfg = sorted(glob.glob(str(BACKUP_DIR / "huawei-bridge.yaml.*-teleapisub")))[-1]
-            subprocess.run(["cp", latest_cfg, str(CFG)])
+            restore_config_pair(cfg_before, nodes_before)
             return 1
-        NODES.write_text(yaml.safe_dump(nodes_d, allow_unicode=True, sort_keys=False))
 
         subprocess.run(["systemctl", "restart", "ip-pool-huawei-bridge.service"], check=False)
         subprocess.run(["systemctl", "restart", "ip-pool-api.service", "ip-pool-gateway.service"], check=False)
@@ -250,10 +338,7 @@ def main():
         if listening < len(new_listeners) - 5:
             print("[TELEAPISUB_REFRESH_FAIL] listeners missing: %d/%d up -> rolling back" % (
                 listening, len(new_listeners)), file=sys.stderr)
-            for suffix, dst in (("huawei-bridge.yaml.*-teleapisub", CFG), ("nodes.yaml.*-teleapisub", NODES)):
-                baks = sorted(glob.glob(str(BACKUP_DIR / suffix)))
-                if baks:
-                    subprocess.run(["cp", baks[-1], str(dst)], check=False)
+            restore_config_pair(cfg_before, nodes_before)
             subprocess.run(["systemctl", "restart", "ip-pool-huawei-bridge.service",
                             "ip-pool-api.service", "ip-pool-gateway.service"], check=False)
             time.sleep(8)
@@ -263,15 +348,7 @@ def main():
         # ---- 悬空绑定清理 (部署验证通过后) ----
         dangling = old_node_names - new_names
         if dangling:
-            import sqlite3
-            conn = sqlite3.connect(str(DB))
-            cur = conn.cursor()
-            ph = ",".join("?" * len(dangling))
-            cur.execute(f"DELETE FROM account_allocations WHERE node_name IN ({ph})", tuple(dangling))
-            n_alloc = cur.rowcount
-            cur.execute(f"DELETE FROM binding_changes WHERE to_node IN ({ph}) OR from_node IN ({ph})", tuple(dangling) * 2)
-            conn.commit()
-            conn.close()
+            n_alloc = cleanup_retired_bindings(DB, dangling)
             print(f"dangling bindings cleaned: {n_alloc} allocations over {len(dangling)} retired nodes")
 
         print("deployed: %d teleapisub nodes, bridge listeners=%d, nodes=%d, verified listening=%d" % (
