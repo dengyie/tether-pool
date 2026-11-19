@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""warp_ep_redial.py — WARP 死会话 identity 轮换 (2026-11-19)。
+
+背景 (cue-1 事故复盘认知升级):
+  - CF 对同出口 IP 的并发 WARP 会话有上限 (~75-90/100, 有抖动), 超额会话
+    「链路层假活 + 隧道内全超时」; 死会话 15min+ 不自愈 (零和分配)。
+  - sing-box 1.14 无 per-endpoint 热重载 → 换 identity 必须 restart。
+  - restart 会重摇全部会话骰子 (活的可能死, 死的可能活), 因此策略不是
+    「重启救活」而是「每次 restart 前把已知死 identity 换成库里未分配的
+    全新 device」—— 新注册 identity = 干净会话配额, 单调减少死 ep 数。
+
+策略:
+  1. 本机并发探针全部 warp 端口 (CF trace 断言 v6 出口)。
+  2. dead 比例 < DEAD_MIN (默认 3) → 无事退出 (避免为 1-2 个抖动重启)。
+  3. 对每个 dead ep: 从 /root/warp-pool/endpoints.json 里找未在 config
+     中使用的 identity (未分配的 device_id), 替换 private_key/address/
+     reserved/peer_pub; 备用不足则跳过该 ep。
+  4. sing-box check 通过才写回 + restart; 失败保持原配置 (带 .bad 快照)。
+  5. 冷却 COOLDOWN (默认 1800s) 防连轴重摇; mkdir 原子锁。
+  6. 轮换历史追加 /root/warp-redial/history.jsonl (tag, old/new device)。
+
+注意: 脚本不缩减 endpoint 数量 (那是容量决策), 只换身份。裁剪用
+  trim 模式人工做 (config.json.bak-trim* 系列快照)。
+"""
+import base64
+import datetime
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+
+CONFIG = os.environ.get("SING_BOX_CONFIG", "/etc/sing-box/config.json")
+POOL_FILE = os.environ.get("WARP_POOL_FILE", "/root/warp-pool/endpoints.json")
+HIST_FILE = os.environ.get("WARP_REDIAL_HIST", "/root/warp-redial/history.jsonl")
+LOCK_DIR = os.environ.get("WARP_REDIAL_LOCK", "/root/warp-redial")
+TAGMAP_FILE = os.environ.get("WARP_TAGMAP", os.path.join(
+    os.environ.get("WARP_REDIAL_LOCK", "/root/warp-redial"), "tagmap.json"))
+DEAD_MIN = int(os.environ.get("WARP_DEAD_MIN", "3"))
+COOLDOWN = int(os.environ.get("WARP_COOLDOWN", "1800"))
+PROBE_HOST = os.environ.get("WARP_PROBE_HOST", "10.144.144.81")
+PROBE_TIMEOUT = int(os.environ.get("WARP_PROBE_TIMEOUT", "6"))
+DRYRUN = os.environ.get("WARP_DRYRUN", "0") == "1"
+
+LOG = os.environ.get("WARP_REDIAL_LOG", "/var/log/warp-ep-redial.log")
+
+
+def log(msg):
+    line = "%s %s" % (datetime.datetime.now().strftime("%F %T"), msg)
+    print(line)
+    try:
+        with open(LOG, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def acquire_lock():
+    os.makedirs(LOCK_DIR, exist_ok=True)
+    fd = open(os.path.join(LOCK_DIR, "lock"), "w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except OSError:
+        sys.exit(0)  # 上一个实例在跑
+
+
+def cooldown_ok():
+    last_f = os.path.join(LOCK_DIR, "last_restart")
+    try:
+        last = os.path.getmtime(last_f)
+        if time.time() - last < COOLDOWN:
+            log("SKIP cooldown %ds" % int(time.time() - last))
+            return False
+    except OSError:
+        pass
+    return True
+
+
+def mark_restart():
+    with open(os.path.join(LOCK_DIR, "last_restart"), "w") as f:
+        f.write(str(time.time()))
+
+
+def warp_ok(port):
+    """探针: CF trace 且出口 v6 (2a09:bac 段) — 与池侧契约一致。"""
+    try:
+        out = subprocess.run(
+            ["curl", "-s", "--max-time", str(PROBE_TIMEOUT),
+             "-x", "socks5h://%s:%d" % (PROBE_HOST, port),
+             "https://cloudflare.com/cdn-cgi/trace"],
+            capture_output=True, text=True, timeout=PROBE_TIMEOUT + 2
+        ).stdout
+        return bool([l for l in out.splitlines() if l.startswith("ip=2a09:bac")])
+    except Exception:
+        return False
+
+
+def main():
+    acquire_lock()
+    cfg = json.load(open(CONFIG))
+    inbounds = {i["tag"]: i for i in cfg.get("inbounds", [])}
+    endpoints = cfg.get("endpoints", [])
+
+    # tag → port: socks-warp-NN ↔ warp-epNN (port = 10880 + NN)
+    probes = {}
+    for ep in endpoints:
+        tag = ep.get("tag", "")  # warp-epNN
+        nn = tag.replace("warp-ep", "")
+        if not nn.isdigit():
+            continue
+        inb = inbounds.get("socks-warp-" + nn)
+        if not inb:
+            continue  # 已裁剪的 ep (inbound 没了) 跳过
+        probes[ep["tag"]] = inb.get("listen_port")
+
+    dead = [t for t, p in probes.items() if not warp_ok(p)]
+    alive = len(probes) - len(dead)
+    log("PROBE alive=%d dead=%d (%s)" % (alive, len(dead), ",".join(sorted(dead)[:10]) + ("..." if len(dead) > 10 else "")))
+
+    if len(dead) < DEAD_MIN:
+        log("OK dead<%d, skip" % DEAD_MIN)
+        return
+
+    if not cooldown_ok():
+        return
+
+    # identity 库: 找未在 config 中的 device_id
+    # sing-box schema 不认 device_id 字段, 无法写进 config; 改用持久映射
+    # 文件 tagmap.json (tag -> device_id) 记录轮换结果, 初始值按 tag 编号
+    # 对齐 identity 库 (tag NN = 库序号 NN, 1-based)。
+    pool = json.load(open(POOL_FILE))
+    pool_by_id = {i["device_id"]: i for i in pool if i.get("device_id")}
+    dev_by_tag = {}
+    for ep in endpoints:
+        m = ep.get("tag", "").replace("warp-ep", "")
+        if m.isdigit() and 1 <= int(m) <= len(pool):
+            dev = pool[int(m) - 1].get("device_id")
+            if dev:
+                dev_by_tag[ep["tag"]] = dev
+    try:
+        dev_by_tag.update(json.load(open(TAGMAP_FILE)))
+    except (OSError, ValueError):
+        pass
+    used_devices = set(dev_by_tag.values())
+    spare = [i for i in pool if i.get("device_id") not in used_devices and i.get("device_id")]
+    log("spare identities: %d (used %d)" % (len(spare), len(used_devices)))
+
+    cfg_by_tag = {ep["tag"]: ep for ep in endpoints}
+    swaps = []
+    for tag in dead:
+        if not spare:
+            log("WARN no spare identity left; %s kept dead" % tag)
+            continue
+        new = spare.pop(0)
+        old_dev = dev_by_tag.get(tag, "?")
+        swaps.append((tag, old_dev, new))
+
+    if not swaps:
+        log("OK nothing to swap (no spare)")
+        return
+
+    if DRYRUN:
+        for tag, old_dev, new in swaps:
+            log("DRYRUN %s: %s -> %s" % (tag, old_dev[:8], new["device_id"][:8]))
+        return
+
+    # 应用替换: endpoint 换身份; address 数组也换 (新 identity 的双栈地址)。
+    # device_id 不写入 config (sing-box schema 不认), 记 tagmap。
+    tagmap_new = {}
+    for tag, old_dev, new in swaps:
+        ep = cfg_by_tag[tag]
+        ep["private_key"] = new["private_key"]
+        ep["address"] = new["addresses"]
+        tagmap_new[tag] = new["device_id"]
+        for peer in ep.get("peers", []):
+            peer["public_key"] = new.get("peer_pub", peer.get("public_key"))
+            peer["reserved"] = new.get("reserved", peer.get("reserved"))
+        log("SWAP %s: %s -> %s (v6=%s)" % (tag, old_dev[:8], new["device_id"][:8], new.get("v6", "")[:24]))
+
+    # check 门禁
+    tmp = CONFIG + ".redial-tmp"
+    json.dump(cfg, open(tmp, "w"), indent=2, ensure_ascii=False)
+    chk = subprocess.run(["sing-box", "check", "-c", tmp], capture_output=True, text=True)
+    if chk.returncode != 0:
+        os.replace(tmp, CONFIG + ".bad-" + datetime.datetime.now().strftime("%H%M%S"))
+        log("ERROR check failed: %s" % chk.stderr[:200])
+        return
+    os.replace(tmp, CONFIG)
+    # tagmap 持久化 (restart 成功路径; check 失败不写, 保持旧映射)
+    dev_by_tag.update(tagmap_new)
+    json.dump(dev_by_tag, open(TAGMAP_FILE, "w"), indent=1)
+
+    subprocess.run(["systemctl", "restart", "sing-box"], check=False)
+    mark_restart()
+    time.sleep(20)
+
+    # 验证
+    ok2 = sum(1 for t, p in probes.items() if warp_ok(p))
+    log("RESTART done: alive %d -> %d (swapped %d)" % (alive, ok2, len(swaps)))
+    os.makedirs(os.path.dirname(HIST_FILE), exist_ok=True)
+    with open(HIST_FILE, "a") as f:
+        for tag, old_dev, new in swaps:
+            f.write(json.dumps({
+                "ts": datetime.datetime.now().isoformat(),
+                "tag": tag, "old": old_dev, "new": new["device_id"],
+                "alive_before": alive, "alive_after": ok2,
+            }) + "\n")
+
+
+if __name__ == "__main__":
+    main()
