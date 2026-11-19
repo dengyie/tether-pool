@@ -15,14 +15,14 @@
 #   4. 冷却 1800s (重启代价 = 全量握手 ~1min, 与 relay_watchdog 对齐)
 #   5. stat 用 Linux 语法 (-c %Y); 无 flock → mkdir 原子锁 (同 tebi 版)
 
-PATH=/usr/local/bin:/usr/bin:/bin:/sbin
+PATH=${WARP_WD_PATH:-/usr/local/bin:/usr/bin:/bin:/sbin}
 
 LOG=${WARP_WD_LOG:-/var/log/warp-tunnel-watchdog.log}
 RUNDIR=${WARP_WD_RUNDIR:-/root/warp-tunnel-watchdog}
 PROBE_HOST=${WARP_WD_HOST:-10.144.144.81}
 NATIVE_PORT=${WARP_WD_NATIVE_PORT:-10801}
-# 抽 3 个 warp 端口 (head/mid/tail 覆盖 10881-10980 段)
-WARP_PORTS=${WARP_WD_PORTS:-"10882 10930 10978"}
+# 抽 3 个 warp 端口 (head/mid/tail 覆盖; 2026-11-19 裁剪后 ep002 已删, 10882 换 10881)
+WARP_PORTS=${WARP_WD_PORTS:-"10881 10930 10978"}
 FAILS_NEEDED=${WARP_WD_FAILS_NEEDED:-2}
 COOLDOWN=${WARP_WD_COOLDOWN:-1800}
 LOCK_STALE=${WARP_WD_LOCK_STALE:-600}
@@ -82,7 +82,13 @@ warp_ok() {  # $1 = port
 
 # 短路判定: native 死 → 宿主机网络问题, 不作为 warp 故障计数
 if ! native_ok; then
-    log "SKIP native 出口也不通 (宿主机网络问题), 不计 warp 故障"
+    prev=$(num "$(cat "${STATE}" 2>/dev/null)" 0)
+    if [ "${prev}" -gt 0 ]; then
+        log "SKIP native 出口也不通 (宿主机网络问题), 清除此前 warp streak=${prev}"
+        echo 0 > "${STATE}"
+    else
+        log "SKIP native 出口也不通 (宿主机网络问题), 不计 warp 故障"
+    fi
     exit 0
 fi
 
@@ -117,13 +123,12 @@ if [ $((now - last)) -lt "${COOLDOWN}" ]; then
     log "SKIP 冷却期内 ($((now - last))s < ${COOLDOWN}s)"
     exit 0
 fi
-echo "${now}" > "${LAST}"
-
 if [ "${DRYRUN}" = "1" ]; then
-    log "HEAL [DRYRUN] 命中 (fails=${fails}, bad=${bad}/3) → 跳过 restart"
+    log "HEAL [DRYRUN] 命中 (fails=${fails}, bad=${bad}/3) → 跳过 restart 和冷却写入"
     exit 0
 fi
 
+echo "${now}" > "${LAST}"
 log "HEAL 指纹命中 (fails=${fails}, bad=${bad}/3) → systemctl restart sing-box"
 if systemctl restart sing-box >/dev/null 2>&1; then
     sleep 20
@@ -138,6 +143,5 @@ if systemctl restart sing-box >/dev/null 2>&1; then
         log "HEAL 已执行但 20s 后仅 ${okcnt}/3 恢复，冷却后自动重试 (持续失败请查 CF 会话/宿主机 UDP)"
     fi
 else
-    log "ERROR systemctl restart sing-box 失败，请人工检查 systemd"
-    echo 0 > "${STATE}"
+    log "ERROR systemctl restart sing-box 失败，请人工检查 systemd；保留连续失败 streak=${fails}"
 fi
