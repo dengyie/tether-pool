@@ -134,14 +134,22 @@ def main():
     # 净亏熔断: 上一轮 swap 后 alive 不升反降 → 贴 CF 配额上限, 连续 swap
     # 只会继续重摇随机死 (21:30 轮 61→56 实证)。熔断直到 alive 回升或人工
     # touch /root/warp-redial/resume。
+    # 解除条件: 本轮探针 alive 已回到上轮 swap 前 (alive_before) 水平 →
+    # 配额低谷已过去, 可以重试; 只看 alive_after 永远不会自动解除 (history
+    # 只在 swap 成功后写, 熔断阻止 swap → 死锁, 2026-11-20 00:01 实证)。
     try:
         last = [json.loads(l) for l in open(HIST_FILE)][-1]
         if last["alive_after"] < last["alive_before"] and \
                 not os.path.exists(os.path.join(LOCK_DIR, "resume")):
-            log("CIRCUIT last round net %d, skip until alive recovers "
-                "(touch %s/resume to override)" % (
-                    last["alive_after"] - last["alive_before"], LOCK_DIR))
-            return
+            if alive >= last["alive_before"]:
+                log("CIRCUIT lifted: alive=%d recovered >= before=%d" % (
+                    alive, last["alive_before"]))
+            else:
+                log("CIRCUIT last round net %d, skip until alive recovers "
+                    "(now %d, before %d; touch %s/resume to override)" % (
+                        last["alive_after"] - last["alive_before"], alive,
+                        last["alive_before"], LOCK_DIR))
+                return
     except (OSError, KeyError, ValueError):
         pass
 
