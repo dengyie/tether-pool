@@ -66,8 +66,12 @@ def gen_one(idx):
                   or {})  # {"v4": "172.16.0.2", "v6": "2606:..."}
     v4 = iface_addr.get("v4") or ""
     v6 = iface_addr.get("v6") or ""
+    # CF API 返回裸地址; sing-box endpoint address 需要 CIDR 前缀 (netip.ParsePrefix)
+    if v6 and "/" not in v6:
+        v6 += "/128"
+    v4 = v4 if v4 and "/" in v4 else (f"{v4}/32" if v4 else "")
 
-    addresses = [x for x in (f"{v4}/32" if v4 else "172.16.0.2/32",
+    addresses = [x for x in (v4 or "172.16.0.2/32",
                              v6 if v6 else "") if x]
     return {
         "tag": f"warp-ep{idx:03d}",
