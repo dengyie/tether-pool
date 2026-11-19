@@ -36,7 +36,7 @@ TIMEOUT = 30
 
 
 def fetch_api(ip_type: str) -> list[dict]:
-    """拉一页足够大的 active 列表 (单类型 active 上限 < 150, 一页够)。"""
+    """拉一页 active 列表; 分页守卫: total 超过单页时告警 (截断可见化, 不静默丢)。"""
     url = (f"{DOPROXY_BASE}/api/v1/proxy/list?status=active"
            f"&ip_type={ip_type}&page_size={PAGE_SIZE}&page=1")
     req = urllib.request.Request(url, headers={"User-Agent": "ip-pool-doproxy-sync/1.0"})
@@ -44,7 +44,12 @@ def fetch_api(ip_type: str) -> list[dict]:
         d = json.loads(r.read().decode("utf-8", "replace"))
     if d.get("code") != 200:
         raise RuntimeError(f"DoProxy API code={d.get('code')}")
-    return d.get("data") or []
+    rows = d.get("data") or []
+    total = d.get("total") or 0
+    if total > len(rows):
+        print(f"[DOPROXY_SYNC_WARN] ip_type={ip_type} truncated: total={total} "
+              f"> returned={len(rows)}, 池扩容后需翻页支持", file=sys.stderr)
+    return rows
 
 
 def to_clash_proxy(x: dict, idx: int, ip_type: str) -> dict:
@@ -53,9 +58,18 @@ def to_clash_proxy(x: dict, idx: int, ip_type: str) -> dict:
     # 一个坏节点让整份 probe yaml 校验失败 → alive 0/195), 直接过滤
     if ptype not in ("http", "socks5"):
         return {}
+    try:
+        server, port = str(x["host"]).strip(), int(x["port"])
+    except (KeyError, TypeError, ValueError):
+        print(f"[DOPROXY_SYNC_WARN] bad row skipped (host/port 脏值): {x!r}", file=sys.stderr)
+        return {}
+    if not server or port <= 1:
+        print(f"[DOPROXY_SYNC_WARN] bad row skipped (空 host 或 port<=1): {x!r}",
+              file=sys.stderr)
+        return {}
     cc = str(x.get("country") or "UN")
     name = f"{cc}.{x.get('country_name') or '未知'}-{ip_type}-{ptype}-{idx:03d}"
-    p = {"name": name, "type": ptype, "server": str(x["host"]), "port": int(x["port"]),
+    p = {"name": name, "type": ptype, "server": server, "port": port,
          "udp": ptype == "socks5"}
     if x.get("username"):
         p["username"] = str(x["username"])
@@ -97,6 +111,8 @@ def main() -> int:
     tmp = OUT.with_suffix(".tmp")
     tmp.write_text(yaml.dump(doc, allow_unicode=True, sort_keys=False, width=200),
                    encoding="utf-8")
+    # 凭据可能随节点携带 (DoProxy 未来带 username/password): 600 与 secrets 惯例对齐
+    os.chmod(tmp, 0o600)
     os.replace(tmp, OUT)
     print(f"[DOPROXY_SYNC_OK] wrote {len(proxies)} proxies -> {OUT}")
     return 0
