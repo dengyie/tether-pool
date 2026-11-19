@@ -153,3 +153,65 @@ def test_cmd_relay_on_injects_from_local_file(tmp_path, monkeypatch):
     assert by_name["node-1"]["dialer-proxy"] == "[自建] R1"
     assert by_name["[自建] R1"]["uuid"] == "u-1"      # 定义被完整注入
     assert "dialer-proxy" not in by_name["[自建] R1"]  # 且自身无 dialer
+
+
+def test_import_region_auto_infer_mixed_group_falls_back_global(tmp_path, monkeypatch, capsys):
+    """2026-11-19 newfree 事故回归: --region 未传时按节点名/服务器推导, 混合区
+    组落 global——绝不默认 us-west 假标 (region 是调度硬约束, 假值=假承诺事故源:
+    消费方 region=us-west 会拿到国内直连出口)。前缀同时去 🇺🇸/家宽 假语义。"""
+    manifest = {"groups": {}, "updated": ""}
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "node_groups.yaml").write_text(yaml.dump(manifest))
+    (tmp_path / "config" / "nodes.yaml").write_text(yaml.dump({"nodes": []}))
+    bridge_yaml = tmp_path / "config" / "gtest-bridge.yaml"
+    monkeypatch.setattr(isa.np, "load_manifest", lambda: {"groups": {}, "updated": ""})
+    saved = {}
+    monkeypatch.setattr(isa.np, "save_manifest", lambda m: saved.update(m))
+    monkeypatch.setattr(isa.np, "next_free_ports", lambda m, n: list(range(11317, 11317 + n)))
+    monkeypatch.setattr(isa.np, "next_free_seq", lambda ny, m: 3590)
+    monkeypatch.setattr(isa.np, "NODES_YAML", tmp_path / "config" / "nodes.yaml")
+    # 防止真写仓库文件: cmd_import 用 np.NODES_YAML 与 np.save_manifest, 但
+    # manifest 组键写 saved 字典; nodes.yaml 用 np.NODES_YAML 路径 → 已指 tmp。
+    monkeypatch.setattr(isa, "load_source", lambda s: {"proxies": [
+        {"name": "HK-FREE", "type": "vless", "server": "2.26.204.46", "port": 31001},
+        {"name": "Lightsail-SG-Reality", "type": "vless", "server": "18.140.145.188", "port": 443},
+        {"name": "国内1-SOCKS", "type": "socks5", "server": "47.92.214.169", "port": 50001},
+    ]})
+    monkeypatch.setattr(isa.subprocess, "run",
+                        lambda *a, **k: __import__("subprocess").CompletedProcess([], 0, "", ""))
+
+    rc = isa.cmd_import(argparse.Namespace(
+        source="x", group="gtest", region="", tier="standard", prefix=None,
+        filter_type="", filter_server="", tags="datacenter", port_base=None,
+        fault_domain=None, replace=False, dry_run=False))
+    assert rc == 0
+    assert saved["groups"]["gtest"]["region"] == "global", "混合区必须落 global, 不得假标 us-west"
+    assert saved["groups"]["gtest"]["gateway_route"] == "region=global&type=clash_proxy"
+    assert saved["groups"]["gtest"]["clash_node_prefix"] == "GTEST-", "前缀不得带 🇺🇸/家宽 假语义"
+    ny = yaml.safe_load(open(tmp_path / "config" / "nodes.yaml"))
+    regions = {n["region"] for n in ny["nodes"] if "gtest" in n["name"]}
+    assert regions == {"global"}, f"nodes.yaml 同步 region=global, got {regions}"
+
+
+def test_import_region_explicit_passthrough(tmp_path, monkeypatch):
+    """显式 --region 仍然直通 (同区组如 teleapi 明确传值语义不变)。"""
+    (tmp_path / "config").mkdir()
+    monkeypatch.setattr(isa.np, "load_manifest", lambda: {"groups": {}, "updated": ""})
+    saved = {}
+    monkeypatch.setattr(isa.np, "save_manifest", lambda m: saved.update(m))
+    monkeypatch.setattr(isa.np, "next_free_ports", lambda m, n: list(range(11400, 11400 + n)))
+    monkeypatch.setattr(isa.np, "next_free_seq", lambda ny, m: 3600)
+    monkeypatch.setattr(isa.np, "NODES_YAML", tmp_path / "config" / "nodes.yaml")
+    (tmp_path / "config" / "nodes.yaml").write_text(yaml.dump({"nodes": []}))
+    monkeypatch.setattr(isa, "load_source", lambda s: {"proxies": [
+        {"name": "US-1", "type": "http", "server": "brd.superproxy.io", "port": 44445},
+    ]})
+    monkeypatch.setattr(isa.subprocess, "run",
+                        lambda *a, **k: __import__("subprocess").CompletedProcess([], 0, "", ""))
+
+    rc = isa.cmd_import(argparse.Namespace(
+        source="x", group="gus", region="us-west", tier="standard", prefix=None,
+        filter_type="", filter_server="", tags="", port_base=None,
+        fault_domain=None, replace=False, dry_run=False))
+    assert rc == 0
+    assert saved["groups"]["gus"]["region"] == "us-west"

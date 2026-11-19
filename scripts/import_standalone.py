@@ -32,8 +32,9 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import node_pipeline as np  # noqa: E402  (复用 load_manifest/save_manifest/端口规划/探活)
+sys.path.insert(0, str(REPO := Path(__file__).resolve().parent.parent))
+from core.clash_importer import detect_region  # noqa: E402  (复用区域推导, 防假 region)
 
-REPO = Path(__file__).resolve().parent.parent
 PINNED_IP_RE = re.compile(r"-ip-(\d+\.\d+\.\d+\.\d+)$")
 CITY_RE = re.compile(r"「(.+?)」")
 RELAY_LOCAL_YAML = REPO / "config/relay-nodes.local.yaml"
@@ -122,7 +123,18 @@ def cmd_import(args):
     pinned = sum(1 for p in parsed if p["_exit_ip"])
     log(f"      固定出口 IP 可解析: {pinned}/{len(parsed)}")
 
-    prefix = args.prefix or f"🇺🇸{args.group.upper()}-家宽-"
+    prefix = args.prefix or f"{args.group.upper()}-"
+    # region 确定性 (2026-11-19 newfree 事故根修): region 是调度/约束持久化的硬
+    # 字段, 默认值绝不可假——显式传入直接用; 未传时按节点名/服务器逐条推导,
+    # 全组同区才落该区, 混合区落 global (无 region 约束语义, 消费方不带 region
+    # 过滤即可命中; 比 us-west 假标安全得多)。
+    if args.region:
+        region = args.region
+    else:
+        regions = {detect_region(p.get("name", ""), p.get("server", "")) for p in parsed}
+        region = regions.pop() if len(regions) == 1 else "global"
+        if region == "global" or len(regions) >= 1:
+            log(f"      region 自动推导: {sorted(regions) if regions else '{}'} → {region!r}")
     ports = args.port_base and list(range(args.port_base, args.port_base + len(parsed))) \
         or np.next_free_ports(manifest, len(parsed))
     ny_now = yaml.safe_load(open(np.NODES_YAML, encoding="utf-8")) or {}
@@ -135,7 +147,7 @@ def cmd_import(args):
         "clash_node_prefix": prefix,
         "tether_name_template": f"clash-{{seq:03d}}-{args.group}-{{idx:0{width}d}}",
         "tether_seq_start": seq_start,
-        "region": args.region,
+        "region": region,
         "tier": args.tier,
         "egress_type": "clash_proxy",
         "tags": ["clash", "bridge", str(parsed[0].get("type", "http")).lower(), args.group] + args.tags.split(","),
@@ -153,7 +165,7 @@ def cmd_import(args):
         },
         "bridge_ports": {"declared": f"{ports[0]}-{ports[-1]}", "realized": ""},
         "listener_prefix": f"{args.group}-bridge-",
-        "gateway_route": f"region={args.region}&type=clash_proxy",
+        "gateway_route": f"region={region}&type=clash_proxy",
         "nodes": [
             {**{k: v for k, v in p.items() if not k.startswith("_")},
              "idx": i + 1,
@@ -216,7 +228,7 @@ def cmd_import(args):
             continue
         ny["nodes"].append({
             "name": tname, "host": "127.0.0.1", "port": ports[i],
-            "protocol": "socks5h", "region": args.region, "egress_type": "clash_proxy",
+            "protocol": "socks5h", "region": region, "egress_type": "clash_proxy",
             "tags": group["tags"] + ["bridge-core"], "weight": 100, "tier": args.tier,
             "relay_mode": "direct_only", "fault_domain": args.fault_domain,
         })
@@ -351,7 +363,9 @@ def main():
     p_imp = sub.add_parser("import", help="解析订阅并写入 manifest/nodes.yaml/桥核配置")
     p_imp.add_argument("source", help="订阅 url 或本地 clash yaml")
     p_imp.add_argument("--group", required=True)
-    p_imp.add_argument("--region", default="us-west")
+    p_imp.add_argument("--region", default="",
+                       help="不传=按节点名/服务器自动推导 (detect_region), 组内多区域落 global;"
+                            " 显式传值仅当整组真实同区 (region 是调度硬约束, 假值=假承诺事故源)")
     p_imp.add_argument("--tier", default="standard", choices=["standard", "premium"])
     p_imp.add_argument("--prefix", default=None)
     p_imp.add_argument("--filter-type", default="http", help="按 type 过滤 (空串=不过滤)")
