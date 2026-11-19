@@ -131,6 +131,20 @@ def main():
             alive, ALIVE_CEILING))
         return
 
+    # 净亏熔断: 上一轮 swap 后 alive 不升反降 → 贴 CF 配额上限, 连续 swap
+    # 只会继续重摇随机死 (21:30 轮 61→56 实证)。熔断直到 alive 回升或人工
+    # touch /root/warp-redial/resume。
+    try:
+        last = [json.loads(l) for l in open(HIST_FILE)][-1]
+        if last["alive_after"] < last["alive_before"] and \
+                not os.path.exists(os.path.join(LOCK_DIR, "resume")):
+            log("CIRCUIT last round net %d, skip until alive recovers "
+                "(touch %s/resume to override)" % (
+                    last["alive_after"] - last["alive_before"], LOCK_DIR))
+            return
+    except (OSError, KeyError, ValueError):
+        pass
+
     if not cooldown_ok():
         return
 
