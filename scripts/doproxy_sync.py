@@ -32,23 +32,35 @@ DOPROXY_BASE = os.environ.get("DOPROXY_BASE", "http://198.200.42.250:8888")
 OUT = Path(os.environ.get("DOPROXY_OUT", "/opt/ip-pool/data/sub6/doproxy.yaml"))
 IP_TYPES = ("residential", "business")   # 家宽 + 商宽; datacenter 不进 SUB6
 PAGE_SIZE = 100
+MAX_PAGES = 10   # 翻页上限: 单类型 active 远低于此, 纯防异常 API 死循环
 TIMEOUT = 30
 
 
 def fetch_api(ip_type: str) -> list[dict]:
-    """拉一页 active 列表; 分页守卫: total 超过单页时告警 (截断可见化, 不静默丢)。"""
-    url = (f"{DOPROXY_BASE}/api/v1/proxy/list?status=active"
-           f"&ip_type={ip_type}&page_size={PAGE_SIZE}&page=1")
-    req = urllib.request.Request(url, headers={"User-Agent": "ip-pool-doproxy-sync/1.0"})
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-        d = json.loads(r.read().decode("utf-8", "replace"))
-    if d.get("code") != 200:
-        raise RuntimeError(f"DoProxy API code={d.get('code')}")
-    rows = d.get("data") or []
-    total = d.get("total") or 0
-    if total > len(rows):
-        print(f"[DOPROXY_SYNC_WARN] ip_type={ip_type} truncated: total={total} "
-              f"> returned={len(rows)}, 池扩容后需翻页支持", file=sys.stderr)
+    """拉全部分页 active 列表 (2026-11-20 根修: business 池涨过单页 100 截断丢节点)。
+
+    翻页直到取满 total 或返回空页 (上限 MAX_PAGES 防异常 API 死循环);
+    翻页失败不静默: 已取到的页照常返回, 失败页告警 (部分数据优于零数据)。
+    """
+    rows: list[dict] = []
+    total = None
+    for page in range(1, MAX_PAGES + 1):
+        url = (f"{DOPROXY_BASE}/api/v1/proxy/list?status=active"
+               f"&ip_type={ip_type}&page_size={PAGE_SIZE}&page={page}")
+        req = urllib.request.Request(url, headers={"User-Agent": "ip-pool-doproxy-sync/1.0"})
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            d = json.loads(r.read().decode("utf-8", "replace"))
+        if d.get("code") != 200:
+            raise RuntimeError(f"DoProxy API code={d.get('code')}")
+        page_rows = d.get("data") or []
+        rows.extend(page_rows)
+        total = d.get("total") or 0
+        if not page_rows or len(rows) >= total:
+            break
+        time.sleep(0.5)   # 分页间小歇, 防打爆 API
+    if total and len(rows) < total:
+        print(f"[DOPROXY_SYNC_WARN] ip_type={ip_type} incomplete after {MAX_PAGES} "
+              f"pages: got={len(rows)} total={total}", file=sys.stderr)
     return rows
 
 

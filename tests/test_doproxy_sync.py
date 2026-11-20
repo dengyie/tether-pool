@@ -64,10 +64,12 @@ def test_to_clash_proxy_naming_stable_and_indexed():
     assert p["name"] == "US.美国-residential-http-007"
 
 
-# ---------------------------------------------------------------- 分页守卫
+# ---------------------------------------------------------------- 分页
 
-def test_fetch_api_truncation_warn(monkeypatch, capsys):
-    """total > returned 时必须告警 (review P2: 截断可见化)。"""
+def _fake_urlopen_factory(pages):
+    """pages: ip_type 无关的响应序列 (每页一个 dict)。"""
+    seq = iter(pages)
+
     class FakeResp:
         def __enter__(self):
             return self
@@ -76,26 +78,41 @@ def test_fetch_api_truncation_warn(monkeypatch, capsys):
             return False
 
         def read(self):
-            return b'{"code": 200, "total": 250, "data": [{}, {}, {}]}'
+            import json
+            return json.dumps(next(seq)).encode()
 
-    monkeypatch.setattr(ds.urllib.request, "urlopen", lambda *a, **k: FakeResp())
-    rows = ds.fetch_api("residential")
-    assert len(rows) == 3
-    assert "truncated" in capsys.readouterr().err
+    return lambda *a, **k: FakeResp()
+
+
+def test_fetch_api_paginates_until_total(monkeypatch, capsys):
+    """total > 单页时自动翻页取满 (review P2 根修升级: 截断→翻页)。"""
+    monkeypatch.setattr(ds.urllib.request, "urlopen",
+                        _fake_urlopen_factory([
+                            {"code": 200, "total": 250, "data": [_row() for _ in range(100)]},
+                            {"code": 200, "total": 250, "data": [_row() for _ in range(100)]},
+                            {"code": 200, "total": 250, "data": [_row() for _ in range(50)]},
+                        ]))
+    monkeypatch.setattr(ds.time, "sleep", lambda s: None)
+    rows = ds.fetch_api("business")
+    assert len(rows) == 250
+    assert "incomplete" not in capsys.readouterr().err
+
+
+def test_fetch_api_incomplete_after_max_pages_warns(monkeypatch, capsys):
+    """超 MAX_PAGES 仍不满足 total: 告警可见化, 返回已取到的部分。"""
+    monkeypatch.setattr(ds.urllib.request, "urlopen",
+                        _fake_urlopen_factory([
+                            {"code": 200, "total": 9999, "data": [_row() for _ in range(100)]},
+                        ] * ds.MAX_PAGES))
+    monkeypatch.setattr(ds.time, "sleep", lambda s: None)
+    rows = ds.fetch_api("business")
+    assert len(rows) == 100 * ds.MAX_PAGES
+    assert "incomplete" in capsys.readouterr().err
 
 
 def test_fetch_api_bad_code_raises(monkeypatch):
-    class FakeResp:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def read(self):
-            return b'{"code": 500, "data": []}'
-
-    monkeypatch.setattr(ds.urllib.request, "urlopen", lambda *a, **k: FakeResp())
+    monkeypatch.setattr(ds.urllib.request, "urlopen",
+                        _fake_urlopen_factory([{"code": 500, "data": []}]))
     try:
         ds.fetch_api("residential")
         raise AssertionError("code!=200 必须 raise")
