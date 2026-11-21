@@ -206,12 +206,12 @@ def main():
 
     if not swaps:
         log("OK nothing to swap (no spare)")
-        return
+        return 0
 
     if DRYRUN:
         for tag, old_dev, new in swaps:
             log("DRYRUN %s: %s -> %s" % (tag, old_dev[:8], new["device_id"][:8]))
-        return
+        return 0
 
     # 应用替换: endpoint 换身份; address 数组也换 (新 identity 的双栈地址)。
     # device_id 不写入 config (sing-box schema 不认), 记 tagmap。
@@ -228,24 +228,65 @@ def main():
 
     # check 门禁
     tmp = CONFIG + ".redial-tmp"
-    json.dump(cfg, open(tmp, "w"), indent=2, ensure_ascii=False)
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
     chk = subprocess.run(["sing-box", "check", "-c", tmp], capture_output=True, text=True)
     if chk.returncode != 0:
         os.replace(tmp, CONFIG + ".bad-" + datetime.datetime.now().strftime("%H%M%S"))
         log("ERROR check failed: %s" % chk.stderr[:200])
-        return
+        return 1
+
+    with open(CONFIG, "rb") as f:
+        config_before = f.read()
+    try:
+        with open(TAGMAP_FILE, "rb") as f:
+            tagmap_before = f.read()
+    except FileNotFoundError:
+        tagmap_before = None
+
+    def restore_file(path, content):
+        if content is None:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            return
+        restore_tmp = path + ".redial-restore"
+        with open(restore_tmp, "wb") as f:
+            f.write(content)
+        os.replace(restore_tmp, path)
+
     os.replace(tmp, CONFIG)
-    # tagmap 持久化 (restart 成功路径; check 失败不写, 保持旧映射)
     dev_by_tag.update(tagmap_new)
-    json.dump(dev_by_tag, open(TAGMAP_FILE, "w"), indent=1)
+    tagmap_tmp = TAGMAP_FILE + ".redial-tmp"
+    with open(tagmap_tmp, "w") as f:
+        json.dump(dev_by_tag, f, indent=1)
+    os.replace(tagmap_tmp, TAGMAP_FILE)
 
-    subprocess.run(["systemctl", "restart", "sing-box"], check=False)
-    mark_restart()
+    restart = subprocess.run(["systemctl", "restart", "sing-box"], check=False)
+    active = subprocess.run(["systemctl", "is-active", "--quiet", "sing-box"], check=False)
+    if restart.returncode != 0 or active.returncode != 0:
+        restore_file(CONFIG, config_before)
+        restore_file(TAGMAP_FILE, tagmap_before)
+        subprocess.run(["systemctl", "restart", "sing-box"], check=False)
+        log("ERROR restart failed (restart=%d active=%d); config and tagmap restored" % (
+            restart.returncode, active.returncode))
+        return 1
+
     time.sleep(20)
-
-    # 验证
     ok2 = sum(1 for t, p in probes.items() if warp_ok(p))
     log("RESTART done: alive %d -> %d (swapped %d)" % (alive, ok2, len(swaps)))
+    if ok2 < alive:
+        restore_file(CONFIG, config_before)
+        restore_file(TAGMAP_FILE, tagmap_before)
+        restored = subprocess.run(["systemctl", "restart", "sing-box"], check=False)
+        if restored.returncode != 0:
+            log("ERROR probe regressed and config restored, but rollback restart failed")
+        log("ERROR post-restart probes regressed (%d < %d); config and tagmap restored" % (
+            ok2, alive))
+        return 1
+
+    mark_restart()
     os.makedirs(os.path.dirname(HIST_FILE), exist_ok=True)
     with open(HIST_FILE, "a") as f:
         for tag, old_dev, new in swaps:
@@ -257,4 +298,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

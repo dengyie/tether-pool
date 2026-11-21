@@ -73,8 +73,8 @@ def test_release_keeps_lease_while_another_service_binding_remains(storage):
 
     assert storage.get_allocation("svcA", "acc-multi") is None
     assert storage.get_allocation("svcB", "acc-multi") is not None
-    # svcB remains bound, so the lease must survive and keep reporting the account as active
-    assert storage.get_lease("acc-multi") is not None
+    # A non-default service has no legacy mirror to preserve.
+    assert storage.get_lease("acc-multi") is None
 
 
 def test_migrate_legacy_leases_backfills_and_is_idempotent(storage):

@@ -286,13 +286,17 @@ http://<account_id>:<gateway_password>@<gateway_host>:9101
 
 #### 2.0.2 拉取增量绑定
 - **方法**：`GET /v1/export/grok2api?since_epoch=42`
-- **说明**：**只**返回 `epoch > since_epoch` 的变更，且每个账号只出现一次——映射到它的**当前**节点，而不是中间跳转过的节点。下游把这些条目覆盖到自己缓存的映射上，随后把本地记录的 epoch 提升到响应里的 `epoch` 即可。响应里没有任何账号回滚/删除条目，因此天然幂等，可以安全重放。
+- **说明**：**只**返回 `epoch > since_epoch` 的变更，且每个账号只出现一次——映射到它的**当前**节点，而不是中间跳转过的节点。下游把 `assignments` 覆盖到本地映射，并删除 `deletions` 中的账号。
+  响应带 `has_more`；当为 `true` 时，只能把本地 cursor 提升到响应 `epoch`，继续以该 epoch 请求下一页，不能跳到服务当前 epoch。响应在单个 SQLite 快照中生成，可安全重放。
 - **成功响应**：`200 OK`
   ```json
   {
     "count": 511,
     "nodes": [ { "name": "nl-warp-01", "url": "socks5://10.144.144.12:10881", "region": "netherlands", "egress_type": "warp_ipv6", "exit_ip": "" } ],
     "assignments": { "grok_acc_101": { "name": "sg-huawei-warp-05", "url": "socks5://10.144.144.13:10885", "region": "singapore", "egress_type": "warp_ipv6", "exit_ip": "" } },
+    "deletions": [],
+    "truncated": false,
+    "has_more": false,
     "epoch": 43,
     "since_epoch": 42,
     "changed_at": "2026-11-07T03:14:41.882000",

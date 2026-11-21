@@ -144,19 +144,24 @@ def test_router_avoid_banned_excludes_node(seeded):
 
 def test_router_avoid_banned_slash24(seeded):
     # clash-b 与被封 clash-a 同 /24, 也必须被排除
-    seeded.record_ban("zcode-hub", "acc", "clash-a", "23.1.1.5", "comcast", "edge_405_html", {}, 24)
+    # (2026-11-22) service 用非 exclusive 的 "ban-svc": zcode-hub 现为
+    # 一号一节点硬互斥 (SERVICE_EXCLUSIVE_SERVICES), 4 节点 5 账号必 blocked,
+    # 会掩盖本测试要验证的 /24 过滤语义。
+    seeded.record_ban("ban-svc", "acc", "clash-a", "23.1.1.5", "comcast", "edge_405_html", {}, 24)
     r = Router(seeded)
     for _ in range(5):
-        lease = r.acquire_for_account(f"acc{_:d}", egress_type=None, service="zcode-hub", avoid_banned=True)
+        lease = r.acquire_for_account(f"acc{_:d}", egress_type=None, service="ban-svc", avoid_banned=True)
         assert lease is not None
         assert lease.node_name not in ("clash-a", "clash-b"), f"{lease.node_name} 同 /24 未被排除"
 
 
 def test_router_avoid_same_isp(seeded):
-    seeded.record_ban("zcode-hub", "acc", "clash-a", "23.1.1.5", "comcast", "edge_405_html", {}, 24)
+    # (2026-11-22) service 用非 exclusive 的 "ban-svc" (zcode-hub 硬互斥下
+    # 4 节点 6 账号必 blocked, 见 test_router_avoid_banned_slash24 注释)。
+    seeded.record_ban("ban-svc", "acc", "clash-a", "23.1.1.5", "comcast", "edge_405_html", {}, 24)
     r = Router(seeded)
     for i in range(6):
-        lease = r.acquire_for_account(f"acc{i}", egress_type=None, service="zcode-hub", avoid_banned=True, avoid_same_isp=True)
+        lease = r.acquire_for_account(f"acc{i}", egress_type=None, service="ban-svc", avoid_banned=True, avoid_same_isp=True)
         assert lease is not None
         assert lease.node_name not in ("clash-a", "clash-b"), "同 ISP 未被排除"
 
@@ -238,10 +243,12 @@ def test_router_avoid_banned_exhausted_returns_none(storage):
 
 def test_router_without_avoid_banned_ignores_quarantine(seeded):
     # opt-in 语义: 不传 avoid_banned 的调用完全不受 quarantine 影响
-    seeded.record_ban("zcode-hub", "acc", "clash-a", "23.1.1.5", "comcast", "edge_405_html", {}, 24)
+    # (2026-11-22) service 用非 exclusive 的 "ban-svc" (zcode-hub 硬互斥下
+    # 4 节点 6 账号必 blocked, 见 test_router_avoid_banned_slash24 注释)。
+    seeded.record_ban("ban-svc", "acc", "clash-a", "23.1.1.5", "comcast", "edge_405_html", {}, 24)
     r = Router(seeded)
     for i in range(6):
-        lease = r.acquire_for_account(f"acc{i}", egress_type=None, service="zcode-hub")
+        lease = r.acquire_for_account(f"acc{i}", egress_type=None, service="ban-svc")
         assert lease is not None  # 不炸不排除
 
 

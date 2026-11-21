@@ -21,6 +21,14 @@ from core.ban import (
 from core.storage import Storage
 from core.locks import BINDING_WRITE_LOCK
 
+# 一号一节点硬互斥 (service-exclusive 2026-11-21 迭代): 这些 service 的数据面
+# 写路径 (gateway lease persist / rehome) 与控制面 exclusive=true 同语义 ——
+# 候选节点已被本 service 其它账号现占即剔除, 无 healthy 候选宁 blocked/降级
+# 绝不制造共占。控制面 exclusive 参数只覆盖 API acquire; gateway 每请求
+# acquire_for_account + auto_rehome / R2 rehome_account_binding 一样会落库
+# reason=bind, 不加过滤会在池压下继续制造共占 (08:35 casperpenny20→322 实锤)。
+SERVICE_EXCLUSIVE_SERVICES = {"zcode-hub"}
+
 
 class Router:
     def __init__(self, storage: Storage):
@@ -394,6 +402,13 @@ class Router:
                 return True
             candidates = [c for c in candidates if _ban_filtered(c)]
 
+        # 一号一节点硬互斥 (service-exclusive 2026-11-21 迭代): 与控制面
+        # exclusive=true 同语义。注意只过滤「新绑」候选 —— 本账号粘性绑定
+        # 节点已在上方 fast path 提前返回，走到这里必是新选节点。
+        if svc in SERVICE_EXCLUSIVE_SERVICES and candidates:
+            occupied = self.storage.count_allocations_per_node(svc)
+            candidates = [c for c in candidates if occupied.get(c.name, 0) == 0]
+
         if not candidates:
             # 软排除降级 (目标级兜底): 绑定节点健康、只是被本请求的目标类健康集
             # 排除, 且候选被排除空 —— 宁可返回绑定节点 (该类流量可能失败, 但绝不
@@ -463,7 +478,6 @@ class Router:
             if not bind_persist:
                 return ephemeral_lease
             try:
-                self.storage.set_lease(account_id, selected_node.name, rebind_reason="constraint_rebind")
                 honoured = _honoured_constraints(selected_node)
                 self.storage.batch_save_allocations(
                     [(svc, account_id, selected_node.name, now_str)],
@@ -486,18 +500,25 @@ class Router:
         #    call passes no constraint map at all: the ON CONFLICT CASE branches keep the
         #    existing bound_* columns instead of stripping them (F2 review root fix —
         #    a plain force_rebind must never erase a pinned binding's promise).
-        lease = self.storage.set_lease(account_id, selected_node.name)
         honoured = _honoured_constraints(selected_node)
         self.storage.batch_save_allocations(
             [(svc, account_id, selected_node.name, now_str)],
             constraints_by_account={(svc, account_id): honoured} if honoured else {},
         )
-        # set_lease 由 lease 表构造, 不带拨号字段 —— 从 selected_node 补齐,
-        # 让新绑定/R2 重绑路径同样免掉网关的重复 get_node。
-        lease.host = selected_node.host
-        lease.port = selected_node.port
-        lease.relay_mode = selected_node.relay_mode
-        lease.relay_hop_node = selected_node.relay_hop_node
+        lease = LeaseInfo(
+            account_id=account_id,
+            node_name=selected_node.name,
+            proxy_url=selected_node.proxy_url,
+            exit_ip=selected_node.exit_ip,
+            region=selected_node.region,
+            egress_type=selected_node.egress_type,
+            assigned_at=now_str,
+            tier=selected_node.tier,
+            host=selected_node.host,
+            port=selected_node.port,
+            relay_mode=selected_node.relay_mode,
+            relay_hop_node=selected_node.relay_hop_node,
+        )
 
         return lease
 
@@ -705,6 +726,20 @@ class Router:
         bound_tier = (constraints.get("tier") or "").strip() or None
         bound_policy = (constraints.get("tier_policy") or "").strip().lower() or None
 
+        def _svc_exclusive_filter(cands: List[ProxyNode]) -> List[ProxyNode]:
+            # 一号一节点硬互斥 (service-exclusive 2026-11-21 收尾补): 约束感知
+            # 路径的直查分支不走 _find_rehome_candidates 共享 ladder, 之前漏滤
+            # —— 09:44 节点死亡风暴把 5 个 zcode-hub 账号堆进同一 native 节点
+            # 实锤。与共享 ladder 过滤同语义。
+            if not cands:
+                return cands
+            ex_occ: Dict[str, int] = {}
+            for _svc in SERVICE_EXCLUSIVE_SERVICES:
+                _occ = self.storage.count_allocations_per_node(_svc)
+                for _n, _cnt in _occ.items():
+                    ex_occ[_n] = max(ex_occ.get(_n, 0), _cnt)
+            return [c for c in cands if ex_occ.get(c.name, 0) == 0]
+
         if not bound_region:
             if bound_egress:
                 # Egress-promise without a region: hop regions but never the egress
@@ -712,14 +747,14 @@ class Router:
                 # the data plane keeps re-asserting on every request.
                 tier_pref = self._rehome_tier_pref(bound_policy, bound_tier)
                 for t in tier_pref:
-                    cands = [
+                    cands = _svc_exclusive_filter([
                         n for n in self.storage.list_nodes(
                             egress_type=bound_egress,
                             status=HealthStatus.HEALTHY.value,
                             tier=t,
                         )
                         if n.name not in exclude_names
-                    ]
+                    ])
                     if cands:
                         return cands, None
                 return None, None
@@ -735,7 +770,8 @@ class Router:
                 region=bound_region, egress_type=egress,
                 status=HealthStatus.HEALTHY.value, tier=tier
             )
-            return [n for n in nodes if n.name not in exclude_names]
+            return _svc_exclusive_filter(
+                [n for n in nodes if n.name not in exclude_names])
 
         if bound_policy == TierPolicy.PREMIUM_ONLY.value:
             hard_tiers = [Tier.PREMIUM.value]
@@ -1304,8 +1340,10 @@ class Router:
             cooldown_seconds=cooldown_seconds
         )
 
-        # 5. Persist lease
-        self.storage.set_lease(account_id, selected_node.name)
+        # 5. Persist the canonical default binding and compatibility mirror atomically.
+        self.storage.batch_save_allocations([
+            ("default", account_id, selected_node.name, now_str)
+        ], reason="registration_bind")
 
         # 6. Resolve relay hop
         relay_hop = self.resolve_relay_hop(selected_node)

@@ -10,7 +10,9 @@ core/target_health.py - Destination-class health tracking for gateway steering
 节点 —— 业务宁可慢/差, 不可 503。上游修复后探活转绿, 排除自动消失, 零人工。
 """
 
+import ipaddress
 import time
+import urllib.parse
 from typing import Dict, Optional, Set, Tuple
 
 # 目标类 → canary URL。语义对齐 probe_target_service: 401/404 容忍, CF challenge
@@ -33,6 +35,29 @@ TARGET_DOMAIN_SUFFIXES: Dict[str, str] = {
     "anthropic.com": "claude",
     "claude.ai": "claude",
 }
+
+
+def validate_probe_target(target_url: str) -> str:
+    """Validate a target probe URL against the supported public target classes."""
+    parsed = urllib.parse.urlsplit(target_url)
+    if parsed.scheme.lower() != "https":
+        raise ValueError("target probe requires https")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("target probe URL must not contain userinfo")
+    if parsed.query or parsed.fragment:
+        raise ValueError("target probe URL must not contain query or fragment")
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host or classify_target(host) is None:
+        raise ValueError("target probe host is not allowlisted")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is not None and (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved):
+        raise ValueError("target probe host must be public")
+    if parsed.port not in (None, 443):
+        raise ValueError("target probe only permits HTTPS port 443")
+    return host
 
 
 def classify_target(target_host: str) -> Optional[str]:

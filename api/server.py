@@ -28,6 +28,7 @@ from core.ban import node_isp
 from core.metrics import MetricsCollector
 from core.allocator import AllocationEngine
 from core.quality import IPQualityEvaluator
+from core.target_health import validate_probe_target
 from core.locks import BINDING_WRITE_LOCK
 
 CONFIG_FILE = os.environ.get("IP_POOL_CONFIG", os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "nodes.yaml"))
@@ -56,6 +57,7 @@ if not API_TOKEN and not SERVICE_TOKENS:
           "全部端点 (含 DELETE/bulk-disable/config reload 等破坏性写) 仅靠 mesh 网络隔离保护; "
           "生产部署请至少配置其一")
 AUTH_COOKIE_NAME = "ip_pool_token"
+
 PROBE_INTERVAL_SECONDS = int(os.environ.get("IP_POOL_PROBE_INTERVAL", "300"))
 # 全池 sweep 的并发度。50 并发下 347 节点一轮 ~1 分钟（12s 超时 + warp 高延迟），
 # 25 并发会把死节点多的轮次拖到 2.5 分钟以上。可用 env 调回保守值。
@@ -97,6 +99,7 @@ HOST_PROBE_CONCURRENCY = int(os.environ.get("IP_POOL_HOST_PROBE_CONCURRENCY", "1
 _last_probe_trigger_at: float = 0.0
 _probe_pending: bool = False  # 已排队但尚未跑完的 sweep (sweep 排队时长可能超过合并窗口)
 PROBE_TRIGGER_COALESCE_SECONDS = 15  # 同窗口重复触发合并 (含 start.sh 确认式重试)
+_EXPORT_CHANGES_CAP = 20000
 
 
 def _apply_config_settings(data: dict) -> None:
@@ -453,6 +456,14 @@ async def bearer_auth_middleware(request: Request, call_next):
         if request.url.path != "/health":
             token = _provided_token(request)
             svc = await _request_service(request) if SERVICE_TOKENS else None
+            service_token_admin_path = (
+                request.url.path == "/v1/nodes"
+                or request.url.path.startswith("/v1/nodes/")
+                or request.url.path.startswith("/v1/config/")
+                or request.url.path == "/v1/probe"
+                or request.url.path.startswith("/v1/probe/")
+                or request.url.path.startswith("/v1/circuit/")
+            )
 
             def _tok_eq(a: Optional[str], b: Optional[str]) -> bool:
                 # 时序安全 + bytes 比较 (与网关 _password_ok 同源; str 比较对非 ASCII 也会抛)
@@ -462,6 +473,10 @@ async def bearer_auth_middleware(request: Request, call_next):
 
             if API_TOKEN and _tok_eq(token, API_TOKEN):
                 authorized = True
+            elif service_token_admin_path:
+                # A consumer token must never become an admin credential merely by
+                # adding ?service=<consumer> to an infrastructure route.
+                authorized = False
             elif SERVICE_TOKENS and svc is not None and token and _tok_eq(token, SERVICE_TOKENS.get(svc)):
                 authorized = True
             elif API_TOKEN:
@@ -1001,6 +1016,10 @@ async def test_target_service(
     node = storage.get_node(node_name)
     if not node:
         raise HTTPException(status_code=404, detail=f"Node {node_name} not found")
+    try:
+        validate_probe_target(target_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     res = await prober.probe_target_service(node, target_url)
     return res
 
@@ -1036,27 +1055,26 @@ def export_grok2api(
     """
     if since_epoch is not None:
         service = "grok2api"
-        changes = storage.list_binding_changes_since(service, since_epoch)
-        current = storage.get_binding_epoch(service) or {
-            "epoch": 0, "changed_at": None, "last_change_reason": None
-        }
-        # 2026-11-19 review P2: 旧实现每条 change 两次串行 SQLite 点查 (2N 次往返,
-        # mass-rehome 后 N=数千), 改为两把全量快照 + 内存取用; 变更行上限 20000
-        # 防止单次 reconcile 拉爆响应体。
-        _EXPORT_CHANGES_CAP = 20000
-        truncated = len(changes) > _EXPORT_CHANGES_CAP
-        if truncated:
-            changes = changes[:_EXPORT_CHANGES_CAP]
-        allocs = {a["account_id"]: a for a in storage.list_allocations_by_service(service)}
-        nodes_by_name = {n.name: n for n in storage.list_nodes()}
-        assignments = {}
+        snapshot = storage.get_binding_delta_snapshot(
+            service, since_epoch, _EXPORT_CHANGES_CAP
+        )
+        changes = snapshot["changes"]
+        # 末条变更定归属 (2026-11-22 review P1): 同账号在本页内可同时出现 move 与
+        # delete 行 (先 rebind 后配额回收), 若按"先到先得"去重, delete-after-move
+        # 会让下游保留幽灵绑定。变更流按 epoch,id 升序, 每账号取末条决定归属。
+        final_by_account: Dict[str, object] = {}
         for change in changes:
-            acc = change.account_id
-            if acc in assignments:
+            final_by_account[change.account_id] = change
+        assignments = {}
+        deletions = []
+        for acc, change in final_by_account.items():
+            if change.to_node is None:
+                deletions.append(acc)
                 continue
-            alloc = allocs.get(acc)
-            node = nodes_by_name.get(alloc["node_name"]) if alloc else None
+            alloc = snapshot["allocations"].get(acc)
+            node = snapshot["nodes"].get(alloc["node_name"]) if alloc else None
             if not node:
+                deletions.append(acc)
                 continue
             assignments[acc] = {
                 "name": node.name,
@@ -1065,15 +1083,23 @@ def export_grok2api(
                 "egress_type": node.egress_type,
                 "exit_ip": node.exit_ip or ""
             }
+        nodes = []
+        seen_nodes = set()
+        for assignment in assignments.values():
+            if assignment["name"] not in seen_nodes:
+                seen_nodes.add(assignment["name"])
+                nodes.append(assignment)
         return {
             "count": len(assignments),
-            "truncated": truncated,
-            "nodes": list(assignments.values()),
+            "truncated": snapshot["truncated"],
+            "has_more": snapshot["has_more"],
+            "nodes": nodes,
             "assignments": assignments,
-            "epoch": current["epoch"],
+            "deletions": deletions,
+            "epoch": snapshot["epoch"],
             "since_epoch": since_epoch,
-            "changed_at": current.get("changed_at"),
-            "last_change_reason": current.get("last_change_reason"),
+            "changed_at": snapshot["changed_at"],
+            "last_change_reason": changes[-1].reason if changes else None,
             "reason_breakdown": _binding_reason_breakdown(changes),
         }
 
@@ -1332,7 +1358,8 @@ def acquire_account_allocation(
     force_rebind: bool = Query(False, description="Alias of force_rebalance (accepted on both endpoints to kill the param drift)"),
     avoid_banned: bool = Query(False, description="Exclude quarantined (banned) nodes and their /24 for this service"),
     avoid_cidr: Optional[str] = Query(None, description="Comma-separated CIDR list to exclude, e.g. 23.230.200.0/24"),
-    avoid_same_isp: bool = Query(False, description="Cross-ISP selection: skip nodes whose isp=<name> tag matches a banned node's ISP")
+    avoid_same_isp: bool = Query(False, description="Cross-ISP selection: skip nodes whose isp=<name> tag matches a banned node's ISP"),
+    exclusive: bool = Query(False, description="One-account-one-node hard mutex: skip nodes already allocated to another account of this service; exhausted pool answers 503 instead of sharing a node")
 ):
     """
     On-demand allocation for a single account with load-aware capacity distribution.
@@ -1369,6 +1396,7 @@ def acquire_account_allocation(
             avoid_banned=avoid_banned,
             avoid_cidrs=avoid_cidrs,
             avoid_same_isp=avoid_same_isp,
+            exclusive=exclusive,
             region_strict=region_strict
         )
         # 防汛告警 (需求 §5.5): 该 service 的 active quarantine 打穿健康池 30% 时
@@ -1386,7 +1414,16 @@ def acquire_account_allocation(
     except Exception as e:
         # F6 (二轮 review): RuntimeError(str) 可能携带内部细节, 响应体给稳定摘要
         print(f"[-] allocation acquire failed: {type(e).__name__}: {e}")
-        raise HTTPException(status_code=503, detail="no available node for this constraint set (see api logs for cause)")
+        detail = "no available node for this constraint set (see api logs for cause)"
+        if "exclusive exhausted" in str(e):
+            detail = ("one-account-one-node mutex exhausted: all eligible nodes "
+                      "are held by other accounts of this service")
+        # 结构化错误码 (2026-11-21 iter3): detail 字符串匹配是隐式契约——hub 侧
+        # 优先读 headers 的 X-Exhausted-Reason, 文案匹配保留为旧客户端兜底。
+        headers = None
+        if "exclusive exhausted" in str(e):
+            headers = {"X-Exhausted-Reason": "mutex_exhausted"}
+        raise HTTPException(status_code=503, detail=detail, headers=headers)
 
 
 @app.get("/v1/allocation/status", response_model=AllocationOverviewResponse)

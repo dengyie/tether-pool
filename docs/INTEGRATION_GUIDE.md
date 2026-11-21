@@ -130,7 +130,8 @@ curl -X POST http://10.144.144.9:9100/v1/battery/event \
 
   # 2) 纪元变化时只拉增量，并覆盖到本地映射
   curl -s 'http://10.144.144.9:9100/v1/export/grok2api?since_epoch=42'
-  # {"assignments":{"grok_user_01":{"name":"sg-huawei-warp-05","url":"socks5://..."}},"epoch":43,...}
+  # {"assignments":{"grok_user_01":{"name":"sg-huawei-warp-05","url":"socks5://..."}},"deletions":[],"epoch":43,"has_more":false}
+  # 若 deletions 非空，先删除这些账号的本地映射；has_more=true 时只推进到响应 epoch，继续从该 epoch 拉下一页。
   ```
   首次冷启动可以不带 `since_epoch` 做一次全量对齐。详见 [API.md](./API.md) 的「绑定增量对账契约」与「死节点自愈部署参数」两节。
 

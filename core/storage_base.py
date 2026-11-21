@@ -54,6 +54,7 @@ class StorageBase:
             conn = sqlite3.connect(self.db_path, timeout=10.0)
             conn.row_factory = sqlite3.Row
             try:
+                conn.execute("PRAGMA foreign_keys = ON;")
                 # WAL 自动 checkpoint 上限 (HA 加固): 默认 1000 页在长事务读者
                 # (探活线程池) 存在时可能压不住, WAL 无限增长最终打满磁盘
                 # (97% 事故同型)。10000 页 ≈ 40MB, checkpoint 由后续写自然触发。

@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 data/*.db
+data/sub6/
 data/*.db-*
 data/ip_pool.pid
 logs/

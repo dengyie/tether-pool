@@ -10,7 +10,7 @@
 [![EasyTier](https://img.shields.io/badge/Mesh-EasyTier%20P2P-FF6600.svg?style=flat-square)](https://github.com/EasyTier/EasyTier)
 [![Prometheus](https://img.shields.io/badge/Metrics-Prometheus-E6522C.svg?style=flat-square&logo=prometheus&logoColor=white)](https://prometheus.io/)
 [![SQLite](https://img.shields.io/badge/Database-SQLite%20WAL-003B57.svg?style=flat-square&logo=sqlite&logoColor=white)](https://sqlite.org/)
-[![Tests](https://img.shields.io/badge/tests-106%20passed-brightgreen.svg?style=flat-square)]()
+[![Tests](https://img.shields.io/badge/tests-514%20passed-brightgreen.svg?style=flat-square)]()
 
 [English](./README.md) · [简体中文](./README.zh-CN.md)
 
@@ -99,7 +99,7 @@ pip install -r requirements.txt
 ```
 Verifies pool topology, multi-region probing, circuit breaker self-healing, forward proxy gateway tunneling, and adapter exports in ~10 seconds.
 
-### 3. Run Unit Tests (106 Tests Passing)
+### 3. Run Unit Tests (514 Tests Passing)
 ```bash
 .venv/bin/pytest -v
 ```
@@ -113,8 +113,10 @@ Verifies pool topology, multi-region probing, circuit breaker self-healing, forw
 - Web Dashboard: `http://127.0.0.1:9100/dashboard`
 - Prometheus Metrics: `http://127.0.0.1:9100/metrics`
 
-> **Network exposure:** both listeners bind to `127.0.0.1` by default. When
-> `IP_POOL_API_TOKEN=<secret>` is set, **every endpoint except `/health`** requires the token
+> **Network exposure:** both listeners bind to `127.0.0.1` by default. If `HOST` or
+> `GATEWAY_HOST` is changed to a non-loopback address, startup refuses to continue unless
+> `IP_POOL_API_TOKEN` or `GATEWAY_PASSWORD` is respectively configured. When
+> `IP_POOL_API_TOKEN=<secret>` is set, every endpoint except `/health` requires the token
 > (`Authorization: Bearer <secret>`, `?token=<secret>`, or the HttpOnly cookie set by the
 > dashboard handshake). Browsers navigate to `/dashboard?token=<secret>` once; the token is
 > exchanged for a cookie so the page's same-origin fetches keep working. `/metrics` is
@@ -194,7 +196,7 @@ ip-pool/
 │   ├── gemini_adapter.py       # Gemini Web reverse routing adapter
 │   ├── playwright_pool.py      # Python crawler & Playwright pool SDK
 │   └── tetherpool_client.py    # Zero-dependency HTTP client for the control plane
-├── tests/                      # Pytest isolated unit test suite (99 passing tests)
+├── tests/                      # Pytest isolated unit test suite (514 passing tests)
 ├── demo.py                     # Interactive end-to-end verification showcase
 ├── requirements.txt            # Python dependencies
 └── start.sh                    # Dual-process background daemon manager

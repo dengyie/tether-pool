@@ -45,8 +45,8 @@ def test_ip_quality_evaluator_scoring_breakdown():
         consecutive_failures=1,
         exit_ip="198.51.100.1",
     )
-    # Provenance: 15, Latency (350-700ms): 10, Stability: 5, Exit IP: 10 -> Total: 40
-    assert score2 == 15 + 10 + 5 + 10
+    # Provenance: 15, Latency (350-700ms): 20 (2026-11-21 放宽档位), Stability: 5, Exit IP: 10 -> Total: 50
+    assert score2 == 15 + 20 + 5 + 10
     assert tier2 == QualityTier.STANDARD
 
     # 3. Dead node with consecutive failures -> score penalty

@@ -11,6 +11,17 @@ from core.models import ProxyNode, HealthStatus
 BASE_COOLDOWN_SECONDS = 60.0
 MAX_COOLDOWN_SECONDS = 1800.0
 JITTER_MAX_SECONDS = 10.0
+
+# Canary flap suppression (2026-11-21): half_open 复核失败重开时, 若节点
+# fail_count 显示长期慢性死亡, 在 cap 之上按重开深度继续指数升级退避。
+# 背景: teleapisub 等上游真死透的节点, canary 复核注定失败, 但 host_dampen
+# 的 1/4 折扣把它们钉在 ~13min 一轮的必失败复核循环 (单节点 248 事件/天,
+# 全池 63k canary 事件/天)。升级后的退避绕过 host_dampen ( dampen 只服务
+# "共同原因可能修复" 的场景, chronic flapper 不满足该前提)。
+FLAP_ESCALATION_BASE = 2.0        # 每档翻倍
+FLAP_ESCALATION_MAX_SECONDS = 7200.0  # chronic flapper 复核上限 2h
+# 本轮连续失败达到此值视为 chronic (反复证伪, 而非瞬时抖动)
+FLAP_CHRONIC_FAIL_COUNT = 30
 # Host-level failure dampening (2026-11-19 warp 隧道僵死事故): 同一宿主机
 # 隧道层抖动 (sing-box 重启握手窗口 / mesh 抖动) 会让 sweep 把主机级事件
 # 分散成 N 个独立断路, 每个都按指数退避各自叠加 → 恢复比底层慢 ~30min。
@@ -40,6 +51,26 @@ class CircuitBreaker:
         """
         exponent = min(max(0, consecutive_failures - 2), 16)
         backoff = min(BASE_COOLDOWN_SECONDS * float(2 ** exponent), MAX_COOLDOWN_SECONDS)
+        jitter = random.uniform(0, JITTER_MAX_SECONDS)
+        return round(backoff + jitter, 2)
+
+    @staticmethod
+    def compute_flap_retrip_cooldown(consecutive_failures: int) -> float:
+        """Chronic flapper 的 canary 重开退避: 在 MAX_COOLDOWN 之上按本轮
+        连续失败深度继续指数升级, 封顶 FLAP_ESCALATION_MAX_SECONDS。
+
+        锚用 consecutive_failures 而非累计 fail_count (2026-11-22 review
+        P2 纠正): fail_count 是跨成功归零不清的累计值, 会把"历史上死过
+        30 次、后来自愈、今天新死"的节点误判 chronic; consecutive_failures
+        失败 +1 / 成功归零, 才真正表达"这轮反复死没死透"。
+
+        与 compute_cooldown 的区别: 不受 MAX_COOLDOWN_SECONDS 封顶, 也不应
+        再过 host_dampen_cooldown (dampen 加速的是"可能修复的共同原因",
+        而本轮反复证伪的节点不满足该前提)。consecutive_failures 低 (新死
+        节点) 不走本路径, 保持原有快速复核语义。"""
+        depth = max(0, int(consecutive_failures // FLAP_CHRONIC_FAIL_COUNT) - 1)
+        escalated = MAX_COOLDOWN_SECONDS * (FLAP_ESCALATION_BASE ** min(depth, 8))
+        backoff = min(escalated, FLAP_ESCALATION_MAX_SECONDS)
         jitter = random.uniform(0, JITTER_MAX_SECONDS)
         return round(backoff + jitter, 2)
 
@@ -148,10 +179,17 @@ class CircuitBreaker:
                     next_allowed
                 )
             elif current_state == HealthStatus.HALF_OPEN.value:
-                # Half-open trial failed -> Retrip into DEAD (Open) with longer cooldown
-                cooldown_sec = cls.compute_cooldown(new_failures)
-                if conn is not None:
-                    cooldown_sec = cls.host_dampen_cooldown(cooldown_sec, conn, node.host)
+                # Half-open trial failed -> Retrip into DEAD (Open) with longer cooldown.
+                # 2026-11-21 flap 抑制: 本轮连续失败深的 chronic flapper 用升级
+                # 退避 (绕过 host_dampen), 新死节点保持原快速复核路径。
+                # 锚是 consecutive_failures (new_failures 含本次), 不是累计
+                # fail_count —— 恢复过的节点二次死亡不该继承历史退避档。
+                if new_failures >= FLAP_CHRONIC_FAIL_COUNT:
+                    cooldown_sec = cls.compute_flap_retrip_cooldown(new_failures)
+                else:
+                    cooldown_sec = cls.compute_cooldown(new_failures)
+                    if conn is not None:
+                        cooldown_sec = cls.host_dampen_cooldown(cooldown_sec, conn, node.host)
                 next_allowed = now + timedelta(seconds=cooldown_sec)
                 return (
                     HealthStatus.DEAD.value,

@@ -11,6 +11,7 @@ from typing import List, Optional, Any
 from core.models import ProxyNode, ProbeResult, EgressType, HealthStatus
 from core.storage import Storage
 from core.circuit import CircuitBreaker
+from core.target_health import validate_probe_target
 
 DEFAULT_TIMEOUT = 12.0
 PROBE_URL_V4 = "https://api.ipify.org"
@@ -237,10 +238,14 @@ class Prober:
         Target-specific business probe (e.g. testing Cloudflare Turnstile, X signup, or OpenAI Auth).
         Differentiates between general network reachability and domain-level anti-bot blockages.
         """
+        try:
+            validate_probe_target(target_url)
+        except ValueError as exc:
+            return ProbeResult(node_name=node.name, success=False, error=str(exc))
         proxy_url = f"socks5h://{node.host}:{node.port}"
         start_t = time.perf_counter()
         try:
-            async with httpx.AsyncClient(proxy=proxy_url, timeout=self.timeout, follow_redirects=True) as client:
+            async with httpx.AsyncClient(proxy=proxy_url, timeout=self.timeout, follow_redirects=False) as client:
                 resp = await client.get(
                     target_url,
                     headers={
@@ -248,6 +253,14 @@ class Prober:
                     }
                 )
                 latency = round((time.perf_counter() - start_t) * 1000, 1)
+
+                if resp.is_redirect or resp.is_permanent_redirect:
+                    return ProbeResult(
+                        node_name=node.name,
+                        success=False,
+                        latency_ms=latency,
+                        error="Target returned redirect (redirects are not followed)",
+                    )
 
                 # Check for Cloudflare / Anti-Bot blockages
                 if resp.status_code in (403, 503) and ("challenge-running" in resp.text or "Just a moment" in resp.text or "cf-mitigated" in resp.headers):

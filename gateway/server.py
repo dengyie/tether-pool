@@ -289,6 +289,19 @@ class ForwardProxyGateway:
         来自客户端头, 未转义的 \" 与 \\n 可注入任意 metric 行毒化抓取。"""
         return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
+    @staticmethod
+    def _safe_log_target(target: str) -> str:
+        """Keep auth diagnostics to a redacted host/port, never URL credentials or query."""
+        try:
+            parsed = urllib.parse.urlsplit(target)
+            if parsed.hostname:
+                host = parsed.hostname
+                port = parsed.port
+                return f"{host}:{port}" if port else host
+            return target.split("?", 1)[0].split("#", 1)[0][:80]
+        except (ValueError, UnicodeError):
+            return "<invalid-target>"
+
     def render_metrics(self) -> bytes:
         lines = [
             "# HELP tetherpool_gateway_relay_total Relay connections established per account.",
@@ -806,18 +819,50 @@ class ForwardProxyGateway:
 
             req_line = lines[0]
             parts = req_line.split(" ")
-            if len(parts) < 3:
+            if len(parts) != 3 or not parts[0] or not parts[1] or not parts[2].startswith("HTTP/"):
                 client_writer.close()
                 return
 
-            method, target, version = parts[0], parts[1], parts[2]
+            method, target, version = parts
 
-            # Parse headers
+            # Parse headers while preserving duplicates for framing validation. Header
+            # ambiguity must be rejected before any upstream socket is opened.
             headers_dict = {}
-            for line in lines[1:]:
-                if ":" in line:
-                    k, v = line.split(":", 1)
-                    headers_dict[k.strip().lower()] = v.strip()
+            header_values = {}
+            for line in lines[1:-2]:
+                if not line or ":" not in line:
+                    client_writer.close()
+                    return
+                k, v = line.split(":", 1)
+                key = k.strip().lower()
+                if not key or any(ord(ch) < 0x21 or ord(ch) > 0x7e for ch in key):
+                    client_writer.close()
+                    return
+                value = v.strip()
+                headers_dict[key] = value
+                header_values.setdefault(key, []).append(value)
+
+            content_lengths = header_values.get("content-length", [])
+            parsed_lengths = []
+            try:
+                for value in content_lengths:
+                    parsed_lengths.extend(int(part.strip()) for part in value.split(","))
+            except (TypeError, ValueError):
+                parsed_lengths = None
+            framing_invalid = (
+                parsed_lengths is None
+                or any(length < 0 for length in (parsed_lengths or []))
+                or len(set(parsed_lengths or [])) > 1
+                or ("transfer-encoding" in header_values and bool(content_lengths))
+            )
+            if framing_invalid:
+                client_writer.write(
+                    b"HTTP/1.1 400 Bad Request\\r\\nConnection: close\\r\\n"
+                    b"Content-Length: 0\\r\\n\\r\\n"
+                )
+                await client_writer.drain()
+                client_writer.close()
+                return
 
             # 2. Extract routing constraints
             route_ctx = self._extract_routing_headers(headers_dict, client_ip)
@@ -848,13 +893,19 @@ class ForwardProxyGateway:
                         client_ip,
                         # 2026-11-19 review P2: target 与 user 同样可注入换行
                         # (裸 \n 不被 \r\n split 捕获), 一律过可打印过滤
-                        "".join(ch if ch.isprintable() else "?" for ch in target)[:80],
+                        self._safe_log_target(target),
                         presented_user or "<none>",
                     )
                     if method.upper() == "CONNECT":
                         resp = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"tetherpool\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     else:
-                        resp = b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Type: text/plain\r\nContent-Length: 16\r\nConnection: close\r\n\r\nauth required\r\n\r\n"
+                        body = b"auth required\n"
+                        resp = (
+                            b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+                            b"Content-Type: text/plain\r\n"
+                            + f"Content-Length: {len(body)}\r\n".encode("ascii")
+                            + b"Connection: close\r\n\r\n" + body
+                        )
                     client_writer.write(resp)
                     await client_writer.drain()
                     client_writer.close()

@@ -11,8 +11,8 @@
 # 设计要点:
 # - 测试门禁失败时只回退代码, 不动运行中的服务 (服务此刻还在跑旧代码)
 # - DB 备份用 sqlite 在线 backup API (WAL 安全), 不用 cp (活库 cp 可能撕裂)
-# - 健康门禁 = /health + 双 systemd unit active; 失败即回退上一 commit 再重启,
-#   回退后仍不健康则明确报人工介入 (备份目录里 prev_commit.txt 可追溯)
+# - 健康门禁 = /health + 双 systemd unit active; 失败即回退代码再重启。
+#   DB 快照保留供人工恢复；不自动覆盖服务启动后的业务写入。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -50,7 +50,7 @@ mkdir -p "backups/$TAG"
 # 生产库, 健康门禁失败后的回退就没有恢复点。--skip-backup 显式豁免。
 SKIP_BACKUP="${1:-}"
 backup_ok=0
-.venv/bin/python - "$TAG" <<'PYEOF'
+if .venv/bin/python - "$TAG" <<'PYEOF'
 import sqlite3, sys, os
 tag = sys.argv[1]
 if not os.path.exists("data/ip_pool.db"):
@@ -67,7 +67,9 @@ except sqlite3.Error as e:
     print(f"      (备份失败: {e})")
     sys.exit(1)
 PYEOF
-if [ $? -eq 0 ]; then backup_ok=1; fi
+then
+    backup_ok=1
+fi
 if [ "$backup_ok" != "1" ] && [ "$SKIP_BACKUP" != "--skip-backup" ]; then
     echo "[-] DB 备份失败且未指定 --skip-backup → 中止部署 (服务未动, 仍跑 $PREV)"
     rmdir "backups/$TAG" 2>/dev/null || true

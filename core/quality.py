@@ -59,6 +59,9 @@ class IPQualityEvaluator:
         factors["provenance"] = {"score": provenance_score, "type": provenance_desc}
 
         # 2. Latency / RTT Score (max 30 pts)
+        # 2026-11-21 放宽: 跨国探测 RTT 普遍 0.9-6s (生产 pigeonw/skyward 实测),
+        # 旧档 >=700ms 一律 0 分 + 动态晋级卡 <350ms, 导致动态 premium 恒为空集。
+        # 业务语义: 5s 内可用即给分, 超过 5s 才视为高延迟零分。
         if latency_ms is None or latency_ms <= 0:
             latency_score = 10  # unprobed baseline
             latency_desc = "unprobed"
@@ -66,11 +69,14 @@ class IPQualityEvaluator:
             latency_score = 30
             latency_desc = "ultra_low"
         elif latency_ms < 350:
-            latency_score = 20
+            latency_score = 25
             latency_desc = "low"
         elif latency_ms < 700:
-            latency_score = 10
+            latency_score = 20
             latency_desc = "moderate"
+        elif latency_ms < 5000:
+            latency_score = 10
+            latency_desc = "acceptable"
         else:
             latency_score = 0
             latency_desc = "high_latency"
@@ -113,9 +119,9 @@ class IPQualityEvaluator:
         elif req_tier == QualityTier.PREMIUM:
             tier = QualityTier.PREMIUM if status_lower != "dead" else QualityTier.STANDARD
         else:
-            # Dynamic Classification:
-            # Must have proven provenance (self_hosted/native), low latency (<350ms), healthy status, and score >= 75
-            if total_score >= 75 and (latency_ms is not None and latency_ms < 350) and status_lower != "dead":
+            # Dynamic Classification (2026-11-21 放宽): score >= 75 且 healthy,
+            # 延迟门槛放宽到 5s 内 (见 latency 档位注释)。超 5s 一律 standard。
+            if total_score >= 75 and (latency_ms is not None and latency_ms < 5000) and status_lower != "dead":
                 tier = QualityTier.PREMIUM
             else:
                 tier = QualityTier.STANDARD

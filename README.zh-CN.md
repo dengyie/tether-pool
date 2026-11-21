@@ -10,7 +10,7 @@
 [![EasyTier](https://img.shields.io/badge/Mesh-EasyTier%20P2P-FF6600.svg?style=flat-square)](https://github.com/EasyTier/EasyTier)
 [![Prometheus](https://img.shields.io/badge/Metrics-Prometheus-E6522C.svg?style=flat-square&logo=prometheus&logoColor=white)](https://prometheus.io/)
 [![SQLite](https://img.shields.io/badge/Database-SQLite%20WAL-003B57.svg?style=flat-square&logo=sqlite&logoColor=white)](https://sqlite.org/)
-[![Tests](https://img.shields.io/badge/tests-106%20passed-brightgreen.svg?style=flat-square)]()
+[![Tests](https://img.shields.io/badge/tests-514%20passed-brightgreen.svg?style=flat-square)]()
 
 [English Documentation (README.md)](README.md) · [简体中文](./README.zh-CN.md)
 
@@ -101,7 +101,7 @@ pip install -r requirements.txt
 ```
 10 秒内完整跑通全池拓扑校验、双栈实时探活、断路器熔断自愈演练与 `:9101` 正向网关转发验证。
 
-### 3. 执行自动化测试 (106 项全绿)
+### 3. 执行自动化测试 (514 项全绿)
 ```bash
 .venv/bin/pytest -v
 ```
@@ -193,7 +193,7 @@ ip-pool/
 │   ├── gemini_adapter.py       # Gemini Web 逆向出站适配器
 │   ├── playwright_pool.py      # Python 爬虫与 Playwright 代理池 SDK
 │   └── tetherpool_client.py    # 控制面零依赖 HTTP 客户端
-├── tests/                      # 隔离沙箱自动化单元测试 (99 项全绿)
+├── tests/                      # 隔离沙箱自动化单元测试 (514 项全绿)
 ├── demo.py                     # 端到端交互式全功能演练脚本
 ├── requirements.txt            # Python 依赖清单
 └── start.sh                    # 双进程后台守护启停脚本

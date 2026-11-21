@@ -19,6 +19,22 @@ GATEWAY_PORT=${GATEWAY_PORT:-9101}
 # operator explicitly opts into exposing it (and sets IP_POOL_API_TOKEN).
 HOST=${HOST:-"127.0.0.1"}
 GATEWAY_HOST=${GATEWAY_HOST:-"127.0.0.1"}
+
+is_loopback_host() {
+    case "$1" in
+        127.*|localhost|::1|\[::1\]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+if ! is_loopback_host "$HOST" && [ -z "${IP_POOL_API_TOKEN:-}" ]; then
+    echo "[-] HOST=$HOST is non-loopback but IP_POOL_API_TOKEN is not set" >&2
+    exit 1
+fi
+if ! is_loopback_host "$GATEWAY_HOST" && [ -z "${GATEWAY_PASSWORD:-}" ]; then
+    echo "[-] GATEWAY_HOST=$GATEWAY_HOST is non-loopback but GATEWAY_PASSWORD is not set" >&2
+    exit 1
+fi
 LOG_DIR="$DIR/logs"
 DATA_DIR="$DIR/data"
 
@@ -183,16 +199,33 @@ start_services() {
     # 立即 canary)。确认式重试: 拿到 200 (已排队) 才算成功, 最多等 ~30s —
     # 控制面慢启动或后台首轮扫描占锁都不会再丢触发 (api 侧已改为锁等待)。
     PROBE_OK=0
-    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-        sleep 2
-        CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:$PORT/v1/probe?force=true")
-        if [ "$CODE" = "200" ]; then
-            echo "[*] Force full probe queued (circuit debt cleanup)"
-            PROBE_OK=1
-            break
-        fi
-    done
-    [ "$PROBE_OK" = "1" ] || echo "[!] Force probe NOT queued after 30s — check $LOG_API"
+    if [ -n "${IP_POOL_API_TOKEN:-}" ]; then
+        PROBE_AUTH=(-H "Authorization: Bearer $IP_POOL_API_TOKEN")
+        for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+            sleep 2
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "${PROBE_AUTH[@]}" \
+                -X POST "http://127.0.0.1:$PORT/v1/probe?force=true")
+            if [ "$CODE" = "200" ]; then
+                echo "[*] Force full probe queued (circuit debt cleanup)"
+                PROBE_OK=1
+                break
+            fi
+        done
+    elif [ -n "${IP_POOL_SERVICE_TOKENS:-}" ]; then
+        echo "[!] Skipping force probe: service-token-only mode has no admin credential"
+    else
+        for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+            sleep 2
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                -X POST "http://127.0.0.1:$PORT/v1/probe?force=true")
+            if [ "$CODE" = "200" ]; then
+                echo "[*] Force full probe queued (circuit debt cleanup)"
+                PROBE_OK=1
+                break
+            fi
+        done
+    fi
+    [ "$PROBE_OK" = "1" ] || [ -n "${IP_POOL_SERVICE_TOKENS:-}" ] || echo "[!] Force probe NOT queued after 30s — check $LOG_API"
 }
 
 status_services() {

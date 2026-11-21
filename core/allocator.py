@@ -393,6 +393,10 @@ class AllocationEngine:
         avoid_banned: bool = False,
         avoid_cidrs: Optional[List[str]] = None,
         avoid_same_isp: bool = False,
+        # 一号一节点硬互斥 (exclusive 2026-11-21): 候选节点已被本 service 其它
+        # 账号占用即剔除 (不再是 least-loaded 容忍共占), 占满 -> RuntimeError
+        # (503)。zcode-hub 风控红线专用: 同一出口 IP 多账号 = 405 封 IP 面锭。
+        exclusive: bool = False,
         region_strict: bool = False
     ) -> AccountAllocationItem:
         """
@@ -403,7 +407,7 @@ class AllocationEngine:
             return self._acquire_single(
                 service, account_id, egress_preference, region, tier, tier_policy, force_rebalance, gateway_base,
                 avoid_banned=avoid_banned, avoid_cidrs=avoid_cidrs, avoid_same_isp=avoid_same_isp,
-                region_strict=region_strict
+                exclusive=exclusive, region_strict=region_strict
             )
 
     def _acquire_single(
@@ -419,6 +423,7 @@ class AllocationEngine:
         avoid_banned: bool = False,
         avoid_cidrs: Optional[List[str]] = None,
         avoid_same_isp: bool = False,
+        exclusive: bool = False,
         region_strict: bool = False
     ) -> AccountAllocationItem:
         # quarantine 集合组装: 节点名让 fast path 视为 mismatch, /24 与 isp 集在
@@ -491,8 +496,20 @@ class AllocationEngine:
         # 封禁感知硬过滤 (需求 §5.2/§5.3): 被封节点名、同 /24、同 ISP 剔除。
         if ban_node_names or ban_excluded_nets or (avoid_same_isp and ban_excluded_isps):
             nodes = [n for n in nodes if _ban_node_ok(n)]
+        # 一号一节点硬互斥 (exclusive 2026-11-21): 本 service 其它账号现占节点
+        # 剔除。占满 -> RuntimeError(503), 绝不放松硬塞 —— 与 avoid_banned 同级
+        # 硬约束语义; 非 exclusive 路径保持 least-loaded 共占兜底 (grok2api 等
+        # 大池服务依赖)。
+        if exclusive:
+            occupied = self.storage.count_allocations_per_node(service)
+            nodes = [n for n in nodes if occupied.get(n.name, 0) == 0]
         if not nodes:
-            raise RuntimeError("No eligible nodes available for allocation")
+            # F6 约定: RuntimeError(str) 只到 api 日志, 503 响应是稳定摘要——
+            # 互斥占满与真池枯给不同短语, hub 侧据此区分排障。
+            raise RuntimeError(
+                "exclusive exhausted: every eligible node is held by another "
+                "account of this service" if exclusive
+                else "No eligible nodes available for allocation")
 
         # Pick node with least existing allocations in this service (single GROUP BY query)
         load_counts: Dict[str, int] = self.storage.count_allocations_per_node(service)

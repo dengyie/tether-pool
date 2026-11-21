@@ -24,6 +24,12 @@ class BindingStore:
     """绑定域: leases 镜像 / account_allocations 权威表 / epoch 与变更流。"""
 
     def set_lease(self, account_id: str, node_name: str, rebind_reason: Optional[str] = None) -> LeaseInfo:
+        """[test-only legacy primitive] 只写 leases 镜像、不写权威表。
+
+        生产绑定路径一律走 batch_save_allocations (权威行+镜像同事务)。
+        本方法 2026-11-22 review 确认生产 0 调用, 仅为测试构造「历史崩溃
+        残留的孤儿镜像行」而保留 (test_constraint_persistence /
+        test_failover_hardening 的 lease-adopt 用例)。新代码禁用。"""
         now_str = datetime.now().isoformat()
         with self._get_conn() as conn:
             # 读改写原子化 (2026-11-15 review storage#3): rebind 计数基线 SELECT
@@ -138,32 +144,10 @@ class BindingStore:
             return
         now_str = datetime.now().isoformat()
         constraints_by_account = constraints_by_account or {}
-        with self._get_conn() as conn:
-            # Pre-image lookup so rebind counts and change logs reflect real transitions.
-            # Later duplicates win, matching the upsert ordering executemany applies.
-            # 2026-11-15 review storage#6: 2100 个逐行 SELECT (N+1) 换成两条
-            # 集合 IN 查询 —— 每行一次往返既慢又拉长写锁持有时间。
-            desired: Dict[Tuple[str, str], str] = {}
-            for service, account_id, node_name, _ in records:
-                desired[(service, account_id)] = node_name
-            pre_images: Dict[Tuple[str, str], Optional[str]] = {}
-            keys = list(desired)
-            # sqlite IN 参数上限 999 (老版本 32766): 按 900 一批切片
-            for i in range(0, len(keys), 900):
-                chunk = keys[i:i + 900]
-                by_service: Dict[str, List[str]] = {}
-                for svc, acc in chunk:
-                    by_service.setdefault(svc, []).append(acc)
-                for svc, accs in by_service.items():
-                    ph = ",".join("?" * len(accs))
-                    for row in conn.execute(
-                        f"SELECT account_id, node_name FROM account_allocations "
-                        f"WHERE service = ? AND account_id IN ({ph})",
-                        [svc, *accs]
-                    ):
-                        pre_images[(svc, row["account_id"])] = row["node_name"]
-            for key in keys:
-                pre_images.setdefault(key, None)
+        desired_records: Dict[Tuple[str, str], Tuple[str, str, str, str]] = {}
+        for record in records:
+            desired_records[(record[0], record[1])] = record
+        records = list(desired_records.values())
 
         def _c(key: Tuple[str, str]) -> Tuple[int, str, int, str, str, str]:
             c = constraints_by_account.get(key)
@@ -178,18 +162,38 @@ class BindingStore:
                 c.get("tier_policy") or "",
             )
 
-        # 2026-11-15 review storage#6: 单事务写 2100 行会长期持有 WAL 写锁,
-        # 探活写全部排队 (超过 busy timeout 直接 OperationalError)。按 500 一批
-        # 分事务提交 —— 每批自身原子 (pre-image/epoch/变更日志同批计算), 批间
-        # 短暂可见属可接受 (下游 reconciler 按 epoch 增量拉, 不会看到半迁移行)。
+        # Keep each write transaction short enough for probe writers to make progress.  The
+        # pre-image is deliberately read inside the same IMMEDIATE transaction as the
+        # upsert; a pre-image collected before chunking can be stale or describe a
+        # different occurrence of a duplicate account.
         CH = 500
         for i in range(0, len(records), CH):
             recs = records[i:i + CH]
-            sub_desired: Dict[Tuple[str, str], str] = {}
-            for service, account_id, node_name, _ in recs:
-                sub_desired[(service, account_id)] = node_name
+            sub_desired = {(s, a): (node, allocated_at)
+                           for s, a, node, allocated_at in recs}
             with self._get_conn() as conn:
                 with self._immediate_txn(conn):
+                    pre_images: Dict[Tuple[str, str], Optional[str]] = {}
+                    keys = list(sub_desired)
+                    # Keep the lookup inside BEGIN IMMEDIATE for a fresh pre-image,
+                    # while batching it to avoid one SQLite round-trip per account.
+                    for start in range(0, len(keys), 900):
+                        key_slice = keys[start:start + 900]
+                        by_service: Dict[str, List[str]] = {}
+                        for service, account_id in key_slice:
+                            by_service.setdefault(service, []).append(account_id)
+                        for service, account_ids in by_service.items():
+                            placeholders = ",".join("?" for _ in account_ids)
+                            rows = conn.execute(
+                                "SELECT account_id, node_name FROM account_allocations "
+                                f"WHERE service = ? AND account_id IN ({placeholders})",
+                                [service, *account_ids],
+                            ).fetchall()
+                            for row in rows:
+                                pre_images[(service, row["account_id"])] = row["node_name"]
+                    for key in keys:
+                        pre_images.setdefault(key, None)
+
                     conn.executemany("""
                         INSERT INTO account_allocations (
                             service, account_id, node_name, allocated_at,
@@ -222,41 +226,37 @@ class BindingStore:
                             _c((service, account_id))[0], _c((service, account_id))[4],
                             _c((service, account_id))[0], _c((service, account_id))[5],
                         )
-                        for service, account_id, node_name, allocated_at in recs
+                        for (service, account_id), (node_name, allocated_at) in sub_desired.items()
                     ])
 
-                    # Advance each service's epoch once per chunk and append one change row per move.
                     changed = [
-                        (s, a, pre_images.get((s, a)), sub_desired[(s, a)])
-                        for (s, a) in sub_desired
-                        if pre_images.get((s, a)) != sub_desired[(s, a)]
+                        (service, account_id, pre_images[(service, account_id)], node_name)
+                        for (service, account_id), (node_name, _) in sub_desired.items()
+                        if pre_images[(service, account_id)] != node_name
                     ]
-                    if changed:
-                        epochs = self._advance_binding_epochs(conn, {s for s, _, _, _ in changed}, now_str)
-                        conn.executemany("""
-                            INSERT INTO binding_changes (service, epoch, account_id, from_node, to_node, reason, created_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """, [
-                            (s, epochs[s], a, old, new, reason, now_str)
-                            for s, a, old, new in changed
-                        ])
+                    if not changed:
+                        continue
 
-                        # Keep the legacy account-keyed lease mirror in the SAME transaction as the
-                        # allocation it mirrors. The old code did this with one `set_lease` call per
-                        # account, which turned a whole-host rehome into N separate commits.
-                        lease_moves: Dict[str, Tuple[str, int]] = {}
-                        for s, a, old, new in changed:
-                            # A first bind is not a rebind; a move is. If the account has several
-                            # services, any pre-existing binding makes this a rebind.
-                            lease_moves[a] = (new, 1 if old is not None else 0)
-                        # The mirror is account-keyed while constraints are (service, account)-keyed;
-                        # prebuild the per-account lookup once (first service wins in insertion
-                        # order) instead of scanning the map for every lease row.
-                        first_c_by_acc: Dict[str, Tuple[int, str, int, str, str, str]] = {}
-                        if constraints_by_account:
-                            for (s, a) in constraints_by_account.keys():
-                                if a not in first_c_by_acc:
-                                    first_c_by_acc[a] = _c((s, a))
+                    epochs = self._advance_binding_epochs(
+                        conn, {service for service, _, _, _ in changed}, now_str
+                    )
+                    conn.executemany("""
+                        INSERT INTO binding_changes (service, epoch, account_id, from_node, to_node, reason, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, [
+                        (service, epochs[service], account_id, old, new, reason, now_str)
+                        for service, account_id, old, new in changed
+                    ])
+
+                    # `leases` is an account-keyed compatibility mirror and therefore can
+                    # only represent the default namespace.  Service-scoped allocations
+                    # must never overwrite it with an ambiguous binding.
+                    lease_moves: Dict[str, Tuple[str, int]] = {
+                        account_id: (new, 1 if old is not None else 0)
+                        for service, account_id, old, new in changed
+                        if service == "default"
+                    }
+                    if lease_moves:
                         conn.executemany("""
                             INSERT INTO leases (account_id, node_name, assigned_at, rebind_count, last_rebind_reason,
                                                 bound_region, bound_region_strict, bound_egress_type, bound_tier, bound_tier_policy)
@@ -272,17 +272,17 @@ class BindingStore:
                                 bound_tier = CASE WHEN ?=1 THEN ? ELSE leases.bound_tier END,
                                 bound_tier_policy = CASE WHEN ?=1 THEN ? ELSE leases.bound_tier_policy END
                         """, [
-                            (acc, node, now_str, initial, reason,
-                             _lc[1], _lc[2], _lc[3], _lc[4], _lc[5],
-                             _lc[0], _lc[1],
-                             _lc[0], _lc[2],
-                             _lc[0], _lc[3],
-                             _lc[0], _lc[4],
-                             _lc[0], _lc[5],
-                             )
-                            for acc, (node, initial) in lease_moves.items()
-                            for _lc in (first_c_by_acc.get(acc, (0, "", 0, "", "", "")),)
+                            (account_id, node, now_str, initial, reason,
+                             _c(("default", account_id))[1], _c(("default", account_id))[2],
+                             _c(("default", account_id))[3], _c(("default", account_id))[4], _c(("default", account_id))[5],
+                             _c(("default", account_id))[0], _c(("default", account_id))[1],
+                             _c(("default", account_id))[0], _c(("default", account_id))[2],
+                             _c(("default", account_id))[0], _c(("default", account_id))[3],
+                             _c(("default", account_id))[0], _c(("default", account_id))[4],
+                             _c(("default", account_id))[0], _c(("default", account_id))[5])
+                            for account_id, (node, initial) in lease_moves.items()
                         ])
+
 
     def find_allocation_by_account(self, account_id: str, service: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
@@ -394,12 +394,16 @@ class BindingStore:
                     DELETE FROM account_allocations
                     WHERE service = ? AND account_id = ?
                 """, (service, account_id))
-                remaining = conn.execute(
-                    "SELECT COUNT(*) FROM account_allocations WHERE account_id = ?",
-                    (account_id,)
-                ).fetchone()[0]
-                if remaining == 0:
+                if service == "default":
                     conn.execute("DELETE FROM leases WHERE account_id = ?", (account_id,))
+                else:
+                    default_binding = conn.execute(
+                        "SELECT 1 FROM account_allocations "
+                        "WHERE service = 'default' AND account_id = ?",
+                        (account_id,),
+                    ).fetchone()
+                    if not default_binding:
+                        conn.execute("DELETE FROM leases WHERE account_id = ?", (account_id,))
                 epoch = self._advance_binding_epochs(conn, {service}, now_str)[service]
                 conn.execute("""
                     INSERT INTO binding_changes (service, epoch, account_id, from_node, to_node, reason, created_at)
@@ -546,6 +550,83 @@ class BindingStore:
             """, (service, epoch)).fetchall()
             return [BindingChangeRecord(**dict(r)) for r in rows]
 
+    def get_binding_delta_snapshot(
+        self, service: str, since_epoch: int, limit: int
+    ) -> Dict[str, Any]:
+        """Read a binding delta and its current rows from one SQLite snapshot.
+
+        Epochs are the cursor unit: a batch may append several rows with the same
+        epoch, so a capped response only advances through complete epochs.
+        """
+        with self._get_conn() as conn:
+            conn.execute("BEGIN")
+            try:
+                current_row = conn.execute(
+                    "SELECT epoch, changed_at FROM binding_epoch_state WHERE service = ?",
+                    (service,),
+                ).fetchone()
+                current_epoch = current_row["epoch"] if current_row else 0
+                current_changed_at = current_row["changed_at"] if current_row else None
+                rows = conn.execute("""
+                    SELECT id, service, epoch, account_id, from_node, to_node, reason, created_at
+                    FROM binding_changes
+                    WHERE service = ? AND epoch > ?
+                    ORDER BY epoch ASC, id ASC
+                    LIMIT ?
+                """, (service, since_epoch, limit + 1)).fetchall()
+                truncated = len(rows) > limit
+                if truncated:
+                    cutoff_epoch = rows[limit - 1]["epoch"]
+                    rows = conn.execute("""
+                        SELECT id, service, epoch, account_id, from_node, to_node, reason, created_at
+                        FROM binding_changes
+                        WHERE service = ? AND epoch > ? AND epoch <= ?
+                        ORDER BY epoch ASC, id ASC
+                    """, (service, since_epoch, cutoff_epoch)).fetchall()
+                    applied_epoch = cutoff_epoch
+                else:
+                    applied_epoch = current_epoch if not rows else rows[-1]["epoch"]
+
+                has_more = bool(conn.execute("""
+                    SELECT 1 FROM binding_changes
+                    WHERE service = ? AND epoch > ? AND epoch <= ?
+                    LIMIT 1
+                """, (service, applied_epoch, current_epoch)).fetchone())
+                changes = [BindingChangeRecord(**dict(row)) for row in rows]
+                account_ids = sorted({change.account_id for change in changes})
+                allocations: Dict[str, Dict[str, Any]] = {}
+                nodes: Dict[str, ProxyNode] = {}
+                if account_ids:
+                    placeholders = ",".join("?" for _ in account_ids)
+                    alloc_rows = conn.execute(f"""
+                        SELECT a.account_id, a.node_name, a.allocated_at,
+                               n.host, n.port, n.protocol, n.region, n.egress_type, n.exit_ip
+                        FROM account_allocations a
+                        JOIN nodes n ON a.node_name = n.name
+                        WHERE a.service = ? AND a.account_id IN ({placeholders})
+                    """, [service, *account_ids]).fetchall()
+                    for row in alloc_rows:
+                        allocations[row["account_id"]] = dict(row)
+                        nodes[row["node_name"]] = ProxyNode(
+                            name=row["node_name"], host=row["host"], port=row["port"],
+                            protocol=row["protocol"], region=row["region"],
+                            egress_type=row["egress_type"], exit_ip=row["exit_ip"],
+                        )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return {
+            "changes": changes,
+            "allocations": allocations,
+            "nodes": nodes,
+            "epoch": applied_epoch,
+            "current_epoch": current_epoch,
+            "changed_at": current_changed_at,
+            "truncated": truncated,
+            "has_more": has_more,
+        }
+
     def move_account_binding(
         self,
         service: str,
@@ -554,13 +635,7 @@ class BindingStore:
         reason: str = "auto_rehome",
         cross_region_rebind: bool = False
     ) -> Dict[str, Any]:
-        """
-        Atomically rewrites ONE account's binding: allocation row + legacy lease mirror +
-        rebind counter + last_rebind_reason + binding epoch + change log, all inside one
-        transaction. This is the storage primitive behind R2 (request-time retry exhaustion)
-        and R3 (domain isolation) — the router picks the target node, storage guarantees the
-        write is atomic and idempotent.
-        """
+        """Atomically rewrite one account binding and its compatible mirror."""
         now_str = datetime.now().isoformat()
         with self._get_conn() as conn:
             # 读改写原子化 (2026-11-15 review storage#3): prev 读取与全部写入
@@ -588,16 +663,18 @@ class BindingStore:
                         last_rebind_reason = ?
                 """, (service, account_id, new_node_name, now_str, reason))
 
-                # Legacy lease mirror (account-keyed); keep its own rebind counter in sync.
-                conn.execute("""
-                    INSERT INTO leases (account_id, node_name, assigned_at, rebind_count, last_rebind_reason)
-                    VALUES (?, ?, ?, 1, ?)
-                    ON CONFLICT(account_id) DO UPDATE SET
-                        node_name = excluded.node_name,
-                        assigned_at = excluded.assigned_at,
-                        rebind_count = leases.rebind_count + CASE WHEN leases.node_name != excluded.node_name THEN 1 ELSE 0 END,
-                        last_rebind_reason = CASE WHEN leases.node_name != excluded.node_name THEN excluded.last_rebind_reason ELSE leases.last_rebind_reason END
-                """, (account_id, new_node_name, now_str, reason))
+                # The legacy mirror has no service column and is only meaningful for
+                # the default namespace.
+                if service == "default":
+                    conn.execute("""
+                        INSERT INTO leases (account_id, node_name, assigned_at, rebind_count, last_rebind_reason)
+                        VALUES (?, ?, ?, 1, ?)
+                        ON CONFLICT(account_id) DO UPDATE SET
+                            node_name = excluded.node_name,
+                            assigned_at = excluded.assigned_at,
+                            rebind_count = leases.rebind_count + CASE WHEN leases.node_name != excluded.node_name THEN 1 ELSE 0 END,
+                            last_rebind_reason = CASE WHEN leases.node_name != excluded.node_name THEN excluded.last_rebind_reason ELSE leases.last_rebind_reason END
+                    """, (account_id, new_node_name, now_str, reason))
 
                 epoch = self._advance_binding_epochs(conn, {service}, now_str)[service]
                 conn.execute("""
