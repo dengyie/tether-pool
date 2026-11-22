@@ -218,6 +218,13 @@ def main():
     except OSError:
         print("[TELEAPISUB_REFRESH_SKIP] another refresh is running", file=sys.stderr)
         return 0
+    # 跨脚本写锁 (2026-11-23): sub/skyward/teleapi 都 read-modify-write 同一份
+    # huawei-bridge.yaml, 独立 flock 防不了互相丢更新。读 CFG 前获取, finally 释放。
+    from atomic_yaml import acquire_bridge_writer_lock, release_bridge_writer_lock
+    bridge_wlock = acquire_bridge_writer_lock()
+    if bridge_wlock is None:
+        print("[TELEAPISUB_REFRESH_SKIP] bridge writer lock busy >600s", file=sys.stderr)
+        return 0
     try:
         force_drop = False
         try:
@@ -361,6 +368,7 @@ def main():
         return 1
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        release_bridge_writer_lock(bridge_wlock)
 
 
 if __name__ == "__main__":
