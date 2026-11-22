@@ -124,6 +124,33 @@ def _reality_ok(p):
     return True
 
 
+class _Quoted(str):
+    """标记类: 数字样字符串强制带引号 dump (见 _numeric_like_strings)。"""
+
+
+def _numeric_like_strings(obj):
+    """递归把"数字样字符串"标记为必须带引号的 dump 形式。
+
+    PyYAML safe_dump 对 '906152e4' (科学计数法样) 裸输出, go-yaml 读回解析成
+    float -> mihomo 报 invalid REALITY short ID (2026-11-22 SUB10 接入实证:
+    s10 全源 38 条中 '906152e4'/'99141482' 两条带引号值, dump 后被吞)。
+    解决: 给这类字符串包一层单元素自定义类型, 强制 PyYAML 带引号输出。"""
+    import yaml
+
+    def _repr(dumper, data):
+        return dumper.represent_scalar("tag:yaml.org,2002:str", str(data), style="'")
+
+    yaml.add_representer(_Quoted, _repr, Dumper=yaml.SafeDumper)
+    if isinstance(obj, dict):
+        return {k: _numeric_like_strings(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_numeric_like_strings(v) for v in obj]
+    if isinstance(obj, str) and re.fullmatch(
+            r"[-+]?[0-9][0-9_]*([eE][-+]?[0-9]+)?", obj.strip()):
+        return _Quoted(obj)
+    return obj
+
+
 def probe_via_listeners(
     proxies,
     probe_pool: int,
@@ -164,7 +191,7 @@ def probe_via_listeners(
     tmp = pdir / "probe.yaml"
     fd = os.open(str(tmp), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
-        f.write(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False))
+        f.write(yaml.safe_dump(_numeric_like_strings(cfg), allow_unicode=True, sort_keys=False))
     proc = subprocess.run([MIHOMO_BIN, "-t", "-d", str(pdir), "-f", str(tmp)],
                           capture_output=True, text=True)
     if "successful" not in proc.stdout + proc.stderr:

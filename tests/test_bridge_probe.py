@@ -107,3 +107,29 @@ def test_reality_ok_rejects_non_string_or_oversized_sid():
         {"reality-opts": {"public-key": "k", "short-id": 123}}) is False
     assert bridge_probe._reality_ok(
         {"reality-opts": {"public-key": "k", "short-id": "a" * 17}}) is False
+
+
+# ------------------------------------------------- 数字样字符串引号化 dump
+def test_numeric_like_strings_quotes_scientific_notation_shape():
+    """'906152e4' 被 go-yaml 读成 float (SUB10 实证): dump 必须带引号。"""
+    import yaml
+    cfg = {"reality-opts": {"short-id": "906152e4", "pk": "k1"},
+           "port": 443, "sid2": "906152ea", "pw": "123456"}
+    out = yaml.safe_dump(bridge_probe._numeric_like_strings(cfg),
+                         allow_unicode=True, sort_keys=False)
+    back = yaml.safe_load(out)
+    assert back["reality-opts"]["short-id"] == "906152e4"
+    assert back["sid2"] == "906152ea"          # 非数字样不误伤
+    assert back["port"] == 443                 # 真 int 不受影响
+    assert back["pw"] == "123456"              # 纯整数字符串同样加引号
+
+
+def test_numeric_like_strings_roundtrip_idempotent():
+    """列表/嵌套递归 + 已加引号值二次处理不变形。"""
+    import yaml
+    cfg = {"a": ["906152e4", "ok-str", {"b": "12e3"}]}
+    once = bridge_probe._numeric_like_strings(cfg)
+    twice = bridge_probe._numeric_like_strings(once)
+    assert yaml.safe_load(yaml.safe_dump(twice))["a"][0] == "906152e4"
+    assert yaml.safe_load(yaml.safe_dump(twice))["a"][2]["b"] == "12e3"
+    assert twice["a"][1] == "ok-str"
