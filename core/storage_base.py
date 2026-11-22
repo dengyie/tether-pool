@@ -246,6 +246,8 @@ class StorageBase:
                 CREATE INDEX IF NOT EXISTS idx_ban_events_active ON ban_events(service, quarantined_until);
                 CREATE INDEX IF NOT EXISTS idx_allocations_service ON account_allocations(service);
                 CREATE INDEX IF NOT EXISTS idx_allocations_node ON account_allocations(node_name);
+                CREATE INDEX IF NOT EXISTS idx_allocations_account ON account_allocations(account_id);
+                CREATE INDEX IF NOT EXISTS idx_leases_node ON leases(node_name);
             """)
 
             # Migration for existing databases

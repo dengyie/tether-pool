@@ -17,6 +17,7 @@ import pytest
 from core.models import EgressType, HealthStatus, ProxyNode
 from core.prober import Prober
 from core.storage import Storage
+from core.store_nodes import NodeStore
 
 
 def _iso(days_ago: float = 0.0, hours_ago: float = 0.0) -> str:
@@ -284,3 +285,43 @@ def test_remove_from_config_atomic_no_truncate(env, tmp_path, monkeypatch):
     assert len(parsed["nodes"]) == 1
     assert os.path.exists(str(cfg) + ".bak")  # 备份在
     assert api.server._remove_from_config("absent") is False
+
+
+# ---------------- 节点快照缓存 (2026-11-23 吞吐优化) ----------------
+
+def test_snapshot_cache_hit_within_ttl(env):
+    """TTL 内二次读取命中缓存 (不回源); 类级缓存需先清态防测试串扰。"""
+    import time as _time
+    storage = env
+    NodeStore._snapshots.clear()
+    storage.upsert_node(_mk(storage, "snap-a", status=HealthStatus.HEALTHY.value))
+    s1 = storage.list_nodes_snapshot()
+    n1 = len(s1)
+    _time.sleep(0.05)
+    s2 = storage.list_nodes_snapshot()
+    assert s2 is s1          # 同一对象 = 命中缓存
+    assert len(s2) == n1
+
+
+def test_snapshot_invalidated_by_write(env):
+    """写路径 (upsert) 主动失效: 下轮读取必须看到新节点。"""
+    storage = env
+    NodeStore._snapshots.clear()
+    before = storage.list_nodes_snapshot()
+    assert all(n.name != "snap-b" for n in before)
+    storage.upsert_node(_mk(storage, "snap-b", status=HealthStatus.HEALTHY.value))
+    after = storage.list_nodes_snapshot()
+    assert any(n.name == "snap-b" for n in after)
+
+
+def test_snapshot_sorted_by_name_matches_list_nodes(env):
+    """快照排序与 list_nodes() 的 ORDER BY name 语义一致 (热路径过滤依赖)。"""
+    storage = env
+    NodeStore._snapshots.clear()
+    for nm in ("snap-c", "snap-a2", "snap-b2"):
+        storage.upsert_node(_mk(storage, nm, status=HealthStatus.HEALTHY.value))
+    snap = storage.list_nodes_snapshot()
+    names = [n.name for n in snap]
+    assert names == sorted(names)
+    direct = sorted(storage.list_nodes(), key=lambda n: n.name)
+    assert [n.name for n in direct] == names

@@ -26,7 +26,47 @@ class NodeStore:
     # 分块剪枝批大小 (类级常量, 测试会 monkeypatch 它验证分块边界)
     _PRUNE_CHUNK_SIZE = 5000
 
+    # 全表快照缓存 (2026-11-23 吞吐优化): _get_candidates_for_tier_policy 每次
+    # acquire 都 list_nodes() 全表扫 + 3000+ 行 Pydantic 映射, 且调用方持有
+    # BINDING_WRITE_LOCK —— 锁内耗时 = 全服务串行化天花板。TTL + 写路径主动
+    # 失效 (见各写方法末尾 _invalidate_node_cache); api/gateway 各进程各持一份,
+    # 跨进程写依赖 TTL 兜底 (与 router._hub_candidates 同口径)。
+    _SNAPSHOT_TTL = float(os.environ.get("IP_POOL_NODE_SNAPSHOT_TTL", "10"))
+    # 按 db_path 分桶: 类是 mixin 全局唯一, 测试里多 Storage 实例指向不同
+    # SQLite 文件, 单值类级缓存会把 A 库的快照喂给 B 库 (test_gateway 串扰实证)
+    _snapshots: Dict[str, List[ProxyNode]] = {}
+    _snapshot_ts: Dict[str, float] = {}
+    _snapshot_lock = threading.Lock()
+
+    def _invalidate_node_cache(self):
+        key = str(getattr(self, "db_path", "?"))
+        type(self)._snapshots.pop(key, None)
+
+    def list_nodes_snapshot(self) -> List[ProxyNode]:
+        """全表快照 (缓存版): 排序与 list_nodes() 的 ORDER BY name 一致。
+
+        供 router 热路径使用; 本进程写路径已接失效钩子。缓存挂类级按 db_path
+        分桶: NodeStore 是 mixin, Storage 组合类在 api/gateway 各进程内为单例,
+        类级即实例级语义且不侵入 __init__ 继承链。"""
+        import time as _time
+        cls = type(self)
+        key = str(getattr(self, "db_path", "?"))
+        now = _time.time()
+        snap = cls._snapshots.get(key)
+        if snap is not None and now - cls._snapshot_ts.get(key, 0.0) <= cls._SNAPSHOT_TTL:
+            return snap
+        with cls._snapshot_lock:
+            now = _time.time()
+            snap = cls._snapshots.get(key)
+            if snap is not None and now - cls._snapshot_ts.get(key, 0.0) <= cls._SNAPSHOT_TTL:
+                return snap  # 双检: 等锁期间另一线程已加载
+            snap = sorted(self.list_nodes(), key=lambda n: n.name)
+            cls._snapshots[key] = snap
+            cls._snapshot_ts[key] = now
+            return snap
+
     def upsert_node(self, node: ProxyNode):
+        self._invalidate_node_cache()  # 写路径失效节点快照缓存
         with self._get_conn() as conn:
             conn.execute("""
                 INSERT INTO nodes (
@@ -83,6 +123,7 @@ class NodeStore:
             ))
 
     def update_node_status(self, node_name: str, status: str):
+        self._invalidate_node_cache()  # 写路径失效节点快照缓存
         with self._get_conn() as conn:
             conn.execute("""
                 UPDATE nodes SET
@@ -109,6 +150,7 @@ class NodeStore:
         DISABLED 第四条防线)。本方法用 CASE guard 保证只有「当前仍为 from_state」
         的行才迁移; DISABLED / 已被并发改态的节点不写、不发事件。
         """
+        self._invalidate_node_cache()  # 写路径失效节点快照缓存
         with self._get_conn() as conn:
             cur = conn.execute("""
                 UPDATE nodes SET
@@ -128,6 +170,7 @@ class NodeStore:
         Records probe history and evaluates circuit breaker transition.
         Returns: (res, optional_circuit_event_if_transitioned)
         """
+        self._invalidate_node_cache()  # 写路径失效节点快照缓存
         now_str = datetime.now().isoformat()
         transition_event: Optional[CircuitEvent] = None
         drift_labels: Optional[Dict[str, str]] = None
@@ -352,6 +395,7 @@ class NodeStore:
 
     def reset_node_circuit(self, node_name: str) -> bool:
         """Manual operator reset of a tripped node back to healthy"""
+        self._invalidate_node_cache()  # 写路径失效节点快照缓存
         node = self.get_node(node_name)
         if not node:
             return False
@@ -385,6 +429,7 @@ class NodeStore:
         2026-11-19 review P3: 复检+写入合入同一 IMMEDIATE 事务, UPDATE 带
         status='dead' 条件 —— 消除"读旧快照判 dead, 写前被并发救活又被盖回
         dead+frozen"的状态腐坏窗口 (frozen 标签会挡住非强制探活, 卡死到人工 revive)。"""
+        self._invalidate_node_cache()  # 写路径失效节点快照缓存
         with self._get_conn() as conn:
             with self._immediate_txn(conn):
                 row = conn.execute("SELECT status, tags FROM nodes WHERE name = ?",
@@ -496,6 +541,7 @@ class NodeStore:
         path re-homes them to healthy nodes. Hard deletion is only performed when the
         operator explicitly opts in (see `prune_nodes_except`).
         """
+        self._invalidate_node_cache()  # 写路径失效节点快照缓存
         with self._get_conn() as conn:
             # 读改写原子化 (2026-11-15 review storage#2): SELECT 基线与批量
             # UPDATE 曾跨事务, 探活成功可在两步之间把节点救活, 随后被本方法
@@ -532,6 +578,7 @@ class NodeStore:
         2026-11-15 review P1: 与 delete_node 同理, 被清节点的绑定必须推进
         epoch + 落 change 行, 否则下游 reconcile 看不到这批释放。
         """
+        self._invalidate_node_cache()  # 写路径失效节点快照缓存
         now_str = datetime.now().isoformat()
         with self._get_conn() as conn:
             with self._immediate_txn(conn):
@@ -577,6 +624,7 @@ class NodeStore:
         R5b 要防的 "N 个账户挂在已消失出口" 故障类。janitor 驱逐路径
         (api/server.py) 在调用本方法前已先 rehome, 这里兜的是剩余绑定。
         """
+        self._invalidate_node_cache()  # 写路径失效节点快照缓存
         now_str = datetime.now().isoformat()
         with self._get_conn() as conn:
             with self._immediate_txn(conn):
@@ -634,6 +682,7 @@ class NodeStore:
         transaction, single circuit event) instead of N independent per-node trips.
         Returns (affected_nodes, domain_event).
         """
+        self._invalidate_node_cache()  # 写路径失效节点快照缓存
         now = datetime.now()
         cooldown_sec = CircuitBreaker.compute_cooldown(2)  # baseline ~60s domain cooldown
         next_allowed = (now + timedelta(seconds=cooldown_sec)).isoformat()
@@ -687,6 +736,7 @@ class NodeStore:
         quality_score, fault_domain, provider_region, self_reported_at.
         Automatically synchronizes circuit_state with status and records circuit transition audit event.
         """
+        self._invalidate_node_cache()  # 写路径失效节点快照缓存
         if not updates:
             return self.get_node(name)
 

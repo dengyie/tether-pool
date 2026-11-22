@@ -533,7 +533,10 @@ class Router:
         # (每次 list_nodes 都 _get_conn 开新连接), 单次 acquire 在消费高并发下
         # 是放大器。改为单快照 + 内存过滤 —— 过滤语义逐字段等价 (等值匹配 +
         # ORDER BY name), 且同一次 acquire 内各梯级看到一致快照。
-        snapshot = sorted(self.storage.list_nodes(), key=lambda n: n.name)
+        # 2026-11-23 二次优化: 快照升级为 NodeStore.list_nodes_snapshot() 缓存版
+        # (TTL + 写路径失效) —— 原实现每 acquire 仍全表扫 + 3000 行 Pydantic
+        # 映射, 且全程持 BINDING_WRITE_LOCK, 锁内耗时 = 全服务串行化天花板。
+        snapshot = self.storage.list_nodes_snapshot()
 
         def _sel(n: ProxyNode, r: Optional[str], e: Optional[str],
                  status: Optional[str], tier: Optional[str]) -> bool:
@@ -866,6 +869,20 @@ class Router:
         except Exception as metric_err:
             print(f"[-] Failed to record rehome_blocked metric: {metric_err}")
 
+    def _record_rehome_blocked_batch(self, blocked_units: Dict[Any, Any]) -> None:
+        """循环攒批一次落盘 (2026-11-23): 域级 rehome 数百账号被 block 时,
+        逐个 incr_metric = 数百次独立写事务, 与探活写争锁。"""
+        if not blocked_units:
+            return
+        try:
+            self.storage.incr_metrics([
+                ("ip_pool_rehome_blocked_total",
+                 {"service": svc, "region": region}, 1.0)
+                for svc, region in blocked_units.values()
+            ])
+        except Exception as metric_err:
+            print(f"[-] Failed to record rehome_blocked metrics (batch): {metric_err}")
+
     def _rehome_leases_for_node(self, broken_node_name: str) -> Dict[str, Any]:
         leases = self.storage.get_leases_for_node(broken_node_name)
         stale_allocations = self.storage.get_allocations_for_node(broken_node_name)
@@ -950,13 +967,13 @@ class Router:
                 # No promise on record: shared availability-first ladder.
                 cands, blocked_region = (base_candidates or None), None
             if not cands:
-                blocked_units[key] = blocked_region or "none_healthy"
-                self._record_rehome_blocked(svc_acc, blocked_units[key])
+                blocked_units[key] = (svc_acc, blocked_region or "none_healthy")
                 continue
             new_node_by_unit[key] = self._weighted_deterministic_pick(cands, acc)
             if svc_acc in SERVICE_EXCLUSIVE_SERVICES:
                 sweep_picked.setdefault(svc_acc, set()).add(new_node_by_unit[key].name)
 
+        self._record_rehome_blocked_batch(blocked_units)
         rehomed_details = []
         for key in sorted(units):
             svc_acc, acc = key
@@ -976,7 +993,7 @@ class Router:
                     "from_node": broken_node_name,
                     "to_node": None,
                     "blocked": True,
-                    "blocked_region": blocked_units[key]
+                    "blocked_region": blocked_units[key][1]
                 })
 
         # One event per rehome sweep, not one per account: the audit trail only needs to
@@ -1101,8 +1118,7 @@ class Router:
             else:
                 cands, blocked_region = (base_candidates or None), None
             if not cands:
-                blocked_units[key] = blocked_region or "none_healthy"
-                self._record_rehome_blocked(svc_acc, blocked_units[key])
+                blocked_units[key] = (svc_acc, blocked_region or "none_healthy")
                 continue
             new_node_by_unit[key] = self._weighted_deterministic_pick(cands, acc)
             if svc_acc in SERVICE_EXCLUSIVE_SERVICES:
@@ -1120,6 +1136,7 @@ class Router:
             self.storage.batch_save_allocations(allocation_records, reason="domain_rehome")
 
         rehomed_account_ids = {acc for (_, acc) in new_node_by_unit}
+        self._record_rehome_blocked_batch(blocked_units)
         rehomed_details = []
         for (svc_acc, acc) in sorted(units):
             base_detail = {"account_id": acc, "service": svc_acc,
@@ -1128,7 +1145,7 @@ class Router:
                 base_detail["to_node"] = new_node_by_unit[(svc_acc, acc)].name
             else:
                 base_detail.update({"to_node": None, "blocked": True,
-                                    "blocked_region": blocked_units[(svc_acc, acc)]})
+                                    "blocked_region": blocked_units[(svc_acc, acc)][1]})
             rehomed_details.append(base_detail)
 
         self.storage.record_circuit_event(

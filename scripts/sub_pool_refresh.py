@@ -421,7 +421,11 @@ def main():
                             "-f", str(CFG)], capture_output=True, text=True)
         if "successful" not in t.stdout + t.stderr:
             print("[SUB_REFRESH_FAIL] mihomo -t failed: rc=%s out=%r err=%r" % (t.returncode, t.stdout[-300:], t.stderr[-300:]), file=sys.stderr)
-            open("/tmp/sub-refresh-failed-cfg.yaml","w").write(Path(str(CFG)).read_text())
+            # 失败配置含全部订阅凭据 (URL 即凭据铁律): 0600 落盘, 部署成功后清理
+            _fc = "/tmp/sub-refresh-failed-cfg.yaml"
+            _fd = os.open(_fc, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+            with os.fdopen(_fd, "w") as _ff:
+                _ff.write(Path(str(CFG)).read_text())
             latest_cfg = sorted(glob.glob(str(BACKUP_DIR / "huawei-bridge.yaml.*")))[-1]
             subprocess.run(["cp", latest_cfg, str(CFG)])
             return 1
