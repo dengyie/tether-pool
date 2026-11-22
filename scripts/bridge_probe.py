@@ -72,11 +72,14 @@ def _listening_ports():
     return None
 
 
-def wait_for_listeners(core, probe_pool, count, timeout=40):
+def wait_for_listeners(core, probe_pool, count, timeout=None):
     """等临时核的 probe listener 全部就位再开探。
 
     固定 sleep(4) 在节点数多时不够: mihomo 按配置顺序建 listener, 末尾节点首轮
-    探活时端口尚未 listen → 被误判 dead (2026-11-19 SUB4 实测 15 全活只入 5)。
+    探活时端口尚未 listen → 被误判 dead (2026-11-19 SUB4 实测 15 全活只入 5;
+    2026-11-22 SUB10 复发并升级: 716 listener 时尾部 15 条 ConnectionRefused,
+    40s 固定超时耗尽后 probing anyway, 重放同配置单独探 2/17 立即活)。
+    → 超时改为随 count 缩放: 40s 基底 + 每 100 listener +10s (1300 条 ≈ 170s)。
 
     就绪判定优先按 pid 圈定 (core.pid 的 listener 才算数) —— 各刷新脚本独立
     flock 可并发, 整机端口集会把别的临时核 listener 误当自己就绪, 探到的端口
@@ -85,6 +88,8 @@ def wait_for_listeners(core, probe_pool, count, timeout=40):
     """
     if count <= 0:
         return True
+    if timeout is None:
+        timeout = 40 + (count // 100) * 10
     want = set(range(probe_pool, probe_pool + count))
     want_pairs = {(p, core.pid) for p in want}
     want_any = {(p, None) for p in want}
