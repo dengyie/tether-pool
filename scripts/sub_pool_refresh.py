@@ -60,26 +60,15 @@ KEEP_BACKUPS = 7
 JUNK_SERVERS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 
 def backup_with_rotation():
-    BACKUP_DIR.mkdir(exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    for src in (CFG, NODES):
-        data = src.read_bytes()
-        (BACKUP_DIR / f"{src.name}.{stamp}").write_bytes(data)
-    # 只轮转本脚本的备份 (曾误删 pigeonw 脚本的时间戳备份 - glob 跨脚本匹配)
-    olds = sorted(glob.glob(str(BACKUP_DIR / "huawei-bridge.yaml.*")) +
-                  glob.glob(str(BACKUP_DIR / "nodes.yaml.*")))
-    for old in olds[:-KEEP_BACKUPS * 2]:
-        os.unlink(old)
+    # 2026-11-23 优化 9: 抽 refresh_common.backup_with_rotation; suffix="" 时
+    # glob 只收纯时间戳备份 —— 旧版 `huawei-bridge.yaml.*` 跨脚本匹配会误删
+    # skyward/teleapisub/pigeonw 的带后缀备份 (轮转最老位时)。
+    from refresh_common import backup_with_rotation as _bwr
+    _bwr(BACKUP_DIR, (CFG, NODES), KEEP_BACKUPS)
 
 def _unbool_proxies(proxies):
-    """YAML 1.1 陷阱: 凭据恰为 no/yes/on/off/y/n 时被 load 成 bool, dump 后变
-    true/false 损坏凭据。回退为字符串原值。"""
-    for p in proxies:
-        for k in ("username", "password", "server"):
-            v = p.get(k)
-            if isinstance(v, bool):
-                p[k] = "true" if v else "false"
-    return proxies
+    from refresh_common import unbool_proxies
+    return unbool_proxies(proxies)
 
 
 def _classify_http_error(e):

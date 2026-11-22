@@ -113,11 +113,14 @@ flip_to() {  # $1 = 目标中继节点名
     return "$rc"
   fi
   printf '%s\n' "$output" | while IFS= read -r l; do log "$l"; done
-  # cmd_relay 只改配置; 杀桥核进程, bridge_keeper.sh 以新配置重生 (用 pidfile 精确定位)
+  # cmd_relay 只改配置; 杀桥核进程, bridge_keeper.sh 以新配置重生。
+  # kill 前必须验证目标进程命令行确实是本桥 mihomo (pidfile 可能陈旧:
+  # PID 复用后 kill 会误杀无辜进程 —— pgrep 兜底同样只信完整 -f 参数匹配)。
   local pidf="$REPO/data/teleapi-bridge.pid"
   local pid=""
   [ -f "$pidf" ] && pid=$(cat "$pidf" 2>/dev/null)
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
+     && ps -p "$pid" -o args= 2>/dev/null | grep -q "bin/mihomo.*$BRIDGE_CFG"; then
     kill "$pid" 2>/dev/null
   else
     # pidfile 失效兜底: 精确匹配完整 -f 参数路径

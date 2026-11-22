@@ -209,7 +209,8 @@ def probe_via_listeners(
     if allow_lan is not None:
         cfg["allow-lan"] = allow_lan
     pdir = Path(probe_dir)
-    pdir.mkdir(exist_ok=True)
+    # 0700: datadir 内 probe.yaml 含全部节点凭据 (2026-11-23 转储 0600 同型)
+    pdir.mkdir(exist_ok=True, mode=0o700)
     tmp = pdir / "probe.yaml"
     fd = os.open(str(tmp), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:

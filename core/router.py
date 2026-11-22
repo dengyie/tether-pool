@@ -42,18 +42,20 @@ class Router:
         self._hub_cache_ttl: float = float(os.environ.get("IP_POOL_HUB_CACHE_TTL", "10"))
 
     def _hub_candidates(self) -> List[ProxyNode]:
-        """Healthy clash_proxy hub nodes (hongkong/tokyo/singapore/us-west), 10s TTL cached."""
+        """Healthy clash_proxy hub nodes (hongkong/tokyo/singapore/us-west), 10s TTL cached.
+
+        2026-11-23: 复用 NodeStore.list_nodes_snapshot() —— 4 次 region 过滤全表扫
+        改为一次全量快照内存过滤; 本 TTL 与快照 TTL 同值, 语义不变。"""
         import time
         now = time.time()
         if self._hub_cache is None or now - self._hub_cache_ts > self._hub_cache_ttl:
-            candidates: List[ProxyNode] = []
-            for hub_region in ["hongkong", "tokyo", "singapore", "us-west"]:
-                candidates.extend(self.storage.list_nodes(
-                    region=hub_region,
-                    egress_type=EgressType.CLASH_PROXY.value,
-                    status=HealthStatus.HEALTHY.value
-                ))
-            self._hub_cache = candidates
+            hub_regions = {"hongkong", "tokyo", "singapore", "us-west"}
+            self._hub_cache = [
+                n for n in self.storage.list_nodes_snapshot()
+                if n.region in hub_regions
+                and n.egress_type == EgressType.CLASH_PROXY.value
+                and n.status == HealthStatus.HEALTHY.value
+            ]
             self._hub_cache_ts = now
         return self._hub_cache
 

@@ -19,11 +19,8 @@ from pathlib import Path
 
 # bearer-token 型订阅 URL 即凭据, 仓库不落盘: 从 /etc/ip-pool-secrets.env 读。
 def _sub_url() -> str:
-    url = os.environ.get("PIGEONW_SUB_URL", "").strip()
-    if not url:
-        print("[PIGEONW_REFRESH_FAIL] PIGEONW_SUB_URL not set (see /etc/ip-pool-secrets.env)", file=sys.stderr)
-        sys.exit(1)
-    return url
+    from refresh_common import sub_url  # 2026-11-23 优化 9
+    return sub_url("PIGEONW_SUB_URL", "PIGEONW_REFRESH_FAIL")
 
 CFG = Path("/opt/ip-pool/config/pigeonw-bridge.yaml")
 CFG_DIR = Path("/opt/ip-pool/config/pigeonw-bridge")
@@ -46,24 +43,13 @@ NODE_RE = re.compile(r"^clash-(3\d\d)-pigeonw-(\d+)$")
 
 
 def backup_with_rotation():
-    BACKUP_DIR.mkdir(exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    for src in (CFG, NODES):
-        (BACKUP_DIR / f"{src.name}.{stamp}-pigeonw").write_bytes(src.read_bytes())
-    olds = sorted(glob.glob(str(BACKUP_DIR / "*-pigeonw")))
-    for old in olds[:-KEEP_BACKUPS * 2]:
-        os.unlink(old)
+    from refresh_common import backup_with_rotation as _bwr  # 2026-11-23 优化 9
+    _bwr(BACKUP_DIR, (CFG, NODES), KEEP_BACKUPS, suffix="-pigeonw")
 
 
 def _unbool_proxies(proxies):
-    """YAML 1.1 陷阱: 凭据恰为 no/yes/on/off/y/n 时被 load 成 bool, dump 后变
-    true/false 损坏凭据且匹配逻辑恒判"变更"。回退为字符串原值。"""
-    for p in proxies:
-        for k in ("username", "password", "server"):
-            v = p.get(k)
-            if isinstance(v, bool):
-                p[k] = "true" if v else "false"
-    return proxies
+    from refresh_common import unbool_proxies
+    return unbool_proxies(proxies)
 
 
 def fetch_and_parse():
