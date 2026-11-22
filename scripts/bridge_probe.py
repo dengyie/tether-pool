@@ -213,12 +213,30 @@ def probe_via_listeners(
     # (2026-11-22 SUB10 yuetong 实证: 17 条同 server 并发探 0/17 全拒,
     # 逐条串行 17/17 全活)。同组串行、跨组仍吃满 max_workers —— 正常多源
     # 订阅各节点 server 互异, 全局吞吐不受影响。
+    # 分组键取注册域后二段 (yuetong.online): 同一上游商的不同子域入口
+    # (17 个 *.e.yuetong.online) 共享同一真实出口, 只按整串 server 分组
+    # 防不住跨子域并发互撞 (实测全量探活 s10 仅 7/17 活)。
+    import socket as _socket
+
+    # 分组键: 纯 IP 用全串; 域名取注册域后二段 (yuetong.online)。同一上游商
+    # 的不同子域入口 (17 个 *.e.yuetong.online) 共享同一真实出口, 只按整串
+    # server 分组防不住跨子域并发互撞 (实测全量探活 s10 仅 7/17 活)。
+    # 注意 IP 不能取末二段 (181.201.5.6 会与 181.201.7.8 错并成同组硬串行)。
+    _ip_re = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}|\[[0-9a-f:]+\]")
+    _domain_re = re.compile(r"^[^.]+(?:\.[^.]+)*?\.([^.]+\.[^.]+)$")
     _sems = defaultdict(threading.Semaphore)
+
+    def _sem_key(p):
+        srv = str(p.get("server") or "")
+        if _ip_re.fullmatch(srv):
+            return srv
+        m = _domain_re.match(srv)
+        return m.group(1).lower() if m else (srv or p.get("name"))
 
     def probe(i_p):
         i, p = i_p
         try:
-            with _sems[p.get("server") or p.get("name")]:
+            with _sems[_sem_key(p)]:
                 s = socket.create_connection(("127.0.0.1", probe_pool + i), timeout=10)
                 s.sendall(b"\x05\x01\x00")
                 if s.recv(2) != b"\x05\x00":

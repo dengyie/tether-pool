@@ -192,9 +192,9 @@ def test_probe_per_server_serialized(monkeypatch, tmp_path):
     for k in range(3):
         fake_listener(probe_pool + k)
     proxies = [
-        {"name": "a1", "type": "socks5", "server": "up-a", "port": 1},
-        {"name": "a2", "type": "socks5", "server": "up-a", "port": 2},
-        {"name": "b1", "type": "socks5", "server": "up-b", "port": 3},
+        {"name": "a1", "type": "socks5", "server": "x1.e.yuetong.online", "port": 1},
+        {"name": "a2", "type": "socks5", "server": "x2.e.yuetong.online", "port": 2},
+        {"name": "b1", "type": "socks5", "server": "1.2.3.4", "port": 3},
     ]
     try:
         results = bridge_probe.probe_via_listeners(
