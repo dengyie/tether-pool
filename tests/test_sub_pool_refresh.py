@@ -81,6 +81,22 @@ def test_upstream_key_ignores_source_prefix_but_not_credentials():
     assert spr.upstream_key(a) != spr.upstream_key(c)
 
 
+def test_upstream_key_distinguishes_sni_and_public_key():
+    """同 server/port/uuid 只差 reality SNI/pk 是独立线路 (SUB10 22 条多 SNI
+    分身实证, 旧六元组键误吞 21 条; SUB8 107 组 sni 全相同不受影响)。"""
+    base = {"name": "s10-x", "type": "vless", "server": "a.e.yuetong.online",
+            "port": 443, "uuid": "u1", "servername": "www.a.com",
+            "reality-opts": {"public-key": "pk1", "short-id": "s1"}}
+    assert spr.upstream_key(base) == spr.upstream_key(dict(base, name="s9-x"))
+    assert spr.upstream_key(base) != spr.upstream_key(dict(base, servername="www.b.com"))
+    assert spr.upstream_key(base) != spr.upstream_key(
+        {**base, "reality-opts": {"public-key": "pk2", "short-id": "s1"}})
+    # servername 缺省 (http/ss 等) 与空串同键: 不影响非 vless 协议去重行为
+    http_a = {"type": "http", "server": "1.1.1.1", "port": 80}
+    http_b = {"type": "http", "server": "1.1.1.1", "port": 80, "servername": ""}
+    assert spr.upstream_key(http_a) == spr.upstream_key(http_b)
+
+
 # ---------------------------------------------------------------- 多源发现
 def test_sub_sources_sorted_by_index(monkeypatch):
     monkeypatch.setenv("SUB2_URL", "https://example.com/2")

@@ -150,9 +150,18 @@ def normalize_source_proxies(proxies, src_idx):
 
 
 def upstream_key(p):
-    """跨源上游去重键: 同一条线路在多个订阅里重复出现时只留一份。"""
+    """跨源上游去重键: 同一条线路在多个订阅里重复出现时只留一份。
+
+    2026-11-22 SUB10 实证: yuetong 22 条 vless 同 server/port/uuid 只差
+    reality SNI (servername: www.infineon.com / www.westerndigital.com / ...),
+    是上游刻意分发的 22 条独立线路 (不同 SNI = 不同握手目标), 旧六元组键把
+    21 条误当重复吞掉。SNI 入键后 SUB8 107 个重复组 sni 全相同、零影响。
+    也纳入 reality public-key: 同 server 不同 pk 同理是不同线路。
+    """
+    ro = p.get("reality-opts") or {}
     return (str(p.get("type")), str(p.get("server")).lower(), p.get("port"),
-            str(p.get("username") or ""), str(p.get("password") or ""), str(p.get("uuid") or ""))
+            str(p.get("username") or ""), str(p.get("password") or ""), str(p.get("uuid") or ""),
+            str(p.get("servername") or ""), str(ro.get("public-key") or ""))
 
 def probe_via_listeners(proxies, extra_proxies=None):
     # F9 (二轮 review): 与 pigeonw 刷新共享的探活实现抽到 scripts/bridge_probe.py
@@ -343,11 +352,16 @@ def main():
         # 失败补探: 主探活 1300+ listener 一次全起, mihomo 资源竞争下尾部源
         # 单轮波动大 (2026-11-22 SUB10 实证: 主探活 0/17, 单独复测 5/17)。
         # 失败的全部节点 (不限 relay) 补探一次, 显著降低单轮误杀。
+        # 补探分批 (≤200/批): 单轮 800 listener 的 retry 与主探活同样拥挤,
+        # 尾部重握手型节点 (reality) 依旧被挤 — s10 混 802 条 retry 仍 0/17,
+        # 200 批实测 6/17。批间天然错开 mihomo 资源高峰。
         alive_names = {p["name"] for _, p, _, _ in alive}
         retry = [p for p in proxies if p["name"] not in alive_names]
-        if retry:
-            more = probe_via_listeners(retry, extra_proxies=list(extra_relays.values()))
-            print(f"retry: {len(more)}/{len(retry)} recovered")
+        RETRY_BATCH = 200
+        for bi in range(0, len(retry), RETRY_BATCH):
+            batch = retry[bi:bi + RETRY_BATCH]
+            more = probe_via_listeners(batch, extra_proxies=list(extra_relays.values()))
+            print(f"retry[{bi // RETRY_BATCH + 1}]: {len(more)}/{len(batch)} recovered")
             alive.extend(more)
         print(f"alive {len(alive)}/{len(proxies)}")
         if len(alive) < 5:
