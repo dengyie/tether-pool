@@ -79,7 +79,7 @@ def fetch_and_parse():
         for attempt in range(3):
             r = subprocess.run(["curl", "-sS", "--max-time", "40", "-A", "clash-verge/1.6.6",
                                 _sub_url(), "-o", str(fetch_file)],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, timeout=70)
             if r.returncode == 0 and fetch_file.exists() and fetch_file.stat().st_size > 100:
                 break
             last_err = (r.returncode, r.stderr[-200:])
@@ -284,20 +284,27 @@ def main():
         # ---- 落盘 + 校验门 (2026-11-15 review P2: 原子写) ----
         from atomic_yaml import atomic_write_text
         atomic_write_text(CFG, yaml.safe_dump(main_cfg, allow_unicode=True, sort_keys=False))
-        t = subprocess.run(["/opt/ip-pool/bin/mihomo", "-t", "-d", str(CFG_DIR), "-f", str(CFG)],
-                           capture_output=True, text=True)
+        try:
+            t = subprocess.run(["/opt/ip-pool/bin/mihomo", "-t", "-d", str(CFG_DIR), "-f", str(CFG)],
+                               capture_output=True, text=True, timeout=180)
+        except subprocess.TimeoutExpired:
+            # 校验挂死: 新 CFG 已落盘但未验证, 必须回滚旧配置
+            print("[PIGEONW_REFRESH_FAIL] mihomo -t timed out (180s) -> rolling back", file=sys.stderr)
+            latest = sorted(glob.glob(str(BACKUP_DIR / "pigeonw-bridge.yaml.*-pigeonw")))[-1]
+            subprocess.run(["cp", latest, str(CFG)], timeout=30)
+            raise
         if "successful" not in t.stdout + t.stderr:
             print("[PIGEONW_REFRESH_FAIL] mihomo -t failed: rc=%s out=%r err=%r" % (
                 t.returncode, t.stdout[-300:], t.stderr[-300:]), file=sys.stderr)
             latest = sorted(glob.glob(str(BACKUP_DIR / "pigeonw-bridge.yaml.*-pigeonw")))[-1]
-            subprocess.run(["cp", latest, str(CFG)])
+            subprocess.run(["cp", latest, str(CFG)], timeout=30)
             return 1
         atomic_write_text(NODES, yaml.safe_dump(nodes_d, allow_unicode=True, sort_keys=False))
 
-        subprocess.run(["systemctl", "restart", "pigeonw-bridge.service"], check=False)
-        subprocess.run(["systemctl", "restart", "ip-pool-api.service", "ip-pool-gateway.service"], check=False)
+        subprocess.run(["systemctl", "restart", "pigeonw-bridge.service"], check=False, timeout=120)
+        subprocess.run(["systemctl", "restart", "ip-pool-api.service", "ip-pool-gateway.service"], check=False, timeout=120)
         time.sleep(6)
-        r = subprocess.run(["ss", "-tln"], capture_output=True, text=True)
+        r = subprocess.run(["ss", "-tln"], capture_output=True, text=True, timeout=30)
         listening = sum(1 for idx in assign if str(":%d " % slot_key(idx)["port"]) in r.stdout)
         if listening < len(assign) - 2:
             # 新状态已生效, 报 FAIL 会误导 (以为旧状态还在) —— 真回滚到部署前备份再重启。
@@ -305,11 +312,11 @@ def main():
                 listening, len(assign)), file=sys.stderr)
             for latest, dst in ((sorted(glob.glob(str(BACKUP_DIR / "pigeonw-bridge.yaml.*-pigeonw")))[-1], CFG),
                                 (sorted(glob.glob(str(BACKUP_DIR / "nodes.yaml.*-pigeonw")))[-1], NODES)):
-                subprocess.run(["cp", latest, str(dst)], check=False)
+                subprocess.run(["cp", latest, str(dst)], check=False, timeout=30)
             subprocess.run(["systemctl", "restart", "pigeonw-bridge.service",
-                            "ip-pool-api.service", "ip-pool-gateway.service"], check=False)
+                            "ip-pool-api.service", "ip-pool-gateway.service"], check=False, timeout=120)
             time.sleep(6)
-            r2 = subprocess.run(["ss", "-tln"], capture_output=True, text=True)
+            r2 = subprocess.run(["ss", "-tln"], capture_output=True, text=True, timeout=30)
             listening2 = sum(1 for idx in assign if str(":%d " % slot_key(idx)["port"]) in r2.stdout)
             print("[PIGEONW_REFRESH_ROLLBACK] restored pre-refresh state, listeners=%d/%d" % (
                 listening2, len(assign)), file=sys.stderr)

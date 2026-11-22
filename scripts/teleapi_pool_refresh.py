@@ -189,7 +189,7 @@ def fetch_and_parse():
         for attempt in range(3):
             r = subprocess.run(["curl", "-sS", "--max-time", "60", "-A", "clash-verge/1.6.6",
                                 _sub_url(), "-o", str(fetch_file)],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, timeout=70)
             if r.returncode == 0 and fetch_file.exists() and fetch_file.stat().st_size > 1000:
                 break
             last_err = (r.returncode, r.stderr[-200:])
@@ -329,25 +329,31 @@ def main():
             yaml.safe_dump(main_cfg, allow_unicode=True, sort_keys=False),
             yaml.safe_dump(nodes_d, allow_unicode=True, sort_keys=False),
         )
-        t = subprocess.run(["/opt/ip-pool/bin/mihomo", "-t", "-d", "/opt/ip-pool/config/huawei-bridge",
-                            "-f", str(CFG)], capture_output=True, text=True)
+        try:
+            t = subprocess.run(["/opt/ip-pool/bin/mihomo", "-t", "-d", "/opt/ip-pool/config/huawei-bridge",
+                                "-f", str(CFG)], capture_output=True, text=True, timeout=180)
+        except subprocess.TimeoutExpired:
+            # 校验挂死: 新 CFG 已落盘但未验证, 必须回滚 (teleapi 是 config_pair 原子换)
+            print("[TELEAPISUB_REFRESH_FAIL] mihomo -t timed out (180s) -> rolling back", file=sys.stderr)
+            restore_config_pair(cfg_before, nodes_before)
+            raise
         if "successful" not in t.stdout + t.stderr:
             print("[TELEAPISUB_REFRESH_FAIL] mihomo -t failed: rc=%s out=%r err=%r" % (
                 t.returncode, t.stdout[-300:], t.stderr[-300:]), file=sys.stderr)
             restore_config_pair(cfg_before, nodes_before)
             return 1
 
-        subprocess.run(["systemctl", "restart", "ip-pool-huawei-bridge.service"], check=False)
-        subprocess.run(["systemctl", "restart", "ip-pool-api.service", "ip-pool-gateway.service"], check=False)
+        subprocess.run(["systemctl", "restart", "ip-pool-huawei-bridge.service"], check=False, timeout=120)
+        subprocess.run(["systemctl", "restart", "ip-pool-api.service", "ip-pool-gateway.service"], check=False, timeout=120)
         time.sleep(8)
-        r = subprocess.run(["ss", "-tln"], capture_output=True, text=True)
+        r = subprocess.run(["ss", "-tln"], capture_output=True, text=True, timeout=30)
         listening = sum(1 for l in new_listeners if str(":%d " % l["port"]) in r.stdout)
         if listening < len(new_listeners) - 5:
             print("[TELEAPISUB_REFRESH_FAIL] listeners missing: %d/%d up -> rolling back" % (
                 listening, len(new_listeners)), file=sys.stderr)
             restore_config_pair(cfg_before, nodes_before)
             subprocess.run(["systemctl", "restart", "ip-pool-huawei-bridge.service",
-                            "ip-pool-api.service", "ip-pool-gateway.service"], check=False)
+                            "ip-pool-api.service", "ip-pool-gateway.service"], check=False, timeout=120)
             time.sleep(8)
             print("[TELEAPISUB_REFRESH_ROLLBACK] restored pre-refresh state", file=sys.stderr)
             return 1

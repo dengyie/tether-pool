@@ -215,7 +215,7 @@ def probe_via_listeners(
     with os.fdopen(fd, "w") as f:
         f.write(yaml.safe_dump(_numeric_like_strings(cfg), allow_unicode=True, sort_keys=False))
     proc = subprocess.run([MIHOMO_BIN, "-t", "-d", str(pdir), "-f", str(tmp)],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, timeout=60)
     if "successful" not in proc.stdout + proc.stderr:
         print("probe config invalid:", proc.stdout[-300:], proc.stderr[-300:], file=sys.stderr)
         return []

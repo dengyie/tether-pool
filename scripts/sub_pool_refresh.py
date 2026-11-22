@@ -424,8 +424,15 @@ def main():
         # 落盘前先校验 (2026-11-15 review P2: 原子写, 崩溃不留半截 yaml)
         from atomic_yaml import atomic_write_text
         atomic_write_text(CFG, yaml.safe_dump(main, allow_unicode=True, sort_keys=False))
-        t = subprocess.run(["/opt/ip-pool/bin/mihomo", "-t", "-d", "/opt/ip-pool/config/huawei-bridge",
-                            "-f", str(CFG)], capture_output=True, text=True)
+        try:
+            t = subprocess.run(["/opt/ip-pool/bin/mihomo", "-t", "-d", "/opt/ip-pool/config/huawei-bridge",
+                                "-f", str(CFG)], capture_output=True, text=True, timeout=180)
+        except subprocess.TimeoutExpired:
+            # 校验挂死 (mihomo -t 极端卡死): 新 CFG 已落盘但未验证, 必须回滚旧配置
+            print("[SUB_REFRESH_FAIL] mihomo -t timed out (180s) -> rolling back", file=sys.stderr)
+            latest_cfg = sorted(glob.glob(str(BACKUP_DIR / "huawei-bridge.yaml.*")))[-1]
+            subprocess.run(["cp", latest_cfg, str(CFG)], timeout=30)
+            raise
         if "successful" not in t.stdout + t.stderr:
             print("[SUB_REFRESH_FAIL] mihomo -t failed: rc=%s out=%r err=%r" % (t.returncode, t.stdout[-300:], t.stderr[-300:]), file=sys.stderr)
             # 失败配置含全部订阅凭据 (URL 即凭据铁律): 0600 落盘, 部署成功后清理
@@ -434,15 +441,15 @@ def main():
             with os.fdopen(_fd, "w") as _ff:
                 _ff.write(Path(str(CFG)).read_text())
             latest_cfg = sorted(glob.glob(str(BACKUP_DIR / "huawei-bridge.yaml.*")))[-1]
-            subprocess.run(["cp", latest_cfg, str(CFG)])
+            subprocess.run(["cp", latest_cfg, str(CFG)], timeout=30)
             return 1
         atomic_write_text(NODES, yaml.safe_dump(nodes_d, allow_unicode=True, sort_keys=False))
 
-        subprocess.run(["systemctl", "restart", "ip-pool-huawei-bridge.service"], check=False)
-        subprocess.run(["systemctl", "restart", "ip-pool-api.service", "ip-pool-gateway.service"], check=False)
+        subprocess.run(["systemctl", "restart", "ip-pool-huawei-bridge.service"], check=False, timeout=120)
+        subprocess.run(["systemctl", "restart", "ip-pool-api.service", "ip-pool-gateway.service"], check=False, timeout=120)
         # 部署后验证: 桥核 listener 实际在位数 (mihomo 静默跳过冲突端口教训)
         time.sleep(6)
-        r = subprocess.run(["ss", "-tln"], capture_output=True, text=True)
+        r = subprocess.run(["ss", "-tln"], capture_output=True, text=True, timeout=30)
         listening = sum(1 for l in new_listeners if str(":%d " % l["port"]) in r.stdout)
         if listening < len(new_listeners) - 2:
             # 新状态已生效, 报 FAIL 会误导 —— 真回滚到部署前备份再重启。
@@ -451,11 +458,11 @@ def main():
             for suffix, dst in (("huawei-bridge.yaml.*", CFG), ("nodes.yaml.*", NODES)):
                 baks = sorted(glob.glob(str(BACKUP_DIR / suffix)))
                 if baks:
-                    subprocess.run(["cp", baks[-1], str(dst)], check=False)
+                    subprocess.run(["cp", baks[-1], str(dst)], check=False, timeout=30)
             subprocess.run(["systemctl", "restart", "ip-pool-huawei-bridge.service",
-                            "ip-pool-api.service", "ip-pool-gateway.service"], check=False)
+                            "ip-pool-api.service", "ip-pool-gateway.service"], check=False, timeout=120)
             time.sleep(6)
-            r2 = subprocess.run(["ss", "-tln"], capture_output=True, text=True)
+            r2 = subprocess.run(["ss", "-tln"], capture_output=True, text=True, timeout=30)
             listening2 = sum(1 for l in new_listeners if str(":%d " % l["port"]) in r2.stdout)
             print("[SUB_REFRESH_ROLLBACK] restored pre-refresh state, listeners=%d/%d" % (
                 listening2, len(new_listeners)), file=sys.stderr)
