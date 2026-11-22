@@ -151,8 +151,15 @@ def test_probe_per_server_serialized(monkeypatch, tmp_path):
     fake_bin.chmod(0o755)
     monkeypatch.setattr(bridge_probe, "MIHOMO_BIN", str(fake_bin))
     probe_pool = 39801
-    monkeypatch.setattr(bridge_probe, "_listening_ports",
-                        lambda: {(probe_pool + k, None) for k in range(3)})
+    # 首次调用 (起核前占用预检) 返回空集放行; 后续 (wait_for_listeners) 返回
+    # 假 listener 已就位 —— 真实 mihomo 起核后 ss 才能看到这些端口。
+    _lp_calls = []
+
+    def _lp():
+        _lp_calls.append(1)
+        return set() if len(_lp_calls) == 1 else {(probe_pool + k, None) for k in range(3)}
+
+    monkeypatch.setattr(bridge_probe, "_listening_ports", _lp)
 
     log = []          # (port, phase, ts)
     srvs = []
@@ -211,3 +218,42 @@ def test_probe_per_server_serialized(monkeypatch, tmp_path):
     s1, e1 = span(probe_pool)
     s2, e2 = span(probe_pool + 1)
     assert min(e1, e2) - max(s1, s2) <= 0.1  # up-a 组内无重叠
+
+
+def test_probe_refuses_occupied_port_range(monkeypatch, tmp_path):
+    """探活端口段被占 (孤儿核污染 SUB10 实证: 假活 16 条) 必须 fail-fast 返回 []。"""
+    fake_bin = tmp_path / "fake-mihomo"
+    fake_bin.write_text('#!/bin/bash\nexit 0\n')
+    fake_bin.chmod(0o755)
+    monkeypatch.setattr(bridge_probe, "MIHOMO_BIN", str(fake_bin))
+    monkeypatch.setattr(bridge_probe, "_listening_ports",
+                        lambda: {(39801, 9999)})  # 段首被别的进程占着
+    got = bridge_probe.probe_via_listeners(
+        [{"name": "a", "type": "socks5", "server": "1.2.3.4", "port": 1}],
+        39801, str(tmp_path))
+    assert got == []
+
+
+def test_probe_proceeds_when_port_range_free(monkeypatch, tmp_path):
+    """段空闲时正常起核 (不误伤)。"""
+    fake_bin = tmp_path / "fake-mihomo"
+    fake_bin.write_text('#!/bin/bash\n'
+                        'if [ "$1" = "-t" ]; then echo "config test successful"; exit 0; fi\n'
+                        'sleep 60\n')
+    fake_bin.chmod(0o755)
+    monkeypatch.setattr(bridge_probe, "MIHOMO_BIN", str(fake_bin))
+    monkeypatch.setattr(bridge_probe, "_listening_ports", lambda: set())  # 段空闲
+    core_pid = []
+    real_popen = bridge_probe.subprocess.Popen
+
+    def fake_popen(*a, **kw):
+        pr = real_popen(*a, **kw)
+        core_pid.append(pr)
+        return pr
+
+    monkeypatch.setattr(bridge_probe.subprocess, "Popen", fake_popen)
+    got = bridge_probe.probe_via_listeners(
+        [{"name": "a", "type": "socks5", "server": "1.2.3.4", "port": 1}],
+        39801, str(tmp_path))
+    assert core_pid  # 起核了 (探活结果无所谓, 本测只验证不提前退出)
+    core_pid[0].terminate()

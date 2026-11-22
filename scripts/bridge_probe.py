@@ -188,6 +188,21 @@ def probe_via_listeners(
                      if p.get("name") not in {x.get("name") for x in proxies}]
     listeners = [{"name": f"probe-{i:03d}", "type": "socks", "port": probe_pool + i,
                   "listen": "127.0.0.1", "proxy": p["name"]} for i, p in enumerate(proxies)]
+
+    # 端口段占用预检 (2026-11-23 SUB10 实证): 8 天前遗留的孤儿探活核占着
+    # 39001+ 端口段, 新核 listener 端口冲突被 mihomo 静默跳过, 探活 connect
+    # 连到孤儿核的旧配置 -> 假活 (s10-only 探活 16 活全是假象, 清核后 0 活)。
+    # 起核前先确认段空闲, 占用即 fail-fast —— 不带着污染探活。
+    # ss/lsof 不可得 (_listening_ports 返回 None, 如裸 macOS) 时跳过, 走宽松兜底。
+    _want_ports = {probe_pool + i for i in range(len(proxies))}
+    _occupied = _listening_ports()
+    if _occupied is not None:
+        _busy = _want_ports & {p for p, _ in _occupied}
+        if _busy:
+            print("probe: probe port range occupied (e.g. %d), refusing to probe "
+                  "(cross-core contamination risk)" % min(_busy), file=sys.stderr)
+            return []
+
     cfg = {"proxies": extra_proxies + list(proxies), "listeners": listeners, "mode": mode,
            "log-level": "warning", "ipv6": False,
            "external-controller": external_controller}
