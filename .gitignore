@@ -5,6 +5,9 @@ data/*.db
 data/sub6/
 data/*.db-*
 data/ip_pool.pid
+# 生产机 /opt/ip-pool/data 运行时目录整体不入库 (gateway.pid / 桥核 keeper
+# 状态 / 刷新失败转储等; 501M, pull_deploy 脏树检查曾因它拒绝部署)
+data/
 logs/
 *.pid
 .pytest_cache/
