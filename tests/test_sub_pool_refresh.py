@@ -29,6 +29,17 @@ import sub_pool_refresh as spr  # noqa: E402
     # 词边界: 子串误报不得命中 (india 在 Indianapolis 内)
     ("Indianapolis 01", "misc"),
     ("India Gate 01", "in"),
+    # SUB9 家宽源真实命名 (2026-11-22): 中文国名全量; 印度尼西亚不得命中 印度->in
+    ("s9-墨西哥-墨西哥城-11【家宽】", "mx"),
+    ("s9-泰国-曼谷-12【家宽】", "th"),
+    ("s9-印度尼西亚-雅加达-05【家宽】", "id"),
+    ("s9-印度-孟买-01【家宽】", "in"),
+    ("s9-意大利-米兰-21【家宽】", "it"),
+    ("s9-法国-里昂-43【家宽】", "fr"),
+    ("s9-韩国-06【家宽】", "kr"),
+    ("s9-爱沙尼亚-04【家宽】", "ee"),
+    ("s9-喀麦隆-02【家宽】", "cm"),
+    ("s9-中国-01【家宽】", "cn"),
 ])
 def test_region_of(name, region):
     assert spr.region_of(name) == region
