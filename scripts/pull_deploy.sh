@@ -16,6 +16,24 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# 四轮 review W2: 并发部署锁 —— 两个部署周期交错 (手动 + cron) 会双重
+# restart / 相互回退, flock 串行化全部周期。
+exec 9>/var/lock/ip-pool-deploy.lock
+if ! flock -n 9; then
+    echo "[-] 另一个部署周期正在运行 (锁 /var/lock/ip-pool-deploy.lock), 退出"
+    exit 1
+fi
+
+# 四轮 review W2: 回退路径用 git reset --hard, 会无声销毁未提交修改 ——
+# 2026-11-22 生产 exclusivity 热修在脏树里险些被 pull 直接回退。部署前
+# 检查脏树: 有未提交修改直接中止 (人工收编), 绝不在脏树上 pull。
+if ! git diff --quiet || ! git diff --cached --quiet || [ -n "$(git ls-files --others --exclude-standard)" ]; then
+    echo "[-] 工作树有未提交修改 — 拒绝部署 (回退路径 reset --hard 会销毁它们)。"
+    echo "    先提交/收编或 stash 后重试。当前脏文件:"
+    git status --short
+    exit 1
+fi
+
 PREV=$(git rev-parse HEAD)
 echo "[1/6] git pull (当前 $PREV)"
 # 境内云主机 → github.com 的 TLS 常被掐断 (GnuTLS -110 等), 三次退避重试

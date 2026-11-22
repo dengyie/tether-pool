@@ -54,6 +54,8 @@ GATEWAY_RETRY_BACKOFF_MS = max(0, int(os.environ.get("GATEWAY_RETRY_BACKOFF_MS",
 # R4: hard ceiling on a *single* attempt, including any relay fallback chaining. Without
 # this the RELAY_FALLBACK path could spend 2s direct + 2s relay per attempt, so three
 # attempts would blow the 6s budget on a host that is simply gone.
+# 四轮 review G2: 预算在 direct/relay 腿间对半分片 —— direct 挂起时 relay 级联
+# 仍保有半个预算可达, 而不是被 direct 吃满后永远轮不到。
 GATEWAY_ATTEMPT_TIMEOUT = float(os.environ.get("GATEWAY_ATTEMPT_TIMEOUT", "2.0"))
 
 # R4: EasyTier peer-table monitoring (sub-5s whole-host detection).
@@ -429,6 +431,14 @@ class ForwardProxyGateway:
         if node.relay_mode == RelayMode.DIRECT_ONLY.value or not relay_hop:
             return await socks5_connect(node.host, node.port, target_host, target_port, timeout=timeout)
 
+        # 四轮 review G2 (预算内链路公平分片): 外层 wait_for(attempt_timeout)
+        # 拿的是同一预算, direct 腿曾吃满整个 2s (direct_timeout=min(10,2)=2.0),
+        # direct 挂起时 relay 级联/应急桥在预算内永远轮不到 —— 恰好是 fallback
+        # 存在的那个场景。给 relay 腿保底一半预算, direct 只拿剩余。
+        budget = max(timeout, self.attempt_timeout)
+        direct_budget = max(0.5, budget / 2.0)
+        relay_budget = max(0.5, budget - direct_budget)
+
         # 2. RELAY_PREFERRED mode
         if node.relay_mode == RelayMode.RELAY_PREFERRED.value:
             try:
@@ -439,15 +449,14 @@ class ForwardProxyGateway:
                     target_proxy_port=node.port,
                     dest_host=target_host,
                     dest_port=target_port,
-                    timeout=timeout
+                    timeout=relay_budget
                 )
             except Exception:
-                return await socks5_connect(node.host, node.port, target_host, target_port, timeout=timeout)
+                return await socks5_connect(node.host, node.port, target_host, target_port, timeout=direct_budget)
 
         # 3. RELAY_FALLBACK mode (Default)
-        direct_timeout = min(timeout, 2.0)
         try:
-            return await socks5_connect(node.host, node.port, target_host, target_port, timeout=direct_timeout)
+            return await socks5_connect(node.host, node.port, target_host, target_port, timeout=direct_budget)
         except Exception:
             # Direct connection failed (e.g. host unreachable, UDP blocked, no IPv6).
             # Fallback to relay cascade!
@@ -459,11 +468,11 @@ class ForwardProxyGateway:
                     target_proxy_port=node.port,
                     dest_host=target_host,
                     dest_port=target_port,
-                    timeout=timeout
+                    timeout=relay_budget
                 )
             except Exception:
                 # Both direct and chained relay failed; emergency bridge via relay hop directly as egress
-                return await socks5_connect(relay_hop.host, relay_hop.port, target_host, target_port, timeout=timeout)
+                return await socks5_connect(relay_hop.host, relay_hop.port, target_host, target_port, timeout=relay_budget)
 
     def _record_attempts(self, attempts: int):
         """Feeds the R7 per-request attempt histogram (rendered by MetricsCollector)."""
@@ -856,9 +865,12 @@ class ForwardProxyGateway:
                 or ("transfer-encoding" in header_values and bool(content_lengths))
             )
             if framing_invalid:
+                # 四轮 review G1: 这里曾是 \\r\\n (字面反斜杠文本) —— 400 拒绝
+                # 响应在 wire 上没有真实 CRLF, 任何客户端都解析失败。2026-11-19
+                # framing 加固的「干净 400 + close」契约因此从未真正生效。
                 client_writer.write(
-                    b"HTTP/1.1 400 Bad Request\\r\\nConnection: close\\r\\n"
-                    b"Content-Length: 0\\r\\n\\r\\n"
+                    b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n"
+                    b"Content-Length: 0\r\n\r\n"
                 )
                 await client_writer.drain()
                 client_writer.close()
@@ -1077,12 +1089,19 @@ class ForwardProxyGateway:
             try:
                 summary = self.relay_summary()
                 if summary["relays"]:
+                    # 四轮 review P3: account_id 源自客户端头, summary 行曾把
+                    # top_accounts/top_nodes 原样 %s 进 journald —— 带 \n 的
+                    # account_id 可伪造日志行 (2026-11-19 只修了 target/user,
+                    # 这里是同类漏网)。节点名经 _relay_key 收敛后来自配置, 但
+                    # 统一转义最便宜。
+                    _esc = self._escape_label
+                    _top = lambda pairs: [( _esc(k), v) for k, v in pairs]
                     logger.info(
                         "relay summary %ss: relays=%d total=%d accounts=%d nodes=%d "
                         "top_accounts=%s top_nodes=%s target_bad=%s target_steers=%s",
                         int(self.relay_report_interval), summary["relays"],
                         summary["total"], summary["accounts"], summary["nodes"],
-                        summary["top_accounts"], summary["top_nodes"],
+                        _top(summary["top_accounts"]), _top(summary["top_nodes"]),
                         summary.get("target_bad") or {},
                         summary.get("target_steers") or {},
                     )

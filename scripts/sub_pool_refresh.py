@@ -52,8 +52,9 @@ NODES = Path("/opt/ip-pool/config/nodes.yaml")
 DB = Path("/opt/ip-pool/data/ip_pool.db")
 LOCK = Path("/tmp/sub_pool_refresh.lock")
 BACKUP_DIR = Path("/opt/ip-pool/config/backups")
-BASE_PORT = 25001
-MAX_PORT = 25500          # skyward-bridge 从 25501 起, sub 段必须止步于此
+BASE_PORT = 25947
+MAX_PORT = 26999          # 25947-27000 为 huawei-bridge 空闲连续段 (2026-11-22 扩容 499→1053 slots);
+                          # 25501-25946 被本桥 skyward(35)/teleapisub(246) listener 占用, sub 段必须跳过
 PROBE_POOL = 39001
 KEEP_BACKUPS = 7
 JUNK_SERVERS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}

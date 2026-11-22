@@ -104,12 +104,15 @@ class Prober:
                 # more per canary per sweep) adds no information.
                 is_canary = True
                 node.status = HealthStatus.HALF_OPEN.value
-                self.storage.update_node_status(node.name, HealthStatus.HALF_OPEN.value)
-                self.storage.record_circuit_event(
-                    node_name=node.name,
+                # sqlite 写移出事件环 (四轮 review P1): 与 :167/:188 的
+                # update_probe_result 同类 —— sweep 并发下每次同步写库都是一次
+                # 全事件环停顿。combine_status 顺带解决 P2: update_node_status
+                # 的无条件 UPDATE 会在快照过期窗口覆盖管理员 disable。
+                await asyncio.to_thread(
+                    self.storage.combine_status_and_record_event,
+                    node.name, HealthStatus.HALF_OPEN.value,
                     from_state=HealthStatus.DEAD.value,
-                    to_state=HealthStatus.HALF_OPEN.value,
-                    reason="cooldown_expired_canary_probe"
+                    reason="cooldown_expired_canary_probe",
                 )
         elif not force and node.status == HealthStatus.DEGRADED.value \
                 and node.next_probe_allowed_at:

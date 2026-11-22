@@ -616,6 +616,12 @@ class BindingStore:
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
+        # 四轮 review S3: since_epoch 落在保留窗之外 (消费方离线 > prune 保留期)
+        # 时 changes 为空但 applied_epoch 会直接跳到 current_epoch —— 下游把这个
+        # 空 delta 当「无变更」推进游标, 保留窗内的全部变更被静默吞掉, 镜像从此
+        # 永久漂移 (路由指向早已换绑/删绑的节点)。gap=true 时下游必须走全量
+        # 冷启动导出重建镜像, 而不是信任空 delta。
+        retention_gap = bool(rows) is False and since_epoch < current_epoch
         return {
             "changes": changes,
             "allocations": allocations,
@@ -625,6 +631,7 @@ class BindingStore:
             "changed_at": current_changed_at,
             "truncated": truncated,
             "has_more": has_more,
+            "gap": retention_gap,
         }
 
     def move_account_binding(

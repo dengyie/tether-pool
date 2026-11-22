@@ -1093,6 +1093,10 @@ def export_grok2api(
             "count": len(assignments),
             "truncated": snapshot["truncated"],
             "has_more": snapshot["has_more"],
+            # 四轮 review S3: since_epoch 早于保留窗 (下游离线超过 prune 保留期)
+            # 时 delta 为空但游标会静默跳到 current_epoch —— 这里显式告知下游
+            # 必须全量冷启动 (不带 since_epoch 重拉) 重建镜像, 不可信任空 delta。
+            "gap": snapshot["gap"],
             "nodes": nodes,
             "assignments": assignments,
             "deletions": deletions,
@@ -1505,7 +1509,12 @@ def release_account_allocation(
     """
     Release or unbind an account allocation.
     """
-    success = storage.delete_allocation(service, account_id)
+    # 四轮 review S2: delete_allocation 是 account_allocations 写者, 必须持
+    # BINDING_WRITE_LOCK —— 否则能插进并发 acquire 的「读绑定 → 选节点 → 落库」
+    # RMW 窗口, release 提交后又被 batch_save 的 INSERT ON CONFLICT 复活
+    # (delete_allocation docstring 明示的复活问题)。
+    with BINDING_WRITE_LOCK:
+        success = storage.delete_allocation(service, account_id)
     return {"success": success, "service": service, "account_id": account_id}
 
 

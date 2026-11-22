@@ -524,7 +524,27 @@ class AllocationEngine:
 
         now_str = datetime.now().isoformat()
         if not ban_skipped_existing:
-            self.storage.batch_save_allocations([(service, account_id, least_loaded_node.name, now_str)])
+            # 四轮 review S4: 控制面分配路径同样要落 bound_* —— 之前只有数据面
+            # router 持久化约束, API acquire_single 传了 region/tier/egress 但
+            # 不落库, 后续 rehome 把这些账号当无约束可用性优先迁移, 跨区/跨
+            # egress 违约 (region_strict 声称的硬承诺形同虚设)。与 Router 步骤5
+            # 语义一致: 只持久化本次实际被选中节点满足的约束。
+            constraints: Dict[str, Any] = {}
+            if egress_preference and least_loaded_node.egress_type == egress_preference:
+                constraints["egress_type"] = egress_preference
+            if region and least_loaded_node.region == region:
+                constraints["region"] = region
+                constraints["region_strict"] = bool(region_strict)
+            if tier and not tier_policy and least_loaded_node.tier == tier:
+                constraints["tier"] = tier
+            if tier_policy:
+                constraints["tier_policy"] = tier_policy
+            self.storage.batch_save_allocations(
+                [(service, account_id, least_loaded_node.name, now_str)],
+                constraints_by_account={
+                    (service, account_id): constraints
+                } if constraints else None,
+            )
 
         gw_url = self._build_gateway_proxy_url(account_id, gateway_base, least_loaded_node.egress_type, least_loaded_node.region, service=service, tier=least_loaded_node.tier)
         return AccountAllocationItem(

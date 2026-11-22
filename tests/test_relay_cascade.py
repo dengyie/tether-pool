@@ -122,8 +122,11 @@ async def test_connect_upstream_adaptive_direct_success(temp_storage, sample_nod
         assert r == fake_reader
         assert w == fake_writer
         # Direct connect was called
+        # 四轮 review G2: direct 腿拿 attempt 预算的一半 (budget=max(CONNECT_TIMEOUT,
+        # attempt_timeout)=10 -> 5.0), 另一半留给 relay 级联 —— direct 挂起时
+        # fallback 不再被饿死。
         mock_conn.assert_awaited_once_with(
-            tokyo_node.host, tokyo_node.port, "cloudflare.com", 443, timeout=2.0
+            tokyo_node.host, tokyo_node.port, "cloudflare.com", 443, timeout=5.0
         )
 
 
@@ -156,5 +159,5 @@ async def test_connect_upstream_adaptive_fallback_to_relay_cascade(temp_storage,
                 target_proxy_port=tokyo_node.port,
                 dest_host="cloudflare.com",
                 dest_port=443,
-                timeout=10.0
+                timeout=5.0  # G2: relay 腿保底另一半预算 (direct 失败后仍可达)
             )

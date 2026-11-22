@@ -660,7 +660,9 @@ class Router:
         target_region: Optional[str],
         target_egress: Optional[str],
         target_tier: Optional[str],
-        exclude_names: set
+        exclude_names: set,
+        service: Optional[str] = None,
+        extra_occupied: Optional[set] = None
     ) -> List[ProxyNode]:
         """
         Narrows the pool for a rebind the same way the allocation ladder does, from the
@@ -668,6 +670,12 @@ class Router:
         is better than none). Only HEALTHY nodes qualify; DEAD / cooling nodes never enter
         the sequence (R3 acceptance: after a mesh-nl kill the pool still has aws-tokyo /
         huawei-sg / india visible, and never re-proposes a dead listener).
+
+        `service` 传入时应用一号一节点硬互斥 (SERVICE_EXCLUSIVE_SERVICES)。四轮
+        review S1: 共享 ladder 之前无此过滤 —— zcode-hub 无约束绑定走节点 sweep
+        base_candidates / 域 sweep base_candidates / R2 else 分支三条 rehome 路径
+        全部绕过互斥, 与 acquire 路径 (router:408) 及约束感知直查分支
+        (_svc_exclusive_filter) 语义不一致, 09:44 共占风暴对无约束绑定重现。
         """
         # Order matters: `egress_type` is preserved before region (R2 acceptance requires a
         # rehomed warp_ipv6 account to stay on warp_ipv6), and region before tier. A
@@ -688,6 +696,13 @@ class Router:
                 status=HealthStatus.HEALTHY.value, tier=tier
             )
             cands = [c for c in cands if c.name not in exclude_names]
+            if service in SERVICE_EXCLUSIVE_SERVICES and cands:
+                occupied = self.storage.count_allocations_per_node(service)
+                if extra_occupied:
+                    occupied = {**occupied}
+                    for _n in extra_occupied:
+                        occupied.setdefault(_n, occupied.get(_n, 0) + 1)
+                cands = [c for c in cands if occupied.get(c.name, 0) == 0]
             if cands:
                 return cands
         return []
@@ -698,7 +713,9 @@ class Router:
         fallback_region: Optional[str],
         fallback_egress: Optional[str],
         fallback_tier: Optional[str],
-        exclude_names: set
+        exclude_names: set,
+        service: Optional[str] = None,
+        extra_occupied: Optional[set] = None
     ) -> Tuple[Optional[List[ProxyNode]], Optional[str]]:
         """
         Rehome candidate set for ONE account under its persisted constraint set.
@@ -725,20 +742,29 @@ class Router:
         bound_egress = (constraints.get("egress_type") or "").strip() or None
         bound_tier = (constraints.get("tier") or "").strip() or None
         bound_policy = (constraints.get("tier_policy") or "").strip().lower() or None
+        svc = service or "default"
 
         def _svc_exclusive_filter(cands: List[ProxyNode]) -> List[ProxyNode]:
             # 一号一节点硬互斥 (service-exclusive 2026-11-21 收尾补): 约束感知
             # 路径的直查分支不走 _find_rehome_candidates 共享 ladder, 之前漏滤
             # —— 09:44 节点死亡风暴把 5 个 zcode-hub 账号堆进同一 native 节点
-            # 实锤。与共享 ladder 过滤同语义。
+            # 实锤。四轮 review C2 根修: 只在「本 rehome 的 service」本身是
+            # exclusive service 时过滤 —— 旧写法把 zcode-hub 占用套到所有
+            # service 的候选上, zcode-hub 占住的节点对 grok2api/cpa 的 rehome
+            # 无谓缩容 (与 acquire 路径 router:408 的 svc 条件不一致)。
             if not cands:
                 return cands
-            ex_occ: Dict[str, int] = {}
-            for _svc in SERVICE_EXCLUSIVE_SERVICES:
-                _occ = self.storage.count_allocations_per_node(_svc)
-                for _n, _cnt in _occ.items():
-                    ex_occ[_n] = max(ex_occ.get(_n, 0), _cnt)
-            return [c for c in cands if ex_occ.get(c.name, 0) == 0]
+            if svc in SERVICE_EXCLUSIVE_SERVICES:
+                occupied = self.storage.count_allocations_per_node(svc)
+                # extra_occupied: 同一 sweep 批内已分配的节点 — sweep 是攒齐一
+                # 批再 batch_save 落库的, 落库前 DB 查不到本批先选的节点, 不补
+                # 这个集合批内第二个账号会与第一个共占同一节点。
+                if extra_occupied:
+                    occupied = {**occupied}
+                    for _n in extra_occupied:
+                        occupied.setdefault(_n, occupied.get(_n, 0) + 1)
+                cands = [c for c in cands if occupied.get(c.name, 0) == 0]
+            return cands
 
         if not bound_region:
             if bound_egress:
@@ -761,7 +787,8 @@ class Router:
             # No region and no egress promise on record: keep the existing
             # availability-first ladder.
             cands = self._find_rehome_candidates(
-                fallback_region, fallback_egress, fallback_tier, exclude_names
+                fallback_region, fallback_egress, fallback_tier, exclude_names,
+                service=svc
             )
             return (cands or None), None
 
@@ -891,6 +918,10 @@ class Router:
 
         new_node_by_unit: Dict[Tuple[str, str], ProxyNode] = {}
         blocked_units: Dict[Tuple[str, str], str] = {}
+        # 四轮 review S1: exclusive service 的单元不能复用未过滤的
+        # base_candidates, 且 sweep 是攒批落库 —— 批内已选节点 DB 查不到, 用
+        # sweep_picked 补进互斥过滤 (批内两个账号不得共占同一节点)。
+        sweep_picked: Dict[str, set] = {}
         for key, info in units.items():
             svc_acc, acc = key
             c = info["constraints"]
@@ -901,8 +932,20 @@ class Router:
                 # breaks the egress contract (2026-11-16, 127 cpa bindings).
                 cands, blocked_region = self._find_rehome_candidates_for_account(
                     c, target_region, target_egress, target_tier,
-                    exclude_names={broken_node_name} | domain_peers
+                    exclude_names={broken_node_name} | domain_peers,
+                    service=svc_acc,
+                    extra_occupied=sweep_picked.get(svc_acc),
                 )
+            elif svc_acc in SERVICE_EXCLUSIVE_SERVICES:
+                # Exclusive service 的无约束单元: 带服务互斥 + 批内已占重跑 ladder
+                # (单元数少, 不值得 hoist; 每单元重查保证批内互斥正确)。
+                cands, blocked_region = self._find_rehome_candidates(
+                    target_region, target_egress, target_tier,
+                    exclude_names={broken_node_name} | domain_peers,
+                    service=svc_acc,
+                ), None
+                if cands and sweep_picked.get(svc_acc):
+                    cands = [n for n in cands if n.name not in sweep_picked[svc_acc]]
             else:
                 # No promise on record: shared availability-first ladder.
                 cands, blocked_region = (base_candidates or None), None
@@ -911,6 +954,8 @@ class Router:
                 self._record_rehome_blocked(svc_acc, blocked_units[key])
                 continue
             new_node_by_unit[key] = self._weighted_deterministic_pick(cands, acc)
+            if svc_acc in SERVICE_EXCLUSIVE_SERVICES:
+                sweep_picked.setdefault(svc_acc, set()).add(new_node_by_unit[key].name)
 
         rehomed_details = []
         for key in sorted(units):
@@ -1032,14 +1077,27 @@ class Router:
 
         new_node_by_unit: Dict[Tuple[str, str], ProxyNode] = {}
         blocked_units: Dict[Tuple[str, str], str] = {}
+        # 四轮 review S1 (同 _rehome_leases_for_node): exclusive service 的
+        # 无约束单元带互斥重跑 ladder, 批内已选节点经 sweep_picked 补进过滤。
+        sweep_picked: Dict[str, set] = {}
         for key, info in units.items():
             svc_acc, acc = key
             c = info["constraints"]
             if c.get("region") or c.get("egress_type"):
                 cands, blocked_region = self._find_rehome_candidates_for_account(
                     c, anchor.region, anchor.egress_type, anchor.tier,
-                    exclude_names=broken_names
+                    exclude_names=broken_names,
+                    service=svc_acc,
+                    extra_occupied=sweep_picked.get(svc_acc),
                 )
+            elif svc_acc in SERVICE_EXCLUSIVE_SERVICES:
+                cands, blocked_region = self._find_rehome_candidates(
+                    anchor.region, anchor.egress_type, anchor.tier,
+                    exclude_names=broken_names,
+                    service=svc_acc,
+                ), None
+                if cands and sweep_picked.get(svc_acc):
+                    cands = [n for n in cands if n.name not in sweep_picked[svc_acc]]
             else:
                 cands, blocked_region = (base_candidates or None), None
             if not cands:
@@ -1047,6 +1105,8 @@ class Router:
                 self._record_rehome_blocked(svc_acc, blocked_units[key])
                 continue
             new_node_by_unit[key] = self._weighted_deterministic_pick(cands, acc)
+            if svc_acc in SERVICE_EXCLUSIVE_SERVICES:
+                sweep_picked.setdefault(svc_acc, set()).add(new_node_by_unit[key].name)
 
         # Single transaction: allocation rows, legacy lease mirror, epoch advance and
         # change-log rows all commit together (no per-account set_lease round trips).
@@ -1143,7 +1203,8 @@ class Router:
                 # 2026-11-16 incident this closes.
                 candidates, blocked_region = self._find_rehome_candidates_for_account(
                     alloc_c, failed.region, failed.egress_type, failed.tier,
-                    exclude_names={failed_node_name} | domain_peers
+                    exclude_names={failed_node_name} | domain_peers,
+                    service=svc
                 )
                 if not candidates:
                     self._record_rehome_blocked(svc, blocked_region)
@@ -1158,7 +1219,8 @@ class Router:
                 # with the same host" is not a fallback, it is the same outage.
                 candidates = self._find_rehome_candidates(
                     failed.region, failed.egress_type, failed.tier,
-                    exclude_names={failed_node_name} | domain_peers
+                    exclude_names={failed_node_name} | domain_peers,
+                    service=svc
                 )
                 if not candidates:
                     return {"rehomed": False, "reason": "no_healthy_target"}

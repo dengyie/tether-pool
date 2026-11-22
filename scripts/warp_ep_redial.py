@@ -277,6 +277,23 @@ def main():
     ok2 = sum(1 for t, p in probes.items() if warp_ok(p))
     log("RESTART done: alive %d -> %d (swapped %d)" % (alive, ok2, len(swaps)))
     if ok2 < alive:
+        # 四轮 review W1: 回滚前 sing-box 已带新 identity 运行 ~20s —— 新身份
+        # 已向 CF 注册并消费会话槽。history 只在成功路径写的旧逻辑下, 这些
+        # identity 下轮仍会漂进 spare 被再次分配 (f5d30d25 三次复用同型)。
+        # 回滚路径补写带 rolled_back 标记的 history 行, banned 集合同样按
+        # old/new 收编, 消费过的身份不再复用。
+        try:
+            os.makedirs(os.path.dirname(HIST_FILE), exist_ok=True)
+            with open(HIST_FILE, "a") as f:
+                for tag, old_dev, new in swaps:
+                    f.write(json.dumps({
+                        "ts": datetime.datetime.now().isoformat(),
+                        "tag": tag, "old": old_dev, "new": new["device_id"],
+                        "alive_before": alive, "alive_after": ok2,
+                        "rolled_back": True,
+                    }) + "\n")
+        except OSError as hist_err:
+            log("WARN failed to record rolled-back identities: %s" % hist_err)
         restore_file(CONFIG, config_before)
         restore_file(TAGMAP_FILE, tagmap_before)
         restored = subprocess.run(["systemctl", "restart", "sing-box"], check=False)

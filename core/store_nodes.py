@@ -94,6 +94,35 @@ class NodeStore:
                 WHERE name = ?
             """, (status, status, status, node_name))
 
+    def combine_status_and_record_event(
+        self, node_name: str, status: str,
+        from_state: str, reason: str
+    ):
+        """
+        单事务内「状态迁移 + 熔断事件」原子写 (四轮 review P1/P2)。
+
+        P1: prober HALF_OPEN canary 之前是 update_node_status + record_circuit_event
+        两次独立写, 事件行可能在中间状态读窗里与实际状态不符。
+        P2: update_node_status 的 UPDATE 无 DISABLED 守卫 —— sweep 快照过期窗口里
+        管理员刚 disable 的节点会被 HALF_OPEN 无条件覆盖, 违反管理意图 (与
+        upsert CASE guard / sweep filter / update_probe_result 重读评估并列为
+        DISABLED 第四条防线)。本方法用 CASE guard 保证只有「当前仍为 from_state」
+        的行才迁移; DISABLED / 已被并发改态的节点不写、不发事件。
+        """
+        with self._get_conn() as conn:
+            cur = conn.execute("""
+                UPDATE nodes SET
+                    status = ?,
+                    circuit_state = ?,
+                    dead_since = CASE WHEN ? != 'dead' THEN NULL ELSE dead_since END
+                WHERE name = ? AND status = ?
+            """, (status, status, status, node_name, from_state))
+            if cur.rowcount:
+                conn.execute("""
+                    INSERT INTO circuit_events (node_name, from_state, to_state, reason, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (node_name, from_state, status, reason, datetime.now().isoformat()))
+
     def update_probe_result(self, res: ProbeResult, force: bool = False) -> Tuple[ProbeResult, Optional[CircuitEvent]]:
         """
         Records probe history and evaluates circuit breaker transition.
