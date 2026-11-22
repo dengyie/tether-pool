@@ -133,3 +133,81 @@ def test_numeric_like_strings_roundtrip_idempotent():
     assert yaml.safe_load(yaml.safe_dump(twice))["a"][0] == "906152e4"
     assert yaml.safe_load(yaml.safe_dump(twice))["a"][2]["b"] == "12e3"
     assert twice["a"][1] == "ok-str"
+
+
+# ------------------------------------------------- per-server 探活节流
+def test_probe_per_server_serialized(monkeypatch, tmp_path):
+    """同上游 server 的握手必须串行 (yuetong 单入口并发限流: 17 并发 0/17,
+    串行 17/17); 跨 server 不受影响。用假 mihomo + 假 SOCKS5 listener 验证。"""
+    import json as _json
+    import socket as _socket
+    import threading
+    import time as _time
+
+    fake_bin = tmp_path / "fake-mihomo"
+    fake_bin.write_text('#!/bin/bash\n'
+                        'if [ "$1" = "-t" ]; then echo "config test successful"; exit 0; fi\n'
+                        'sleep 60\n')
+    fake_bin.chmod(0o755)
+    monkeypatch.setattr(bridge_probe, "MIHOMO_BIN", str(fake_bin))
+    probe_pool = 39801
+    monkeypatch.setattr(bridge_probe, "_listening_ports",
+                        lambda: {(probe_pool + k, None) for k in range(3)})
+
+    log = []          # (port, phase, ts)
+    srvs = []
+
+    def fake_listener(port):
+        srv = _socket.socket()
+        srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", port))
+        srv.listen(4)
+        srvs.append(srv)
+
+        def serve():
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    conn.recv(16)
+                    conn.sendall(b"\x05\x00")          # greeting ok
+                    conn.recv(32)                       # connect req
+                    conn.sendall(b"\x05\x00\x00\x01" + bytes([1, 2, 3, 4]) + b"\x00\x50")
+                    log.append((port, "start", _time.time()))
+                    _time.sleep(0.4)
+                    body = _json.dumps({"query": "1.2.3.4", "countryCode": "US"})
+                    conn.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: %d\r\n\r\n%s"
+                                 % (len(body), body.encode()))
+                    conn.shutdown(_socket.SHUT_WR)
+                    log.append((port, "end", _time.time()))
+                except OSError:
+                    pass
+                finally:
+                    _time.sleep(0.6)  # server 端立即 close 会 RST 掉 client 未读完的 body
+                    conn.close()
+        threading.Thread(target=serve, daemon=True).start()
+
+    for k in range(3):
+        fake_listener(probe_pool + k)
+    proxies = [
+        {"name": "a1", "type": "socks5", "server": "up-a", "port": 1},
+        {"name": "a2", "type": "socks5", "server": "up-a", "port": 2},
+        {"name": "b1", "type": "socks5", "server": "up-b", "port": 3},
+    ]
+    try:
+        results = bridge_probe.probe_via_listeners(
+            proxies, probe_pool, str(tmp_path), max_workers=3)
+    finally:
+        for srv in srvs:
+            srv.close()
+
+    assert sorted(r[0] for r in results) == [0, 1, 2]  # 全部探活成功
+    # 同 server 两条探活区间不得重叠 (串行); 不同 server 可并发
+    def span(port):
+        ev = {ph: ts for p, ph, ts in log if p == port}
+        return ev["start"], ev["end"]
+    s1, e1 = span(probe_pool)
+    s2, e2 = span(probe_pool + 1)
+    assert min(e1, e2) - max(s1, s2) <= 0.1  # up-a 组内无重叠

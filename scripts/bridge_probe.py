@@ -18,7 +18,9 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -207,31 +209,38 @@ def probe_via_listeners(
     if not wait_for_listeners(core, probe_pool, len(proxies)):
         print("probe listeners not all up after timeout; probing anyway", file=sys.stderr)
 
+    # 按上游 server 分组节流: 单入口型上游对同源 IP 的并发 reality 握手限流
+    # (2026-11-22 SUB10 yuetong 实证: 17 条同 server 并发探 0/17 全拒,
+    # 逐条串行 17/17 全活)。同组串行、跨组仍吃满 max_workers —— 正常多源
+    # 订阅各节点 server 互异, 全局吞吐不受影响。
+    _sems = defaultdict(threading.Semaphore)
+
     def probe(i_p):
         i, p = i_p
         try:
-            s = socket.create_connection(("127.0.0.1", probe_pool + i), timeout=10)
-            s.sendall(b"\x05\x01\x00")
-            if s.recv(2) != b"\x05\x00":
-                return None
-            ipb = bytes(int(x) for x in "208.95.112.1".split("."))
-            s.sendall(b"\x05\x01\x00\x01" + ipb + b"\x00\x50")
-            if s.recv(10)[1] != 0:
-                return None
-            s.sendall(b"GET /json HTTP/1.0\r\nHost: ip-api.com\r\n\r\n")
-            s.settimeout(6)
-            data = b""
-            while True:
-                c = s.recv(4096)
-                if not c:
-                    break
-                data += c
-                if len(data) > 8192:
-                    break
-            body = data.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in data else b""
-            j = json.loads(body)
-            if j.get("query"):
-                return (i, p, j["query"], j.get("countryCode") or None)
+            with _sems[p.get("server") or p.get("name")]:
+                s = socket.create_connection(("127.0.0.1", probe_pool + i), timeout=10)
+                s.sendall(b"\x05\x01\x00")
+                if s.recv(2) != b"\x05\x00":
+                    return None
+                ipb = bytes(int(x) for x in "208.95.112.1".split("."))
+                s.sendall(b"\x05\x01\x00\x01" + ipb + b"\x00\x50")
+                if s.recv(10)[1] != 0:
+                    return None
+                s.sendall(b"GET /json HTTP/1.0\r\nHost: ip-api.com\r\n\r\n")
+                s.settimeout(6)
+                data = b""
+                while True:
+                    c = s.recv(4096)
+                    if not c:
+                        break
+                    data += c
+                    if len(data) > 8192:
+                        break
+                body = data.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in data else b""
+                j = json.loads(body)
+                if j.get("query"):
+                    return (i, p, j["query"], j.get("countryCode") or None)
         except Exception:
             return None
         return None
