@@ -340,14 +340,15 @@ def main():
             print("[SUB_REFRESH_FAIL] probe_via_listeners returned empty "
                   "(probe config invalid or all dead), keep current state", file=sys.stderr)
             return 1
-        # 中继源上游对中转出口随机放行, 单轮探活波动大: 失败的中继节点补探一次
-        if relay_for:
-            alive_names = {p["name"] for _, p, _, _ in alive}
-            retry = [p for p in proxies if p.get("dialer-proxy") and p["name"] not in alive_names]
-            if retry:
-                more = probe_via_listeners(retry, extra_proxies=list(extra_relays.values()))
-                print(f"relay retry: {len(more)}/{len(retry)} recovered")
-                alive.extend(more)
+        # 失败补探: 主探活 1300+ listener 一次全起, mihomo 资源竞争下尾部源
+        # 单轮波动大 (2026-11-22 SUB10 实证: 主探活 0/17, 单独复测 5/17)。
+        # 失败的全部节点 (不限 relay) 补探一次, 显著降低单轮误杀。
+        alive_names = {p["name"] for _, p, _, _ in alive}
+        retry = [p for p in proxies if p["name"] not in alive_names]
+        if retry:
+            more = probe_via_listeners(retry, extra_proxies=list(extra_relays.values()))
+            print(f"retry: {len(more)}/{len(retry)} recovered")
+            alive.extend(more)
         print(f"alive {len(alive)}/{len(proxies)}")
         if len(alive) < 5:
             print("[SUB_REFRESH_FAIL] alive too few, keep current state", file=sys.stderr)
