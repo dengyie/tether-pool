@@ -110,6 +110,20 @@ def _port_open(port, timeout=0.4):
         return False
 
 
+def _reality_ok(p):
+    """REALITY 数据完整性: 有 public-key 必须有 short-id (0-16 hex)。
+
+    上游订阅存在"半截 reality"节点 (s8 批 14/255 实测), mihomo 对其报
+    invalid REALITY short ID 并拒整份探活配置 —— 主探活全灭会级联成
+    刷新部署残缺池。缺 short-id 的 reality 节点本就无法握手, 剔除不损失
+    真实可用性。"""
+    ro = p.get("reality-opts")
+    if isinstance(ro, dict) and "public-key" in ro:
+        sid = ro.get("short-id")
+        return isinstance(sid, str) and 0 < len(sid) <= 16
+    return True
+
+
 def probe_via_listeners(
     proxies,
     probe_pool: int,
@@ -130,6 +144,12 @@ def probe_via_listeners(
     供代理里的 `dialer-proxy: <name>` 解析, 不参与探活结果。
     """
     import yaml
+    # 探活前剔除半截 reality 节点 (见 _reality_ok docstring)
+    dropped_reality = [p["name"] for p in proxies if not _reality_ok(p)]
+    if dropped_reality:
+        print("probe: dropped %d proxies with invalid REALITY opts (e.g. %s)" % (
+            len(dropped_reality), dropped_reality[0]), file=sys.stderr)
+        proxies = [p for p in proxies if _reality_ok(p)]
     extra_proxies = [p for p in (extra_proxies or [])
                      if p.get("name") not in {x.get("name") for x in proxies}]
     listeners = [{"name": f"probe-{i:03d}", "type": "socks", "port": probe_pool + i,

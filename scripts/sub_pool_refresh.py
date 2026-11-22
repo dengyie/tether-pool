@@ -332,6 +332,14 @@ def main():
         print(f"merged {len(proxies)} proxies from {len(sources)} source(s), "
               f"upstream dups dropped={dropped}")
         alive = probe_via_listeners(proxies, extra_proxies=list(extra_relays.values()))
+        # 主探活崩溃防御 (2026-11-22 SUB10 接入实证): probe config invalid 时
+        # 返回 [] —— 若无此守卫, relay retry 会把"配置非法全灭"续命成"只活
+        # 中继节点"的部分存活集 (285/881 实测), 部署残缺池踢掉 366 个健康节点。
+        # 主探活 0 活 = 探活机制本身故障, 本轮立即放弃, 保持现状。
+        if not alive:
+            print("[SUB_REFRESH_FAIL] probe_via_listeners returned empty "
+                  "(probe config invalid or all dead), keep current state", file=sys.stderr)
+            return 1
         # 中继源上游对中转出口随机放行, 单轮探活波动大: 失败的中继节点补探一次
         if relay_for:
             alive_names = {p["name"] for _, p, _, _ in alive}

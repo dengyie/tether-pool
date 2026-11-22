@@ -82,3 +82,28 @@ def test_wait_for_listeners_falls_back_to_port_open_when_no_tool(monkeypatch):
     monkeypatch.setattr(bridge_probe, "_port_open", fake_open)
     assert bridge_probe.wait_for_listeners(_FakeCore(), 39001, 5, timeout=1) is True
     assert opens == [39001, 39005]  # 只探首尾两个
+
+
+# ------------------------------------------------- REALITY 数据缺陷防御
+def test_reality_ok_rejects_public_key_without_short_id():
+    """半截 reality (s8 批 14/255 实测): 有 public-key 缺 short-id 必须判非法。"""
+    bad = {"reality-opts": {"public-key": "FWitre1jinQR7qz5HQ0q2Q4Gg9xA9B0SyizCziN7Ch0"}}
+    assert bridge_probe._reality_ok(bad) is False
+
+
+def test_reality_ok_accepts_complete_opts_and_non_reality():
+    """完整 reality (short-id 任意 hex 串) 与非 reality 节点 (含无 ro 的 vless) 放行。"""
+    ok_full = {"reality-opts": {"public-key": "k1", "short-id": "8889f0b7"}}
+    ok_long_sid = {"reality-opts": {"public-key": "k1", "short-id": "6ba85179e30d4fc2"}}
+    no_ro = {"type": "vless", "tls": True}
+    empty_ro = {"reality-opts": {}}  # ro 字典存在但无 public-key (非 reality 用法)
+    for p in (ok_full, ok_long_sid, no_ro, empty_ro):
+        assert bridge_probe._reality_ok(p) is True
+
+
+def test_reality_ok_rejects_non_string_or_oversized_sid():
+    """short-id 非 str (yaml int 陷阱) 或超 16 位: 非法。"""
+    assert bridge_probe._reality_ok(
+        {"reality-opts": {"public-key": "k", "short-id": 123}}) is False
+    assert bridge_probe._reality_ok(
+        {"reality-opts": {"public-key": "k", "short-id": "a" * 17}}) is False
