@@ -367,7 +367,10 @@ def main():
             tags = ["clash", "bridge", "sub", src_tag, str(p.get("type", "http"))]
             if kind: tags.append(kind)
             if reg == "us-west" and kind == "residential": tags.append("us-residential")
-            new_nodes.append({"name": f"clash-{500+i:03d}-sub-{i:03d}", "host": "127.0.0.1",
+            # 名字嵌端口 (端口唯一 -> 名字唯一): 旧方案两段都嵌 alive 顺序号 i,
+            # i 随每轮探活存活数变化, 同名不同实例在 DB/nodes.yaml 撞名
+            # (重名 534 条实证)。端口天然唯一且与 listener 一一对应。
+            new_nodes.append({"name": f"clash-{BASE_PORT + i}-sub-{i:03d}", "host": "127.0.0.1",
                               "port": BASE_PORT + i, "protocol": "socks5h", "region": reg,
                               "egress_type": "clash_proxy", "tags": tags, "tier": "standard",
                               "relay_mode": "direct_only", "fault_domain": "huawei-sub-bridge",
@@ -375,10 +378,14 @@ def main():
         main["proxies"] += new_proxies
         main["listeners"] += new_listeners
 
-        # nodes.yaml 替换 (clash-5xx-sub- 前缀)
+        # nodes.yaml 替换 (-sub- 是本脚本独占命名空间, teleapisub/skyward/pigeonw
+        # 后缀不同不会误伤)。正则必须匹配全代次: 节点名 clash-{500+i}-sub-{i}
+        # 的 i 上不封顶 (曾用 ^clash-5 只够到 i<100, 6xx/7xx/8xx 历史代次永不
+        # 清理, nodes.yaml 积到 1557 条陈旧条目 2026-11-22 实证)。
+        SUB_NODE_RE = re.compile(r"^clash-\d+-sub-\d+$")
         nodes_d = yaml.safe_load(NODES.read_text())
         nl = nodes_d if isinstance(nodes_d, list) else nodes_d.get("nodes")
-        old_node_names = {n["name"] for n in nl if "-sub-" in str(n["name"]) and re.match(r"^clash-5", str(n["name"]))}
+        old_node_names = {n["name"] for n in nl if SUB_NODE_RE.match(str(n["name"]))}
         nl[:] = [n for n in nl if n["name"] not in old_node_names]
         nl.extend(new_nodes)
         if isinstance(nodes_d, dict): nodes_d["nodes"] = nl

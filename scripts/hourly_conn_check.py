@@ -32,12 +32,12 @@ TIMEOUT = 8
 POOLS = [
     ("teleapisub", "tags LIKE '%teleapisub%'"),
     ("skyward", "tags LIKE '%skyward%'"),
-    ("sub", "name LIKE 'clash-5%-sub-%'"),
+    ("sub", "name GLOB 'clash-*-sub-*'"),
     ("pigeonw", "tags LIKE '%pigeonw%'"),
     ("gen", "tags LIKE '%genproxy%'"),
     # cloud (teleapi 云端订阅): 出口共享网关 (实测 15 节点同一出口 IP), region
     # 比对无意义 (db per-node exit_ip 与实际出口对不上, 2026-11-15 复盘), 只验连通。
-    ("cloud", "host='127.0.0.1' AND tags NOT LIKE '%genproxy%' AND tags NOT LIKE '%teleapisub%' AND tags NOT LIKE '%skyward%' AND tags NOT LIKE '%pigeonw%' AND name NOT LIKE 'clash-5%-sub-%'"),
+    ("cloud", "host='127.0.0.1' AND tags NOT LIKE '%genproxy%' AND tags NOT LIKE '%teleapisub%' AND tags NOT LIKE '%skyward%' AND tags NOT LIKE '%pigeonw%' AND name NOT GLOB 'clash-*-sub-*'"),
 ]
 NO_REGION_CHECK = {"cloud"}
 
